@@ -32,10 +32,6 @@
 #   - Scan reports are saved in '.flac_scan_data/reports'
 #   - Operation logs are saved in '.flac_scan_data/logs'
 #   - Uses FLAC's --decode-through-errors for maximum recovery
-#
-# Version: 1.0
-# Author: [Your Name/Organization]
-# Last Updated: $(date +%F)
 ###############################################################################
 
 # flac_health_reencode.sh
