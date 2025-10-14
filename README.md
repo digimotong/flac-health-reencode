@@ -4,12 +4,12 @@ A robust Bash script for scanning and repairing FLAC audio files while preservin
 
 ## Features
 
-- ✅ Recursive scanning of FLAC files for corruption
-- 🔄 Safe re-encoding of problematic files with backup preservation
-- 📊 Detailed CSV reports and operation logs
-- 🎨 Color-coded terminal output with progress tracking
-- ⚙️ Persistent configuration via JSON file
-- 🗑️ Backup cleanup utility
+- Recursive scanning of FLAC files for corruption
+- Safe re-encoding of problematic files with backup preservation
+- Detailed CSV reports and operation logs
+- Color-coded terminal output with progress tracking
+- Persistent configuration via JSON file
+- Backup cleanup utility
 
 ## Installation
 
