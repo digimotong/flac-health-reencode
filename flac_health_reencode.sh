@@ -318,6 +318,149 @@ reencode_library() {
 }
 
 ########################################
+# FUNCTION: reencode_all_files
+# Reencodes EVERY FLAC file in the library (not just problematic ones).
+# Shows a prominent warning and requires explicit confirmation before proceeding.
+# Each original file is backed up to a backup_FLAC_originals folder.
+########################################
+reencode_all_files() {
+    config=$(load_config)
+    library_path=$(echo "$config" | jq -r '.library_path')
+    
+    if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
+        read -rp "Enter the full path to your music library directory: " library_path
+        save_config "$library_path"
+    fi
+
+    library_dir="$library_path"
+    
+    if [ ! -d "$library_dir" ]; then
+        echo "Error: The directory '$library_dir' does not exist."
+        exit 1
+    fi
+
+    # Count total FLAC files
+    echo "Counting FLAC files..."
+    total_files=$(count_flac_files "$library_dir")
+    
+    if [ "$total_files" -eq 0 ]; then
+        echo "No FLAC files found in '$library_dir'."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # Prominent warning
+    echo ""
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "!!                              WARNING                                   !!"
+    echo "!!                                                                        !!"
+    echo "!!  You are about to reencode ALL $total_files FLAC files in:          !!"
+    echo "!!  $library_dir"
+    echo "!!                                                                        !!"
+    echo "!!  This will:                                                            !!"
+    echo "!!    - Reencode every FLAC file (not just corrupted ones)                !!"
+    echo "!!    - Create backups in 'backup_FLAC_originals' folders                 !!"
+    echo "!!    - Replace each original with the reencoded version                  !!"
+    echo "!!                                                                        !!"
+    echo "!!  This process can take a VERY LONG TIME for large libraries.           !!"
+    echo "!!  Make sure you have enough disk space for backups.                     !!"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo ""
+    read -rp "Type 'REENCODE ALL' to confirm: " confirm
+    if [ "$confirm" != "REENCODE ALL" ]; then
+        echo "Reencode cancelled."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    read -rp "Are you ABSOLUTELY SURE? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Reencode cancelled."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # Create scan data directory and log file
+    scan_data_dir="${library_dir}/.flac_scan_data"
+    mkdir -p "${scan_data_dir}/logs"
+    log_file="${scan_data_dir}/logs/reencode_all_log_$(date +%F_%H-%M-%S).txt"
+    echo "Full library reencode started at $(date)" > "$log_file"
+    echo "Library: $library_dir" >> "$log_file"
+    echo "Total files to process: $total_files" >> "$log_file"
+    echo "" >> "$log_file"
+
+    echo ""
+    echo "Starting reencode of all $total_files FLAC files..."
+    echo ""
+
+    success_count=0
+    fail_count=0
+    processed_count=0
+    start_time=$(date +%s)
+    last_update=0
+
+    # Recursively find .flac files (using -print0 to handle spaces).
+    while IFS= read -r -d '' flac_file; do
+        processed_count=$((processed_count + 1))
+        # Update progress every 50 files or 1% progress
+        if (( processed_count % 50 == 0 || processed_count * 100 / total_files > last_update )); then
+            show_progress "$processed_count" "$total_files" "$fail_count"
+            last_update=$((processed_count * 100 / total_files))
+        fi
+
+        # Determine the file's directory and file name.
+        file_dir=$(dirname "$flac_file")
+        base=$(basename "$flac_file")
+        temp_file="${file_dir}/tmp_${base}"
+
+        # Reencode the file using the specified FLAC parameters.
+        if flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
+            # Create a backup folder in the same directory as the file.
+            backup_folder="${file_dir}/backup_FLAC_originals"
+            mkdir -p "$backup_folder"
+            backup_target="${backup_folder}/${base}"
+
+            if cp "$flac_file" "$backup_target"; then
+                echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
+            else
+                echo "WARNING: Failed to backup $flac_file. Skipping reencode for this file." | tee -a "$log_file"
+                rm -f "$temp_file"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+
+            # Replace the original file with the reencoded version.
+            if mv "$temp_file" "$flac_file"; then
+                success_count=$((success_count + 1))
+                echo "SUCCESS: $flac_file reencoded successfully." >> "$log_file"
+            else
+                echo "FAILURE: Could not overwrite $flac_file with the reencoded file." | tee -a "$log_file"
+                fail_count=$((fail_count + 1))
+            fi
+        else
+            echo "FAILURE: Reencoding failed for $flac_file" | tee -a "$log_file"
+            [ -f "$temp_file" ] && rm "$temp_file"
+            fail_count=$((fail_count + 1))
+        fi
+    done < <(find "$library_dir" -type f -iname "*.flac" -print0)
+
+    # Clear progress line
+    printf "\r%${COLUMNS}s\r" ""
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    echo ""
+    echo "Reencode complete at $(date)" | tee -a "$log_file"
+    echo "Total files processed: $processed_count" | tee -a "$log_file"
+    echo "Successful reencodes: $success_count" | tee -a "$log_file"
+    echo "Failed reencodes: $fail_count" | tee -a "$log_file"
+    echo "Duration: ${duration} seconds" | tee -a "$log_file"
+    echo "Detailed log saved as: $log_file"
+    read -rp "Press Enter to return to main menu..."
+}
+
+########################################
 # FUNCTION: cleanup_backups
 # Finds and removes all backup_FLAC_originals folders
 ########################################
@@ -424,16 +567,18 @@ main_menu() {
     echo "2) Reencode problematic FLAC files (with local backups)"
     echo "3) Set/Update default library path"
     echo "4) Clean up FLAC backups"
-    echo "5) Quit"
+    echo "5) Reencode ALL FLAC files (with backups & warning)"
+    echo "6) Quit"
     echo "======================================"
-    read -rp "Enter your selection (1-5): " selection
+    read -rp "Enter your selection (1-6): " selection
 
     case "$selection" in
         1) scan_library ;;
         2) reencode_library ;;
         3) set_library_path ;;
         4) cleanup_backups ;;
-        5) echo "Exiting..."; exit 0 ;;
+        5) reencode_all_files ;;
+        6) echo "Exiting..."; exit 0 ;;
         *) echo "Invalid selection. Exiting." ; exit 1 ;;
     esac
 }
