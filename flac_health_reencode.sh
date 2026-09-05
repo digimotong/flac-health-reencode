@@ -497,7 +497,11 @@ scan_library() {
             # On a pipe / redirect there is no animated bar row to protect: the
             # error and latest progress are just plain text lines. (On a TTY the
             # initial show_progress above + the redraw below keep the animation.)
-            printf "${RED}Error detected in:${NC} %s\n" "$flac_file"
+            if stdout_is_tty; then
+                printf "${RED}Error detected in:${NC} %s\n" "$flac_file"
+            else
+                echo "Error detected in: $flac_file"
+            fi
             show_progress "$processed_count" "$total_files" "$error_count"
         fi
     done < <(find_real_flac_files "$library_dir" -print0)
@@ -513,16 +517,29 @@ scan_library() {
     # ("reencode problematic files from latest scan") never sees an empty manifest.
     if [ $error_count -gt 0 ]; then
         sed -i "s/| Errors: /| Errors: $error_count/" "$csv_output"
-        printf "${GREEN}Scan complete.${NC}\n"
-        printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
-        printf "Found ${RED}%d${NC} errors\n" "$error_count"
-        printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
+        if stdout_is_tty; then
+            printf "${GREEN}Scan complete.${NC}\n"
+            printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
+            printf "Found ${RED}%d${NC} errors\n" "$error_count"
+            printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
+        else
+            echo "Scan complete."
+            echo "Scanned $processed_count files in $duration seconds"
+            echo "Found $error_count errors"
+            echo "CSV report generated: $csv_output"
+        fi
         report_line="$csv_output"
     else
         rm -f "$csv_output"
-        printf "${GREEN}Scan complete.${NC}\n"
-        printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
-        printf "${GREEN}No errors found.${NC}\n"
+        if stdout_is_tty; then
+            printf "${GREEN}Scan complete.${NC}\n"
+            printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
+            printf "${GREEN}No errors found.${NC}\n"
+        else
+            echo "Scan complete."
+            echo "Scanned $processed_count files in $duration seconds"
+            echo "No errors found."
+        fi
         report_line="(none - no errors found)"
     fi
 
@@ -846,7 +863,11 @@ reencode_new_files() {
 
     if [ "$new_count" -eq 0 ]; then
         echo ""
-        printf "${GREEN}All %d FLAC files have already been reencoded.${NC}\n" "$total_files"
+        if stdout_is_tty; then
+            printf "${GREEN}All %d FLAC files have already been reencoded.${NC}\n" "$total_files"
+        else
+            echo "All $total_files FLAC files have already been reencoded."
+        fi
         echo "Nothing to do. If you added new music, run this option again after adding files."
         read -rp "Press Enter to return to main menu..."
         return
@@ -854,7 +875,11 @@ reencode_new_files() {
 
     # Preview + confirmation (destructive-op style, consistent with the script).
     echo ""
-    echo "Found ${YELLOW}${new_count}${NC} new FLAC file(s) out of $total_files total that have never been reencoded."
+    if stdout_is_tty; then
+        echo "Found ${YELLOW}${new_count}${NC} new FLAC file(s) out of $total_files total that have never been reencoded."
+    else
+        echo "Found $new_count new FLAC file(s) out of $total_files total that have never been reencoded."
+    fi
     echo "Each will be reencoded with --verify and backed up to 'backup_FLAC_originals' before replacing."
     read -rp "Reencode these ${new_count} file(s)? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
