@@ -24,13 +24,14 @@
 # Usage:
 #   1. Run script: ./flac_health_reencode.sh
 #   2. Select operation from menu:
-#      - Scan library for errors
-#      - Re-encode problematic files
+#      - Scan music library for errors
+#      - Re-encode problematic files (from the latest scan report)
 #      - Reencode ALL FLAC files
 #      - Reencode NEW FLAC files only (skip already-processed)
 #      - Manage library path
 #      - Clean up backups
 #
+#   Note: an invalid or empty menu entry re-prompts; type 'q' or '7' to quit.
 # Reencoded-file Tracking:
 #   After a successful reencode a file is recorded in
 #   '<library>/.flac_scan_data/reencoded.db' using its FLAC audio MD5 (from
@@ -436,9 +437,14 @@ scan_library() {
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/reports" "${scan_data_dir}/logs"
     
-    # Generate CSV filename with timestamp
+    # Generate CSV + summary-log filenames with a shared timestamp so a run's
+    # report and summary pair up. The CSV is the machine-readable manifest fed
+    # to "Reencode problematic FLAC files (from latest scan)"; it is only
+    # written when errors exist. The summary log is written on EVERY scan, clean
+    # or not, so each run leaves a small human-readable audit record.
     timestamp=$(date +%F_%H-%M-%S)
     csv_output="${scan_data_dir}/reports/flac_scan_${timestamp}.csv"
+    scan_log="${scan_data_dir}/logs/scan_log_${timestamp}.txt"
 
     echo "Scanning FLAC files in: $library_dir"
     echo "Counting FLAC files..."
@@ -483,26 +489,40 @@ scan_library() {
 
     # Clear progress line
     clear_progress
-    
-    # Update error count in metadata if CSV was created
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Finalize the report. The CSV only exists (and only makes sense) when errors
+    # were found; a clean scan removes the never-populated placeholder so option 2
+    # ("reencode problematic files from latest scan") never sees an empty manifest.
     if [ $error_count -gt 0 ]; then
         sed -i "s/| Errors: /| Errors: $error_count/" "$csv_output"
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
         printf "${GREEN}Scan complete.${NC}\n"
         printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
         printf "Found ${RED}%d${NC} errors\n" "$error_count"
         printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
+        report_line="$csv_output"
     else
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
+        rm -f "$csv_output"
         printf "${GREEN}Scan complete.${NC}\n"
         printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
         printf "${GREEN}No errors found.${NC}\n"
-        rm -f "$csv_output"  # Remove empty CSV
+        report_line="(none - no errors found)"
     fi
 
-    echo "Scan complete. Report saved to: $csv_output"
+    # Every scan, clean or not, writes a small human-readable summary next to the
+    # reports/logs the reencode flows already use, so each run leaves an audit trail.
+    {
+        echo "# Scan Summary: $(date -u +%FT%TZ)"
+        echo "Library: $library_dir"
+        echo "Files scanned: $processed_count"
+        echo "Errors found: $error_count"
+        echo "Duration: ${duration}s"
+        echo "Report: $report_line"
+    } > "$scan_log"
+
+    echo "Scan summary saved to: $scan_log"
     read -rp "Press Enter to return to main menu..."
 }
 
@@ -983,18 +1003,41 @@ set_library_path() {
 # Displays a simple menu to select either scanning or reencoding.
 ########################################
 main_menu() {
-    echo "======================================"
-    echo " FLAC Health Check & Reencode Script"
-    echo "======================================"
-    echo "1) Full scan music library"
-    echo "2) Reencode problematic FLAC files (with local backups)"
-    echo "3) Set/Update default library path"
-    echo "4) Clean up FLAC backups"
-    echo "5) Reencode ALL FLAC files (with backups & warning)"
-    echo "6) Reencode NEW FLAC files only (skips already-reencoded)"
-    echo "7) Quit"
-    echo "======================================"
-    read -rp "Enter your selection (1-7): " selection
+    local menu_bar="=========================================================="
+    echo "$menu_bar"
+    echo "   FLAC Health Check & Reencode Script"
+    echo "$menu_bar"
+
+    # Show the currently-configured library so the user knows what a bulk
+    # operation (options 1/2/5/6) would act on. Colors are only used on a live
+    # terminal so captured/redirected output stays plain.
+    local config library_path
+    config=$(load_config)
+    library_path=$(echo "$config" | jq -r '.library_path')
+    if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
+        if stdout_is_tty; then
+            printf "   ${YELLOW}Library: (not set - use option 3)${NC}\n"
+        else
+            echo "   Library: (not set - use option 3)"
+        fi
+    else
+        if stdout_is_tty; then
+            printf "   ${GREEN}Library: %s${NC}\n" "$library_path"
+        else
+            echo "   Library: $library_path"
+        fi
+    fi
+    echo "$menu_bar"
+
+    echo " 1) Scan music library for errors"
+    echo " 2) Reencode problematic FLAC files (from latest scan)"
+    echo " 3) Set/Update default library path"
+    echo " 4) Clean up FLAC backups"
+    echo " 5) Reencode ALL FLAC files (with backups & warning)"
+    echo " 6) Reencode NEW FLAC files only"
+    echo " 7) Quit"
+    echo "$menu_bar"
+    read -rp "Enter your selection (1-7, or q to quit): " selection
 
     case "$selection" in
         1) scan_library ;;
@@ -1003,8 +1046,8 @@ main_menu() {
         4) cleanup_backups ;;
         5) reencode_all_files ;;
         6) reencode_new_files ;;
-        7) echo "Exiting..."; exit 0 ;;
-        *) echo "Invalid selection. Exiting." ; exit 1 ;;
+        7 | q | Q) echo "Exiting..."; exit 0 ;;
+        *) echo "Invalid selection. Please choose a number from 1-7 (or q to quit)." ;;
     esac
 }
 
