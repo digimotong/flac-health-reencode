@@ -39,12 +39,12 @@ Run the script and follow the interactive menu:
 ```
 
 ### Menu Options:
-1. **Full scan music library** - Checks all FLAC files for errors
-2. **Reencode problematic FLAC files** - Fixes corrupted files (creates backups)
+1. **Full scan music library** - Checks all real FLAC files for errors (excludes the script's own `backup_FLAC_originals` copies and the `.flac_scan_data` tracking dir)
+2. **Reencode problematic FLAC files** - Fixes corrupted files (creates backups); skips any CSV row that points into `backup_FLAC_originals` or `.flac_scan_data`
 3. **Set/Update default library path** - Configure your music library location
 4. **Clean up FLAC backups** - Remove backup files after verification
 5. **Reencode ALL FLAC files** - Reencodes every real FLAC file (excludes the script's own `backup_FLAC_originals` copies and the `.flac_scan_data` tracking dir; with backups & warning)
-6. **Reencode NEW FLAC files only** - Reencodes only files that have never been reencoded
+6. **Reencode NEW FLAC files only** - Reencodes only files that have never been reencoded (excludes `backup_FLAC_originals` and `.flac_scan_data`)
 7. **Quit**
 
 > **Note on "Reencode NEW FLAC files only":** After a successful reencode the

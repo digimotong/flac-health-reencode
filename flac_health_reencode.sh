@@ -44,6 +44,9 @@
 #   - Operation logs are saved in '.flac_scan_data/logs'
 #   - Reencoded-file DB is saved as '.flac_scan_data/reencoded.db'
 #   - Uses FLAC's --decode-through-errors for maximum recovery
+#   - All real-FLAC operations (scan, reencode-from-CSV, reencode ALL/NEW) skip
+#     the script's own 'backup_FLAC_originals' copies and '.flac_scan_data'
+#     directory so backup/internal copies are never scanned or re-encoded.
 ###############################################################################
 
 # flac_health_reencode.sh
@@ -105,13 +108,50 @@ for cmd in flac metaflac; do
     fi
 done
 
+# Paths the script itself creates inside a library. These must never be treated
+# as real library content: pre-reencode backup copies (backup_FLAC_originals/)
+# and the internal scan/tracking directory (.flac_scan_data/). Defined once here
+# so callers can build consistent find predicates or path tests.
+readonly FLAC_INTERNAL_PATH_GLOBS=(
+    '*backup_FLAC_originals/*'
+    '*/.flac_scan_data/*'
+)
+
 ########################################
-# FUNCTION: count_flac_files
-# Counts all FLAC files in a directory
+# FUNCTION: find_real_flac_files
+# Recursively prints a library's real FLAC files, excluding the script's own
+# internal paths (backup copies and .flac_scan_data/). Extra arguments (such as
+# "-print0") are forwarded to find.
+# Arguments:
+#   $1 - Directory to search (library root)
 ########################################
-count_flac_files() {
-    local dir="$1"
-    find "$dir" -type f -iname "*.flac" | wc -l
+find_real_flac_files() {
+    local library_dir="$1"
+    shift
+    local find_args=("$library_dir" -type f -iname "*.flac")
+    local glob
+    for glob in "${FLAC_INTERNAL_PATH_GLOBS[@]}"; do
+        find_args+=(-not -path "$glob")
+    done
+    find "${find_args[@]}" "$@"
+}
+
+########################################
+# FUNCTION: is_internal_flac_path
+# Returns 0 if the given path is one of the script's own internal paths (a
+# backup copy or something under .flac_scan_data/), 1 otherwise. Used to filter
+# non-find inputs (e.g. rows from an older scan CSV).
+# Arguments:
+#   $1 - Path to test
+########################################
+is_internal_flac_path() {
+    local glob
+    for glob in "${FLAC_INTERNAL_PATH_GLOBS[@]}"; do
+        case "$1" in
+            $glob) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 ########################################
@@ -289,8 +329,10 @@ reencode_one_file() {
 
 ########################################
 # FUNCTION: scan_library
-# Prompts for a music library directory, then recursively scans all FLAC files using 'flac -t'.
-# Any file that fails the test is recorded (with quotes) in a CSV file stored in the library directory.
+# Prompts for a music library directory, then recursively scans all real FLAC
+# files using 'flac -t'. The script's own backup_FLAC_originals copies and the
+# .flac_scan_data/ tracking dir are excluded. Any file that fails the test is
+# recorded (with quotes) in a CSV file stored in the library directory.
 ########################################
 scan_library() {
     config=$(load_config)
@@ -319,7 +361,7 @@ scan_library() {
 
     echo "Scanning FLAC files in: $library_dir"
     echo "Counting FLAC files..."
-    total_files=$(count_flac_files "$library_dir")
+    total_files=$(find_real_flac_files "$library_dir" | wc -l)
     echo "Found $total_files FLAC files to scan"
     
     error_count=0
@@ -327,7 +369,6 @@ scan_library() {
     start_time=$(date +%s)
     last_update=0
 
-    # Recursively find .flac files (using -print0 to handle spaces).
     while IFS= read -r -d '' flac_file; do
         processed_count=$((processed_count + 1))
         # Update progress every 50 files or 1% progress
@@ -349,7 +390,7 @@ scan_library() {
             printf "\n${RED}Error detected in:${NC} $flac_file\n"
             show_progress "$processed_count" "$total_files" "$error_count"
         fi
-    done < <(find "$library_dir" -type f -iname "*.flac" -print0)
+    done < <(find_real_flac_files "$library_dir" -print0)
 
     # Clear progress line
     printf "\r%${COLUMNS}s\r" ""
@@ -378,8 +419,12 @@ scan_library() {
 
 ########################################
 # FUNCTION: reencode_library
-# Locates the latest scan CSV file from the supplied directory,
-# confirms with the user, and processes each problematic file for reencoding.
+# Reads the most recent scan CSV from the supplied library directory, confirms
+# with the user, and re-encodes each problematic file listed in it.
+#
+# The scan-report metadata row and header are skipped, as are any paths that
+# point into the script's own internal area (backup copies under
+# backup_FLAC_originals/ or .flac_scan_data/), e.g. from an older/exported CSV.
 #
 # Backup Behavior:
 #   For each file, a backup folder is created within its directory (if not already present)
@@ -435,12 +480,21 @@ reencode_library() {
     success_count=0
     fail_count=0
 
-    # Process each problematic file listed in the CSV (skip header).
+    # Process each problematic file listed in the CSV.
     while IFS=, read -r flac_file; do
         # Remove any surrounding quotes.
         flac_file=${flac_file//\"/}
-        # Skip header row.
-        if [[ "$flac_file" == "filepath" ]]; then
+
+        # Skip the header row and the scan-report metadata line (scan_library
+        # writes a leading '# Scan Report: ...' row that is not a file path).
+        if [[ "$flac_file" == "filepath" ]] || [[ "$flac_file" == \#* ]]; then
+            continue
+        fi
+
+        # Skip any rows that point into the script's own internal area (backup
+        # copies or .flac_scan_data/) — these should never be re-encoded.
+        if is_internal_flac_path "$flac_file"; then
+            echo "Skipping internal/backup path: $flac_file"
             continue
         fi
 
@@ -487,12 +541,10 @@ reencode_all_files() {
         exit 1
     fi
 
-    # Count "real" FLAC files (ignore the script's own backup copies and the
-    # .flac_scan_data tracking dir, consistent with reencode_new_files).
+    # Count real FLAC files (find_real_flac_files skips the script's own backup
+    # copies and the .flac_scan_data tracking dir, consistent with reencode_new_files).
     echo "Counting FLAC files..."
-    total_files=$(find "$library_dir" -type f -iname "*.flac" \
-        -not -path "*backup_FLAC_originals/*" \
-        -not -path "*/.flac_scan_data/*" | wc -l)
+    total_files=$(find_real_flac_files "$library_dir" | wc -l)
     
     if [ "$total_files" -eq 0 ]; then
         echo "No FLAC files found in '$library_dir'."
@@ -568,9 +620,7 @@ reencode_all_files() {
         else
             fail_count=$((fail_count + 1))
         fi
-    done < <(find "$library_dir" -type f -iname "*.flac" \
-        -not -path "*backup_FLAC_originals/*" \
-        -not -path "*/.flac_scan_data/*" -print0)
+    done < <(find_real_flac_files "$library_dir" -print0)
 
     # Clear progress line
     printf "\r%${COLUMNS}s\r" ""
@@ -620,12 +670,10 @@ reencode_new_files() {
     load_reencoded_set "$db_path"
     db_entries=${#REENCODED_SET[@]}
 
-    # Count "real" FLAC files (we ignore the script's own backup copies and the
-    # .flac_scan_data tracking dir so incremental reencodes stay accurate).
+    # Count real FLAC files (find_real_flac_files skips the script's own backup
+    # copies and the .flac_scan_data tracking dir so incremental reencodes stay accurate).
     echo "Counting FLAC files..."
-    total_files=$(find "$library_dir" -type f -iname "*.flac" \
-        -not -path "*backup_FLAC_originals/*" \
-        -not -path "*/.flac_scan_data/*" | wc -l)
+    total_files=$(find_real_flac_files "$library_dir" | wc -l)
 
     if [ "$total_files" -eq 0 ]; then
         echo "No FLAC files found in '$library_dir'."
@@ -652,9 +700,7 @@ reencode_new_files() {
         # Either fingerprint could not be read or this exact MD5+size is unknown:
         # treat the file as new/needing reencode.
         new_files+=("$flac_file")
-    done < <(find "$library_dir" -type f -iname "*.flac" \
-        -not -path "*backup_FLAC_originals/*" \
-        -not -path "*/.flac_scan_data/*" -print0)
+    done < <(find_real_flac_files "$library_dir" -print0)
 
     new_count=${#new_files[@]}
 
