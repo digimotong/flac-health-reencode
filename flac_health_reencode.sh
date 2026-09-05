@@ -120,12 +120,14 @@ count_flac_files() {
 # Arguments:
 #   $1 - Current count
 #   $2 - Total count
-#   $3 - Error count
+#   $3 - Error / failure count
+#   $4 - (optional) label for $3 shown after the colon; defaults to "Errors"
 ########################################
 show_progress() {
     local current=$1
     local total=$2
     local errors=$3
+    local label="${4:-Errors}"
     local percent=$((current * 100 / total))
     local filled=$((percent * PROGRESS_WIDTH / 100))
     local empty=$((PROGRESS_WIDTH - filled))
@@ -133,7 +135,7 @@ show_progress() {
     printf "\r["
     printf "%${filled}s" | tr ' ' '█'
     printf "%${empty}s" | tr ' ' '░'
-    printf "] %3d%% (%d/%d) | Errors: %d" "$percent" "$current" "$total" "$errors"
+    printf "] %3d%% (%d/%d) | %s: %d" "$percent" "$current" "$total" "$label" "$errors"
 }
 ########################################
 
@@ -232,7 +234,8 @@ mark_as_reencoded() {
 # Backs up the original to backup_FLAC_originals, runs flac with
 # --verify --compression-level-0 --decode-through-errors --preserve-modtime,
 # then replaces the original with the reencoded temp file on success.
-# Messages go to the log file; fatal/skip messages additionally to the console.
+# SUCCESS/FAILURE/WARNING status lines are echoed and tee'd to the log file;
+# the quieter "Backup created for:" line goes to the log file only.
 # Arguments:
 #   $1 - Absolute path to the FLAC file
 #   $2 - Tracking database path (for mark_as_reencoded)
@@ -276,7 +279,7 @@ reencode_one_file() {
         return 1
     fi
 
-    echo "SUCCESS: $flac_file reencoded successfully." >> "$log_file" || true
+    echo "SUCCESS: $flac_file reencoded successfully." | tee -a "$log_file"
     if ! mark_as_reencoded "$db_path" "$flac_file"; then
         # Reencode succeeded but recording failed (should be extremely rare).
         echo "WARNING: Reencode succeeded but could not record '$flac_file' in the tracking database." | tee -a "$log_file"
@@ -461,9 +464,12 @@ reencode_library() {
 
 ########################################
 # FUNCTION: reencode_all_files
-# Reencodes EVERY FLAC file in the library (not just problematic ones).
+# Reencodes EVERY "real" FLAC file in the library (not just problematic ones).
 # Shows a prominent warning and requires explicit confirmation before proceeding.
 # Each original file is backed up to a backup_FLAC_originals folder.
+# The script's own backup_FLAC_originals copies and the .flac_scan_data tracking
+# dir are excluded (both the count and the processed set) so backups are never
+# re-encoded into nested backups themselves.
 ########################################
 reencode_all_files() {
     config=$(load_config)
@@ -481,9 +487,12 @@ reencode_all_files() {
         exit 1
     fi
 
-    # Count total FLAC files
+    # Count "real" FLAC files (ignore the script's own backup copies and the
+    # .flac_scan_data tracking dir, consistent with reencode_new_files).
     echo "Counting FLAC files..."
-    total_files=$(count_flac_files "$library_dir")
+    total_files=$(find "$library_dir" -type f -iname "*.flac" \
+        -not -path "*backup_FLAC_originals/*" \
+        -not -path "*/.flac_scan_data/*" | wc -l)
     
     if [ "$total_files" -eq 0 ]; then
         echo "No FLAC files found in '$library_dir'."
@@ -550,7 +559,7 @@ reencode_all_files() {
         processed_count=$((processed_count + 1))
         # Update progress every 50 files or 1% progress
         if (( processed_count % 50 == 0 || processed_count * 100 / total_files > last_update )); then
-            show_progress "$processed_count" "$total_files" "$fail_count"
+            show_progress "$processed_count" "$total_files" "$fail_count" "Failed"
             last_update=$((processed_count * 100 / total_files))
         fi
 
@@ -559,7 +568,9 @@ reencode_all_files() {
         else
             fail_count=$((fail_count + 1))
         fi
-    done < <(find "$library_dir" -type f -iname "*.flac" -print0)
+    done < <(find "$library_dir" -type f -iname "*.flac" \
+        -not -path "*backup_FLAC_originals/*" \
+        -not -path "*/.flac_scan_data/*" -print0)
 
     # Clear progress line
     printf "\r%${COLUMNS}s\r" ""
@@ -627,8 +638,10 @@ reencode_new_files() {
     new_files=()
     skipped_count=0
     while IFS= read -r -d '' flac_file; do
-        fp=$(get_file_fingerprint "$flac_file")
-        if [ -n "$fp" ]; then
+        # Guard on the exit status (not just a non-empty string): an unreadable/
+        # corrupt fingerprint makes get_file_fingerprint return 1, and the file
+        # is then treated as new/needing reencode below.
+        if fp=$(get_file_fingerprint "$flac_file"); then
             read -r md5 size mtime _rest <<< "$fp"
             key="${md5}|${size}"
             if [[ -n "${REENCODED_SET[$key]+x}" ]]; then
@@ -689,7 +702,7 @@ reencode_new_files() {
         processed_count=$((processed_count + 1))
         # Update progress every 50 files or 1% progress
         if (( processed_count % 50 == 0 || processed_count * 100 / new_count > last_update )); then
-            show_progress "$processed_count" "$new_count" "$fail_count"
+            show_progress "$processed_count" "$new_count" "$fail_count" "Failed"
             last_update=$((processed_count * 100 / new_count))
         fi
 

@@ -43,7 +43,7 @@ Run the script and follow the interactive menu:
 2. **Reencode problematic FLAC files** - Fixes corrupted files (creates backups)
 3. **Set/Update default library path** - Configure your music library location
 4. **Clean up FLAC backups** - Remove backup files after verification
-5. **Reencode ALL FLAC files** - Reencodes every FLAC file (with backups & warning)
+5. **Reencode ALL FLAC files** - Reencodes every real FLAC file (excludes the script's own `backup_FLAC_originals` copies and the `.flac_scan_data` tracking dir; with backups & warning)
 6. **Reencode NEW FLAC files only** - Reencodes only files that have never been reencoded
 7. **Quit**
 
