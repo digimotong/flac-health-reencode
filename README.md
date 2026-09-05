@@ -10,12 +10,13 @@ A robust Bash script for scanning and repairing FLAC audio files while preservin
 - Color-coded terminal output with progress tracking
 - Persistent configuration via JSON file
 - Backup cleanup utility
+- Reencode "new" files only, via a persistent MD5+sizes tracking database
 
 ## Installation
 
 1. Ensure you have the required dependencies:
    ```bash
-   sudo apt-get install flac jq  # Debian/Ubuntu
+   sudo apt-get install flac jq  # Debian/Ubuntu (metaflac ships with 'flac')
    brew install flac jq         # macOS
    ```
 
@@ -42,7 +43,16 @@ Run the script and follow the interactive menu:
 2. **Reencode problematic FLAC files** - Fixes corrupted files (creates backups)
 3. **Set/Update default library path** - Configure your music library location
 4. **Clean up FLAC backups** - Remove backup files after verification
-5. **Quit**
+5. **Reencode ALL FLAC files** - Reencodes every FLAC file (with backups & warning)
+6. **Reencode NEW FLAC files only** - Reencodes only files that have never been reencoded
+7. **Quit**
+
+> **Note on "Reencode NEW FLAC files only":** After a successful reencode the
+> script records the file's FLAC audio MD5 + file size in
+> `<library>/.flac_scan_data/reencoded.db`. The "new files" option skips any file
+> already recorded, so newly added albums — or albums you deleted and
+> re-downloaded later — are correctly processed without you having to re-run the
+> expensive "Reencode ALL" option each time.
 
 ## Configuration
 
@@ -63,7 +73,8 @@ The script creates the following structure in your music library:
 .music_library/
 └── .flac_scan_data/
     ├── reports/         # CSV scan reports
-    └── logs/            # Operation logs
+    ├── logs/            # Operation logs
+    └── reencoded.db     # Tracking DB of successfully reencoded files
 ```
 
 For each re-encoded file, a backup is stored in:

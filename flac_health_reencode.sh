@@ -13,10 +13,12 @@
 #   - Configurable library paths (stored in JSON)
 #   - Automatic backup of original files before re-encoding
 #   - Comprehensive error logging
+#   - Persistent 'reencoded' tracking database (avoids redundant full re-encodes)
 #
 # Requirements:
-#   - bash 4.0+
+#   - bash 4.0+ (associative arrays)
 #   - flac command line tool
+#   - metaflac (included with the flac package)
 #   - jq for JSON processing
 #
 # Usage:
@@ -24,13 +26,23 @@
 #   2. Select operation from menu:
 #      - Scan library for errors
 #      - Re-encode problematic files
+#      - Reencode ALL FLAC files
+#      - Reencode NEW FLAC files only (skip already-processed)
 #      - Manage library path
 #      - Clean up backups
+#
+# Reencoded-file Tracking:
+#   After a successful reencode a file is recorded in
+#   '<library>/.flac_scan_data/reencoded.db' using its FLAC audio MD5 (from
+#   metaflac --show-md5sum), file size and mtime. The 'Reencode NEW FLAC files
+#   only' option skips files whose MD5+size are already recorded, so newly added
+#   (or freshly downloaded, previously deleted) albums are reliably detected.
 #
 # Important Notes:
 #   - Backups are stored in 'backup_FLAC_originals' subdirectories
 #   - Scan reports are saved in '.flac_scan_data/reports'
 #   - Operation logs are saved in '.flac_scan_data/logs'
+#   - Reencoded-file DB is saved as '.flac_scan_data/reencoded.db'
 #   - Uses FLAC's --decode-through-errors for maximum recovery
 ###############################################################################
 
@@ -47,6 +59,14 @@ NC='\033[0m' # No Color
 
 # Progress tracking
 PROGRESS_WIDTH=50
+
+# COLUMNS is only auto-set by bash in interactive shells; ensure a sane value so
+# the progress-bar clearing built with ${COLUMNS} never trips "set -u".
+: "${COLUMNS:=80}"
+
+# Set of successfully reencoded files, keyed by md5|size (see load_reencoded_set).
+# global associative array
+declare -A REENCODED_SET
 
 # Exit when a command fails, when a variable is unset, and catch errors in pipelines.
 set -o errexit
@@ -78,9 +98,9 @@ save_config() {
 }
 
 # Ensure required commands are available.
-for cmd in flac; do
+for cmd in flac metaflac; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: The '$cmd' command is not installed. Please install it (e.g., sudo apt-get install $cmd) and try again."
+        echo "Error: The '$cmd' command is not installed. Please install it (e.g., sudo apt-get install flac) and try again."
         exit 1
     fi
 done
@@ -114,6 +134,154 @@ show_progress() {
     printf "%${filled}s" | tr ' ' '█'
     printf "%${empty}s" | tr ' ' '░'
     printf "] %3d%% (%d/%d) | Errors: %d" "$percent" "$current" "$total" "$errors"
+}
+########################################
+
+
+# FUNCTION: get_reencoded_db_path
+# Returns the full path to the reencoded-file tracking database.
+# The DB lives inside the library's own .flac_scan_data directory.
+# Arguments:
+#   $1 - Library root directory
+########################################
+get_reencoded_db_path() {
+    local library_dir="$1"
+    printf '%s/.flac_scan_data/reencoded.db\n' "$library_dir"
+}
+
+########################################
+# FUNCTION: get_file_fingerprint
+# Produces the fingerprint line for a FLAC file: "<md5> <size> <mtime>".
+# The md5 is the audio MD5 from the STREAMINFO block (fast, header-only read).
+# On any failure (e.g. unreadable/corrupt header) this returns 1 so the caller
+# treats the file as needing reencoding.
+# Arguments:
+#   $1 - FLAC file path
+# Output: "<md5> <size> <mtime>"
+########################################
+get_file_fingerprint() {
+    local file="$1"
+    local md5 size mtime
+
+    md5=$(metaflac --show-md5sum "$file" 2>/dev/null) || return 1
+    size=$(stat -c %s "$file" 2>/dev/null) || return 1
+    mtime=$(stat -c %Y "$file" 2>/dev/null) || return 1
+
+    printf '%s %s %s\n' "$md5" "$size" "$mtime"
+}
+
+########################################
+# FUNCTION: load_reencoded_set
+# Loads the tracking database into the global associative array REENCODED_SET.
+# Key = "<md5>|<size>". Blank lines and comment lines are skipped.
+# NOTE: populate the array in the CURRENT shell, so call this as a plain command
+# (never inside $() command substitution, which would run in a subshell and
+# discard the array updates). Inspect ${#REENCODED_SET[@]} for the count.
+# Arguments:
+#   $1 - Tracking database path
+########################################
+load_reencoded_set() {
+    local db_path="$1"
+    local md5 size mtime path_line
+
+    REENCODED_SET=()
+
+    if [ ! -f "$db_path" ]; then
+        return 0
+    fi
+
+    while IFS= read -r path_line || [ -n "$path_line" ]; do
+        [ -z "$path_line" ] && continue
+        case "$path_line" in \#*) continue ;; esac
+        read -r md5 size mtime _rest <<< "$path_line"
+        [ -z "$md5" ] && continue
+        REENCODED_SET["$md5|$size"]=1
+    done < "$db_path"
+}
+
+########################################
+# FUNCTION: mark_as_reencoded
+# Appends the current fingerprint of a successfully reencoded file to the
+# tracking database and records it in the in-memory set as well.
+# Arguments:
+#   $1 - Tracking database path
+#   $2 - FLAC file path
+# Returns non-zero if the fingerprint could not be generated.
+########################################
+mark_as_reencoded() {
+    local db_path="$1"
+    local file="$2"
+    local fp md5 size mtime key
+
+    fp=$(get_file_fingerprint "$file") || return 1
+
+    read -r md5 size mtime _rest <<< "$fp"
+
+    mkdir -p "$(dirname "$db_path")"
+    # Append "<md5> <size> <mtime> <path>"; path is the LAST field so it may
+    # safely contain spaces / special characters.
+    printf '%s\n' "$fp $file" >> "$db_path"
+
+    key="${md5}|${size}"
+    REENCODED_SET["$key"]=1
+}
+
+########################################
+# FUNCTION: reencode_one_file
+# Core single-file reencode logic shared by every reencode path.
+# Backs up the original to backup_FLAC_originals, runs flac with
+# --verify --compression-level-0 --decode-through-errors --preserve-modtime,
+# then replaces the original with the reencoded temp file on success.
+# Messages go to the log file; fatal/skip messages additionally to the console.
+# Arguments:
+#   $1 - Absolute path to the FLAC file
+#   $2 - Tracking database path (for mark_as_reencoded)
+#   $3 - Log file path
+# Returns 0 on success, 1 on failure.
+########################################
+reencode_one_file() {
+    local flac_file="$1"
+    local db_path="$2"
+    local log_file="$3"
+
+    local file_dir base temp_file backup_folder backup_target
+
+    # Determine the file's directory and file name.
+    file_dir=$(dirname "$flac_file")
+    base=$(basename "$flac_file")
+    temp_file="${file_dir}/tmp_${base}"
+
+    # Reencode the file using the specified FLAC parameters.
+    if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
+        echo "FAILURE: Reencoding failed for $flac_file" | tee -a "$log_file"
+        [ -f "$temp_file" ] && rm "$temp_file"
+        return 1
+    fi
+
+    # Create a backup folder in the same directory as the file.
+    backup_folder="${file_dir}/backup_FLAC_originals"
+    mkdir -p "$backup_folder"
+    backup_target="${backup_folder}/${base}"
+
+    if ! cp "$flac_file" "$backup_target"; then
+        echo "WARNING: Failed to backup $flac_file. Skipping reencode for this file." | tee -a "$log_file"
+        rm -f "$temp_file"
+        return 1
+    fi
+    echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
+
+    # Replace the original file with the reencoded version.
+    if ! mv "$temp_file" "$flac_file"; then
+        echo "FAILURE: Could not overwrite $flac_file with the reencoded file." | tee -a "$log_file"
+        return 1
+    fi
+
+    echo "SUCCESS: $flac_file reencoded successfully." >> "$log_file" || true
+    if ! mark_as_reencoded "$db_path" "$flac_file"; then
+        # Reencode succeeded but recording failed (should be extremely rare).
+        echo "WARNING: Reencode succeeded but could not record '$flac_file' in the tracking database." | tee -a "$log_file"
+    fi
+    return 0
 }
 
 ########################################
@@ -252,7 +420,10 @@ reencode_library() {
     # Create scan data directory if needed
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
-    
+
+    # Tracking database for successfully reencoded files.
+    db_path=$(get_reencoded_db_path "$library_dir")
+
     # Generate a log file for the reencoding process.
     log_file="${scan_data_dir}/logs/reencode_log_$(date +%F_%H-%M-%S).txt"
     echo "Reencoding started at $(date)" > "$log_file"
@@ -273,38 +444,9 @@ reencode_library() {
         total_files=$((total_files + 1))
         echo "Processing file: $flac_file"
 
-        # Determine the file's directory and file name.
-        file_dir=$(dirname "$flac_file")
-        base=$(basename "$flac_file")
-        temp_file="${file_dir}/tmp_${base}"
-
-        # Reencode the file using the specified FLAC parameters.
-        if flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
-            # Create a backup folder in the same directory as the file.
-            backup_folder="${file_dir}/backup_FLAC_originals"
-            mkdir -p "$backup_folder"
-            backup_target="${backup_folder}/${base}"
-
-            if cp "$flac_file" "$backup_target"; then
-                echo "Backup created for: $flac_file -> $backup_target"
-            else
-                echo "WARNING: Failed to backup $flac_file. Skipping reencode for this file." | tee -a "$log_file"
-                rm -f "$temp_file"
-                fail_count=$((fail_count + 1))
-                continue
-            fi
-
-            # Replace the original file with the reencoded version.
-            if mv "$temp_file" "$flac_file"; then
-                success_count=$((success_count + 1))
-                echo "SUCCESS: $flac_file reencoded successfully." | tee -a "$log_file"
-            else
-                echo "FAILURE: Could not overwrite $flac_file with the reencoded file." | tee -a "$log_file"
-                fail_count=$((fail_count + 1))
-            fi
+        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+            success_count=$((success_count + 1))
         else
-            echo "FAILURE: Reencoding failed for $flac_file" | tee -a "$log_file"
-            [ -f "$temp_file" ] && rm "$temp_file"
             fail_count=$((fail_count + 1))
         fi
     done < "$latest_csv"
@@ -383,6 +525,10 @@ reencode_all_files() {
     # Create scan data directory and log file
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
+
+    # Tracking database for successfully reencoded files.
+    db_path=$(get_reencoded_db_path "$library_dir")
+
     log_file="${scan_data_dir}/logs/reencode_all_log_$(date +%F_%H-%M-%S).txt"
     echo "Full library reencode started at $(date)" > "$log_file"
     echo "Library: $library_dir" >> "$log_file"
@@ -408,38 +554,9 @@ reencode_all_files() {
             last_update=$((processed_count * 100 / total_files))
         fi
 
-        # Determine the file's directory and file name.
-        file_dir=$(dirname "$flac_file")
-        base=$(basename "$flac_file")
-        temp_file="${file_dir}/tmp_${base}"
-
-        # Reencode the file using the specified FLAC parameters.
-        if flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
-            # Create a backup folder in the same directory as the file.
-            backup_folder="${file_dir}/backup_FLAC_originals"
-            mkdir -p "$backup_folder"
-            backup_target="${backup_folder}/${base}"
-
-            if cp "$flac_file" "$backup_target"; then
-                echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
-            else
-                echo "WARNING: Failed to backup $flac_file. Skipping reencode for this file." | tee -a "$log_file"
-                rm -f "$temp_file"
-                fail_count=$((fail_count + 1))
-                continue
-            fi
-
-            # Replace the original file with the reencoded version.
-            if mv "$temp_file" "$flac_file"; then
-                success_count=$((success_count + 1))
-                echo "SUCCESS: $flac_file reencoded successfully." >> "$log_file"
-            else
-                echo "FAILURE: Could not overwrite $flac_file with the reencoded file." | tee -a "$log_file"
-                fail_count=$((fail_count + 1))
-            fi
+        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+            success_count=$((success_count + 1))
         else
-            echo "FAILURE: Reencoding failed for $flac_file" | tee -a "$log_file"
-            [ -f "$temp_file" ] && rm "$temp_file"
             fail_count=$((fail_count + 1))
         fi
     done < <(find "$library_dir" -type f -iname "*.flac" -print0)
@@ -453,6 +570,148 @@ reencode_all_files() {
     echo ""
     echo "Reencode complete at $(date)" | tee -a "$log_file"
     echo "Total files processed: $processed_count" | tee -a "$log_file"
+    echo "Successful reencodes: $success_count" | tee -a "$log_file"
+    echo "Failed reencodes: $fail_count" | tee -a "$log_file"
+    echo "Duration: ${duration} seconds" | tee -a "$log_file"
+    echo "Detailed log saved as: $log_file"
+    read -rp "Press Enter to return to main menu..."
+}
+########################################
+# FUNCTION: reencode_new_files
+# Reencodes only the FLAC files that have never been successfully reencoded
+# into the original format by this script (i.e. not present in the tracking DB).
+# Newly added albums and freshly re-downloaded (previously deleted) albums are
+# detected via MD5+size and reencoded; everything else is skipped.
+########################################
+reencode_new_files() {
+    config=$(load_config)
+    library_path=$(echo "$config" | jq -r '.library_path')
+
+    if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
+        read -rp "Enter the full path to your music library directory: " library_path
+        save_config "$library_path"
+    fi
+
+    library_dir="$library_path"
+
+    if [ ! -d "$library_dir" ]; then
+        echo "Error: The directory '$library_dir' does not exist."
+        exit 1
+    fi
+
+    # Create scan data directory and determine tracking DB path.
+    scan_data_dir="${library_dir}/.flac_scan_data"
+    mkdir -p "${scan_data_dir}/logs"
+
+    db_path=$(get_reencoded_db_path "$library_dir")
+    # NOTE: must be called as a plain command (not $() substitution) so the
+    # global REENCODED_SET is populated in THIS shell, not a discarded subshell.
+    load_reencoded_set "$db_path"
+    db_entries=${#REENCODED_SET[@]}
+
+    # Count "real" FLAC files (we ignore the script's own backup copies and the
+    # .flac_scan_data tracking dir so incremental reencodes stay accurate).
+    echo "Counting FLAC files..."
+    total_files=$(find "$library_dir" -type f -iname "*.flac" \
+        -not -path "*backup_FLAC_originals/*" \
+        -not -path "*/.flac_scan_data/*" | wc -l)
+
+    if [ "$total_files" -eq 0 ]; then
+        echo "No FLAC files found in '$library_dir'."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # Discovery pass: gather files absent from the tracking DB.
+    echo "Checking which FLAC files have never been reencoded ($db_entries entry/entries in '$db_path')..."
+    new_files=()
+    skipped_count=0
+    while IFS= read -r -d '' flac_file; do
+        fp=$(get_file_fingerprint "$flac_file")
+        if [ -n "$fp" ]; then
+            read -r md5 size mtime _rest <<< "$fp"
+            key="${md5}|${size}"
+            if [[ -n "${REENCODED_SET[$key]+x}" ]]; then
+                skipped_count=$((skipped_count + 1))
+                continue
+            fi
+        fi
+        # Either fingerprint could not be read or this exact MD5+size is unknown:
+        # treat the file as new/needing reencode.
+        new_files+=("$flac_file")
+    done < <(find "$library_dir" -type f -iname "*.flac" \
+        -not -path "*backup_FLAC_originals/*" \
+        -not -path "*/.flac_scan_data/*" -print0)
+
+    new_count=${#new_files[@]}
+
+    if [ "$new_count" -eq 0 ]; then
+        echo ""
+        printf "${GREEN}All %d FLAC files have already been reencoded.${NC}\n" "$total_files"
+        echo "Nothing to do. If you added new music, run this option again after adding files."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # Preview + confirmation (destructive-op style, consistent with the script).
+    echo ""
+    echo "Found ${YELLOW}${new_count}${NC} new FLAC file(s) out of $total_files total that have never been reencoded."
+    echo "Each will be reencoded with --verify and backed up to 'backup_FLAC_originals' before replacing."
+    read -rp "Reencode these ${new_count} file(s)? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Reencode cancelled."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # Create log file.
+    log_file="${scan_data_dir}/logs/reencode_new_log_$(date +%F_%H-%M-%S).txt"
+    echo "New-file reencode started at $(date)" > "$log_file"
+    echo "Library: $library_dir" >> "$log_file"
+    echo "Total FLAC files found: $total_files" >> "$log_file"
+    echo "Already reencoded (skipped): $skipped_count" >> "$log_file"
+    echo "New files to process: $new_count" >> "$log_file"
+    echo "" >> "$log_file"
+
+    echo ""
+    echo "Starting reencode of $new_count new FLAC files..."
+    echo ""
+
+    success_count=0
+    fail_count=0
+    processed_count=0
+    start_time=$(date +%s)
+    last_update=0
+
+    # Process the discovered new files (two-phase: find already completed above,
+    # so live temp files created here can never be picked up mid-run).
+    for flac_file in "${new_files[@]}"; do
+        processed_count=$((processed_count + 1))
+        # Update progress every 50 files or 1% progress
+        if (( processed_count % 50 == 0 || processed_count * 100 / new_count > last_update )); then
+            show_progress "$processed_count" "$new_count" "$fail_count"
+            last_update=$((processed_count * 100 / new_count))
+        fi
+
+        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+            success_count=$((success_count + 1))
+        else
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    # Clear progress line
+    printf "\r%${COLUMNS}s\r" ""
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    echo ""
+    echo "Reencode complete at $(date)" | tee -a "$log_file"
+    echo "Total FLAC files in library: $total_files" | tee -a "$log_file"
+    echo "Already reencoded (skipped): $skipped_count" | tee -a "$log_file"
+    echo "New files found: $new_count" | tee -a "$log_file"
+    echo "New files processed: $processed_count" | tee -a "$log_file"
     echo "Successful reencodes: $success_count" | tee -a "$log_file"
     echo "Failed reencodes: $fail_count" | tee -a "$log_file"
     echo "Duration: ${duration} seconds" | tee -a "$log_file"
@@ -568,9 +827,10 @@ main_menu() {
     echo "3) Set/Update default library path"
     echo "4) Clean up FLAC backups"
     echo "5) Reencode ALL FLAC files (with backups & warning)"
-    echo "6) Quit"
+    echo "6) Reencode NEW FLAC files only (skips already-reencoded)"
+    echo "7) Quit"
     echo "======================================"
-    read -rp "Enter your selection (1-6): " selection
+    read -rp "Enter your selection (1-7): " selection
 
     case "$selection" in
         1) scan_library ;;
@@ -578,7 +838,8 @@ main_menu() {
         3) set_library_path ;;
         4) cleanup_backups ;;
         5) reencode_all_files ;;
-        6) echo "Exiting..."; exit 0 ;;
+        6) reencode_new_files ;;
+        7) echo "Exiting..."; exit 0 ;;
         *) echo "Invalid selection. Exiting." ; exit 1 ;;
     esac
 }
