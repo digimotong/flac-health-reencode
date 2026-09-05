@@ -63,9 +63,18 @@ NC='\033[0m' # No Color
 # Progress tracking
 PROGRESS_WIDTH=50
 
-# COLUMNS is only auto-set by bash in interactive shells; ensure a sane value so
-# the progress-bar clearing built with ${COLUMNS} never trips "set -u".
-: "${COLUMNS:=80}"
+# TTY / rendering state ------------------------------------------------------
+# STDOUT_IS_TTY is populated lazily by stdout_is_tty() on first use and cached,
+# so the many render calls in a loop only pay the [ -t 1 ] syscall once. A whole
+# script invocation never flips fd 1 mid-run, so a single cached value is safe.
+declare -g STDOUT_IS_TTY=''
+
+# STATUS_TO_CONSOLE toggles whether per-file SUCCESS/FAILURE/WARNING status
+# lines are echoed to the terminal (1, default) or only appended to the run log
+# (0). The "live single-line progress bar" mode used by reencode ALL/NEW on a
+# real terminal must keep status text OFF the screen, otherwise it would glue
+# onto / scatter the bar; the statuses still reach the log either way.
+declare -g STATUS_TO_CONSOLE=1
 
 # Set of successfully reencoded files, keyed by md5|size (see load_reencoded_set).
 # global associative array
@@ -155,15 +164,29 @@ is_internal_flac_path() {
 }
 
 ########################################
-# FUNCTION: show_progress
-# Displays a progress bar
+# FUNCTION: stdout_is_tty
+# Returns 0 (true) if fd 1 is attached to a terminal right now, 1 otherwise.
+# The result is cached in STDOUT_IS_TTY ('0'/'1') on first use so a rendering
+# loop only performs the [ -t 1 ] syscall once (see the STDOUT_IS_TTY note).
+########################################
+stdout_is_tty() {
+    [ -z "$STDOUT_IS_TTY" ] && { [ -t 1 ] && STDOUT_IS_TTY=1 || STDOUT_IS_TTY=0; }
+    [ "$STDOUT_IS_TTY" = "1" ]
+}
+
+########################################
+# FUNCTION: render_progress
+# Draws the progress/percent text (with a trailing space so a status label can
+# be appended on the same bar row). No carriage return, newline, or clearing is
+# emitted here - callers decide between the animated single-line form (via
+# show_progress, a real terminal) and the plain text-line form (a non-tty).
 # Arguments:
 #   $1 - Current count
 #   $2 - Total count
 #   $3 - Error / failure count
 #   $4 - (optional) label for $3 shown after the colon; defaults to "Errors"
 ########################################
-show_progress() {
+render_progress() {
     local current=$1
     local total=$2
     local errors=$3
@@ -171,11 +194,68 @@ show_progress() {
     local percent=$((current * 100 / total))
     local filled=$((percent * PROGRESS_WIDTH / 100))
     local empty=$((PROGRESS_WIDTH - filled))
-    
-    printf "\r["
-    printf "%${filled}s" | tr ' ' '█'
-    printf "%${empty}s" | tr ' ' '░'
-    printf "] %3d%% (%d/%d) | %s: %d" "$percent" "$current" "$total" "$label" "$errors"
+
+    printf "["
+    printf "%${filled}s" | tr ' ' '#'
+    printf "%${empty}s" | tr ' ' '-'
+    printf "] %3d%% (%d/%d) | %s: %d " "$percent" "$current" "$total" "$label" "$errors"
+}
+
+########################################
+# FUNCTION: show_progress
+# Draws the progress bar on a real terminal as a single self-updating line: a
+# leading carriage return + clear-to-end-of-line snap the cursor to the start of
+# the row the next time anything is emitted, so the bar always overwrites
+# itself in place on that one row. This MUST be the last thing drawn before
+# control returns to an interactive prompt, and no bare status text is ever
+# echoed between calls to it (see reencode_one_file's STATUS_TO_CONSOLE check).
+########################################
+show_progress() {
+    # Only animate on a real terminal. On a non-tty (pipe/redirect/CI) emit a
+    # plain, self-terminated text line so output stays readable and undamaged
+    # and no stray carriage-return/byte-clearing escapes reach the capture.
+    if stdout_is_tty; then
+        printf "\r"
+        render_progress "$@"
+        printf "\033[K"
+    else
+        printf "Progress: "
+        render_progress "$@"
+        printf "\n"
+    fi
+}
+
+########################################
+# FUNCTION: clear_progress
+# Erases the animated progress-bar line, leaving the cursor on a fresh row.
+# No-op when stdout is not a terminal (in that case there is no bar row to
+# clear - show_progress never emitted a bare line there).
+########################################
+clear_progress() {
+    if stdout_is_tty; then
+        printf "\r\033[K"
+    fi
+}
+
+########################################
+# FUNCTION: write_status
+# Outputs one SUCCESS/FAILURE/WARNING status line. The line is ALWAYS appended
+# to the run log; it is additionally echoed to the terminal only while
+# STATUS_TO_CONSOLE is 1 (the non-tty settings, and all option-2 runs). During
+# the option 5/6 single-line-bar mode on a live terminal STATUS_TO_CONSOLE is
+# 0, so per-file progress does not glue onto / scatter the bar; the log file
+# still receives every line.
+# Arguments:
+#   $1 - Full status line (already includes its SUCCESS/FAILURE/WARNING prefix)
+#   $2 - Run log path
+########################################
+write_status() {
+    local line="$1"
+    local log_file="$2"
+    printf '%s\n' "$line" >> "$log_file"
+    if [ "$STATUS_TO_CONSOLE" = "1" ]; then
+        printf '%s\n' "$line"
+    fi
 }
 ########################################
 
@@ -274,8 +354,9 @@ mark_as_reencoded() {
 # Backs up the original to backup_FLAC_originals, runs flac with
 # --verify --compression-level-0 --decode-through-errors --preserve-modtime,
 # then replaces the original with the reencoded temp file on success.
-# SUCCESS/FAILURE/WARNING status lines are echoed and tee'd to the log file;
-# the quieter "Backup created for:" line goes to the log file only.
+# SUCCESS/FAILURE/WARNING lines are always appended to the run log and echoed to
+# the terminal depending on STATUS_TO_CONSOLE (see write_status); the quieter
+# "Backup created for:" line goes to the log file only.
 # Arguments:
 #   $1 - Absolute path to the FLAC file
 #   $2 - Tracking database path (for mark_as_reencoded)
@@ -296,7 +377,7 @@ reencode_one_file() {
 
     # Reencode the file using the specified FLAC parameters.
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
-        echo "FAILURE: Reencoding failed for $flac_file" | tee -a "$log_file"
+        write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
         [ -f "$temp_file" ] && rm "$temp_file"
         return 1
     fi
@@ -307,7 +388,7 @@ reencode_one_file() {
     backup_target="${backup_folder}/${base}"
 
     if ! cp "$flac_file" "$backup_target"; then
-        echo "WARNING: Failed to backup $flac_file. Skipping reencode for this file." | tee -a "$log_file"
+        write_status "WARNING: Failed to backup $flac_file. Skipping reencode for this file." "$log_file"
         rm -f "$temp_file"
         return 1
     fi
@@ -315,14 +396,14 @@ reencode_one_file() {
 
     # Replace the original file with the reencoded version.
     if ! mv "$temp_file" "$flac_file"; then
-        echo "FAILURE: Could not overwrite $flac_file with the reencoded file." | tee -a "$log_file"
+        write_status "FAILURE: Could not overwrite $flac_file with the reencoded file." "$log_file"
         return 1
     fi
 
-    echo "SUCCESS: $flac_file reencoded successfully." | tee -a "$log_file"
+    write_status "SUCCESS: $flac_file reencoded successfully." "$log_file"
     if ! mark_as_reencoded "$db_path" "$flac_file"; then
         # Reencode succeeded but recording failed (should be extremely rare).
-        echo "WARNING: Reencode succeeded but could not record '$flac_file' in the tracking database." | tee -a "$log_file"
+        write_status "WARNING: Reencode succeeded but could not record '$flac_file' in the tracking database." "$log_file"
     fi
     return 0
 }
@@ -387,13 +468,21 @@ scan_library() {
             # Log problematic file
             echo "\"${flac_file}\"" >> "$csv_output"
             error_count=$((error_count + 1))
-            printf "\n${RED}Error detected in:${NC} $flac_file\n"
+            if stdout_is_tty; then
+                # On a live terminal the bar is cleared before the error line so
+                # it reaches its own row; the bar is then redrawn beneath.
+                clear_progress
+            fi
+            # On a pipe / redirect there is no animated bar row to protect: the
+            # error and latest progress are just plain text lines. (On a TTY the
+            # initial show_progress above + the redraw below keep the animation.)
+            printf "${RED}Error detected in:${NC} %s\n" "$flac_file"
             show_progress "$processed_count" "$total_files" "$error_count"
         fi
     done < <(find_real_flac_files "$library_dir" -print0)
 
     # Clear progress line
-    printf "\r%${COLUMNS}s\r" ""
+    clear_progress
     
     # Update error count in metadata if CSV was created
     if [ $error_count -gt 0 ]; then
@@ -606,11 +695,28 @@ reencode_all_files() {
     start_time=$(date +%s)
     last_update=0
 
+    # Render mode: on a real terminal we keep one single-line animated bar that
+    # never moves (see show_progress) and keep per-file status text off the
+    # screen (STATUS_TO_CONSOLE=0) so nothing glues onto it; on a pipe / redirect
+    # all per-file SUCCESS/FAILURE lines are printed as normal text and the bar
+    # degrades to plain progress lines. Either way the run log gets every status
+    # line. We resolve stdout's tty state once up front rather than in the loop.
+    # STATUS_TO_CONSOLE is restored on exit.
+    local live_tty
+    if stdout_is_tty; then live_tty=1; else live_tty=0; fi
+    # It only makes sense to echo per-file SUCCESS/FAILURE lines to the terminal
+    # when no animated single-line bar is on the screen to protect, i.e. on a
+    # pipe/redirect request (live_tty==0). On a real terminal the statuses stay
+    # in the log so the bar keeps redrawing cleanly in place.
+    STATUS_TO_CONSOLE=$(( 1 - live_tty ))
+
     # Recursively find .flac files (using -print0 to handle spaces).
     while IFS= read -r -d '' flac_file; do
         processed_count=$((processed_count + 1))
-        # Update progress every 50 files or 1% progress
-        if (( processed_count % 50 == 0 || processed_count * 100 / total_files > last_update )); then
+        if [ "$live_tty" = "1" ]; then
+            # Redraw the animated bar in place on every file so it stays put.
+            show_progress "$processed_count" "$total_files" "$fail_count" "Failed"
+        elif (( processed_count % 50 == 0 || processed_count * 100 / total_files > last_update )); then
             show_progress "$processed_count" "$total_files" "$fail_count" "Failed"
             last_update=$((processed_count * 100 / total_files))
         fi
@@ -622,8 +728,9 @@ reencode_all_files() {
         fi
     done < <(find_real_flac_files "$library_dir" -print0)
 
-    # Clear progress line
-    printf "\r%${COLUMNS}s\r" ""
+    # Clear progress line and restore console status output for later echoes.
+    clear_progress
+    STATUS_TO_CONSOLE=1
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
@@ -744,10 +851,20 @@ reencode_new_files() {
 
     # Process the discovered new files (two-phase: find already completed above,
     # so live temp files created here can never be picked up mid-run).
+    # Render mode mirrors reencode_all_files(): single moving-proof animated bar
+    # on a real terminal, plain status lines + interval progress otherwise.
+    local live_tty
+    if stdout_is_tty; then live_tty=1; else live_tty=0; fi
+    # Same echo logic as reencode_all_files: echo per-file status lines to the
+    # terminal only when there is no animated bar row to protect (non-tty run).
+    STATUS_TO_CONSOLE=$(( 1 - live_tty ))
+
     for flac_file in "${new_files[@]}"; do
         processed_count=$((processed_count + 1))
-        # Update progress every 50 files or 1% progress
-        if (( processed_count % 50 == 0 || processed_count * 100 / new_count > last_update )); then
+        if [ "$live_tty" = "1" ]; then
+            # Redraw the animated bar in place on every file so it stays put.
+            show_progress "$processed_count" "$new_count" "$fail_count" "Failed"
+        elif (( processed_count % 50 == 0 || processed_count * 100 / new_count > last_update )); then
             show_progress "$processed_count" "$new_count" "$fail_count" "Failed"
             last_update=$((processed_count * 100 / new_count))
         fi
@@ -759,8 +876,9 @@ reencode_new_files() {
         fi
     done
 
-    # Clear progress line
-    printf "\r%${COLUMNS}s\r" ""
+    # Clear progress line and restore console status output for later echoes.
+    clear_progress
+    STATUS_TO_CONSOLE=1
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))

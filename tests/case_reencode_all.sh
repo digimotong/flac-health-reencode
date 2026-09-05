@@ -49,6 +49,17 @@ occur_re 'Starting reencode of all 3 FLAC files'
 [ "$(captured_count 'Failed reencodes: ([0-9]+)')" -eq 0 ]    || _fail "all: failures != 0"
 [ "$(message_count 'SUCCESS:')" -eq 3 ]                       || _fail "expected exactly 3 SUCCESS lines"
 
+# Regression (progress-bar/output collision): success/status text must never be
+# emitted on the same row as the \r-based progress bar, which glued output like
+# "Failed: 0SUCCESS:". Captured stdout (redirected) must therefore contain no
+# carriage-return byte, and every SUCCESS line must start cleanly on its own row.
+if LC_ALL=C grep -q $'\r' "$CURRENT_OUT"; then
+    _fail "captured output contains carriage-return bytes (progress glue)"
+fi
+if grep -qE 'Failed: [0-9]+SUCCESS:' "$CURRENT_OUT"; then
+    _fail "SUCCESS text glued onto the progress line"
+fi
+
 # Every real file was replaced by the stub reencode marker ...
 file_eq "$R1" 'REENCODE_OK'
 file_eq "$R2" 'REENCODE_OK'
