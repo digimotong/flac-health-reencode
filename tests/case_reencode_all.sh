@@ -5,7 +5,7 @@
 # Verifies the full-library reencode:
 #   * the pre-warning reports the real-file count (3 real; the pre-existing
 #     backup copy + internal .flac_scan_data file are excluded and require
-#     'REENCODE ALL' + 'y' confirmation),
+#     'REENCODE ALL' confirmation),
 #   * every REAL .flac is re-encoded (replaced by the stub marker) exactly
 #     once and recorded in reencoded.db,
 #   * pre-existing backup copies and internal .flac_scan_data files are never
@@ -40,7 +40,7 @@ write_file "$LIB/Album One/sub/backup_FLAC_originals/trackB.flac" 'orig-B'
 mkdir -p "$LIB/.flac_scan_data"
 write_file "$LIB/.flac_scan_data/metrics.flac" 'IGNORED'
 
-run_script "$SBX" '5' 'REENCODE ALL' 'y' ''
+run_script "$SBX" '5' 'REENCODE ALL' ''
 
 # Count = 3 real, never the backup/internal.
 occur_re "You are about to reencode ALL 3 FLAC files"

@@ -665,13 +665,6 @@ reencode_all_files() {
         return
     fi
 
-    read -rp "Are you ABSOLUTELY SURE? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Reencode cancelled."
-        read -rp "Press Enter to return to main menu..."
-        return
-    fi
-
     # Create scan data directory and log file
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
@@ -941,12 +934,6 @@ cleanup_backups() {
     echo "WARNING: This will PERMANENTLY delete all FLAC backups"
     read -rp "Type 'DELETE' to confirm: " confirm
     if [ "$confirm" != "DELETE" ]; then
-        echo "Backup cleanup cancelled."
-        return 0
-    fi
-
-    read -rp "Are you ABSOLUTELY SURE? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Backup cleanup cancelled."
         return 0
     fi
