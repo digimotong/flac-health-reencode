@@ -4,3 +4,11 @@
 !.gitignore
 !README.md
 !flac_health_reencode.sh
+
+# Test suite + CI config (see tests/README-free run_tests.sh; README notes)
+!tests/
+!tests/*
+!.github/
+!.github/*
+!.github/workflows/
+!.github/workflows/*

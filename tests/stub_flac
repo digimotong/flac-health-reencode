@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+###############################################################################
+# Test stub for the 'flac' binary.
+#
+# The real 'flac' is NOT required to run the test suite. This stub fakes the two
+# behaviours the script relies on, and is kept deliberately thin:
+#
+#   Test mode      : flac -t <file>
+#                    -> exit 0 normally; exit 1 when <file> content contains
+#                       the marker token CORRUPT (simulates a corrupt/errant
+#                       file so scans flag it but backups of it stay excluded).
+#   Re-encode mode : flac --verify --compression-level-0 ... -o <out> <in>
+#                    -> writes a fresh marker string to <out> and exit 0, then
+#                       the script's cp/mv moves it over the original.
+#
+# If the real script ever changes the flac flags it passes, update this stub to
+# keep matching (see Tests in README).
+###############################################################################
+
+out=''
+infile=''
+prev=''
+for arg in "$@"; do
+    if [ "$prev" = '-o' ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+
+# Last positional argument is the input file for both -t and re-encode modes.
+infile="${@: -1}"
+
+if [[ " $* " == *' -t '* ]]; then
+    # Test mode.
+    if [ -f "$infile" ] && grep -q CORRUPT "$infile" 2>/dev/null; then
+        exit 1
+    fi
+    exit 0
+fi
+
+# Re-encode mode: overwrite the temp target with a single, file-INDEPENDENT
+# marker line. Tests then assert "original replaced by the marker" with no
+# dependence on the file name, and "backups never carry the marker".
+if [ -n "$out" ]; then
+    printf 'REENCODE_OK\n' > "$out"
+fi
+exit 0

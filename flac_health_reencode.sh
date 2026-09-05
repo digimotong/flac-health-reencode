@@ -904,7 +904,11 @@ main_menu() {
 }
 
 
-# Start the script by displaying the main menu in a loop
-while true; do
-    main_menu
-done
+# Start the script by displaying the main menu in a loop. The BASH_SOURCE guard
+# keeps the menu from auto-running when this file is sourced (the test suite
+# sources it to unit-test individual functions directly).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    while true; do
+        main_menu
+    done
+fi
