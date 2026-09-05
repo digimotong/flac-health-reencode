@@ -382,6 +382,12 @@ reencode_one_file() {
     # and keeps an interrupted-run leftover out of the next scan / reencode-NEW.
     temp_file="${file_dir}/tmp_${base}.part"
 
+    # A leftover 'tmp_<base>.part' from an earlier INTERRUPTED run would cause
+    # flac (without -f) to refuse writing: "output file ... already exists."
+    # That temp lives in the script's own namespace, so deleting it first is
+    # always safe: no stale residue can ever block a fresh run.
+    rm -f "$temp_file"
+
     # Reencode the file using the specified FLAC parameters.
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
         write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
