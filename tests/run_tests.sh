@@ -38,8 +38,17 @@ fi
 echo "ok: syntax gate       ($PROD_SCRIPT)"
 
 # 2. Required tooling -----------------------------------------------------------
+# NOTE:
+#   * md5sum ships with coreutils and is preinstalled on ubuntu-latest.
+#   * Under CI (on: pull_request / push, .github/workflows/tests.yml), a missing
+#     tool must FAIL loudly -- a silent SKIP would let a broken install step pass.
+#   * Running locally, a missing md5sum is unexpected too; skip gracefully anyway.
 for tool in jq md5sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
+        if [ "${CI:-}" = "true" ]; then
+            echo "FAIL: tool '$tool' not installed (required in CI)." >&2
+            exit 1
+        fi
         echo "SKIP: tool '$tool' not installed; run_tests cannot exercise the script." >&2
         exit 0
     fi

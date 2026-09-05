@@ -14,7 +14,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq md5sum bash
+          # 'bash' and 'md5sum' (from coreutils) are already preinstalled on the
+          # ubuntu-latest runner; only jq needs installing.
+          sudo apt-get install -y --no-install-recommends jq
         shell: bash
 
       - name: Run FLAC health/re-encode test suite
