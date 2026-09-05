@@ -437,9 +437,14 @@ scan_library() {
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/reports" "${scan_data_dir}/logs"
     
-    # Generate CSV filename with timestamp
+    # Generate CSV + summary-log filenames with a shared timestamp so a run's
+    # report and summary pair up. The CSV is the machine-readable manifest fed
+    # to "Reencode problematic FLAC files (from latest scan)"; it is only
+    # written when errors exist. The summary log is written on EVERY scan, clean
+    # or not, so each run leaves a small human-readable audit record.
     timestamp=$(date +%F_%H-%M-%S)
     csv_output="${scan_data_dir}/reports/flac_scan_${timestamp}.csv"
+    scan_log="${scan_data_dir}/logs/scan_log_${timestamp}.txt"
 
     echo "Scanning FLAC files in: $library_dir"
     echo "Counting FLAC files..."
@@ -484,26 +489,40 @@ scan_library() {
 
     # Clear progress line
     clear_progress
-    
-    # Update error count in metadata if CSV was created
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Finalize the report. The CSV only exists (and only makes sense) when errors
+    # were found; a clean scan removes the never-populated placeholder so option 2
+    # ("reencode problematic files from latest scan") never sees an empty manifest.
     if [ $error_count -gt 0 ]; then
         sed -i "s/| Errors: /| Errors: $error_count/" "$csv_output"
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
         printf "${GREEN}Scan complete.${NC}\n"
         printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
         printf "Found ${RED}%d${NC} errors\n" "$error_count"
         printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
+        report_line="$csv_output"
     else
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
+        rm -f "$csv_output"
         printf "${GREEN}Scan complete.${NC}\n"
         printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
         printf "${GREEN}No errors found.${NC}\n"
-        rm -f "$csv_output"  # Remove empty CSV
+        report_line="(none - no errors found)"
     fi
 
-    echo "Scan complete. Report saved to: $csv_output"
+    # Every scan, clean or not, writes a small human-readable summary next to the
+    # reports/logs the reencode flows already use, so each run leaves an audit trail.
+    {
+        echo "# Scan Summary: $(date -u +%FT%TZ)"
+        echo "Library: $library_dir"
+        echo "Files scanned: $processed_count"
+        echo "Errors found: $error_count"
+        echo "Duration: ${duration}s"
+        echo "Report: $report_line"
+    } > "$scan_log"
+
+    echo "Scan summary saved to: $scan_log"
     read -rp "Press Enter to return to main menu..."
 }
 

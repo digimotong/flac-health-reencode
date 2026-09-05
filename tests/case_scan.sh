@@ -6,8 +6,9 @@
 #    file. Asserts only real files are counted/catalogued (2 real of 4 total),
 #    a CSV is produced with the '# Scan Report...' comment + 'filepath' header,
 #    the report's single data row = the real corrupt file (backup/internal are
-#    NOT reported even when corrupt).
-# B. Library that is CLEAN: reports "No errors found." and leaves NO CSV.
+#    NOT reported even when corrupt), AND a scan summary log is written.
+# B. Library that is CLEAN: reports "No errors found.", writes a scan summary
+#    log, but leaves NO CSV.
 ###############################################################################
 
 set -o errexit
@@ -20,6 +21,8 @@ set -o pipefail
 
 # 'reports' dir only exists once a scan runs; helper to fetch its one CSV.
 first_csv() { find "$1/.flac_scan_data/reports" -type f -name 'flac_scan_*.csv' -print | head -1; }
+# Fetch the single scan-summary log written to the logs dir.
+first_scan_log() { find "$1/.flac_scan_data/logs" -type f -name 'scan_log_*.txt' -print | head -1; }
 
 # ===========================================================================
 # Run A: corrupt real + corrupt backup + corrupt internal file
@@ -60,6 +63,12 @@ esac
 ! grep -Fq 'backup_FLAC_originals' "$CSV" || _fail "corrupt backup echoed in CSV"
 ! grep -Fq '.flac_scan_data' "$CSV"       || _fail "internal path echoed in CSV"
 
+# A scan summary log is written even on a run that found errors.
+SLOG=$(first_scan_log "$LIB")
+[ -n "$SLOG" ] || _fail "expected a scan summary log after the corrupt run"
+exist "$SLOG"
+occur_re 'Scan summary saved to: .*scan_log_.*\.txt'
+
 echo "ok  case_scan (library with corrupt real file)"
 
 # ===========================================================================
@@ -77,5 +86,13 @@ run_script "$SBX2" '1' ''
 occur_re 'No errors found'
 occur_re 'Scan complete'
 [ -z "$(first_csv "$LIB2")" ] || _fail "a CSV was left behind after a clean scan"
+
+# A clean scan still leaves a summary log (no CSV), and its report line says so.
+SLOG2=$(first_scan_log "$LIB2")
+[ -n "$SLOG2" ] || _fail "expected a scan summary log after the clean run"
+exist "$SLOG2"
+grep -qE '^Errors found: 0$' "$SLOG2"   || _fail "clean summary log lacks 'Errors found: 0'"
+grep -Fq 'none - no errors found' "$SLOG2" \
+    || _fail "clean summary log's Report line does not indicate no report"
 
 echo "ok  case_scan (clean library)"
