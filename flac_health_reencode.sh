@@ -196,8 +196,8 @@ render_progress() {
     local empty=$((PROGRESS_WIDTH - filled))
 
     printf "["
-    printf "%${filled}s" | tr ' ' '█'
-    printf "%${empty}s" | tr ' ' '░'
+    printf "%${filled}s" | tr ' ' '#'
+    printf "%${empty}s" | tr ' ' '-'
     printf "] %3d%% (%d/%d) | %s: %d " "$percent" "$current" "$total" "$label" "$errors"
 }
 
