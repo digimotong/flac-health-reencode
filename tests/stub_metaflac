@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+###############################################################################
+# Test stub for the 'metaflac' binary.
+#
+# The real 'metaflac' is NOT required to run the test suite. The script only
+# reads the audio MD5 via:  metaflac --show-md5sum <file>
+# This stub emits a stable 32-hex MD5 derived from the file's content, so the
+# tracking database (reencoded.db) gets deterministic, content-keyed values
+# that support the skip-if-already-reencoded tests.
+###############################################################################
+
+case " $* " in
+    *' --show-md5sum '*)
+        # Emit md5 for the file that follows --show-md5sum.
+        file=''
+        prev=''
+        for arg in "$@"; do
+            if [ "$prev" = '--show-md5sum' ]; then
+                file="$arg"
+                break
+            fi
+            prev="$arg"
+        done
+        if [ -n "$file" ]; then
+            md5sum < "$file" | awk '{print $1}'
+            exit 0
+        fi
+        ;;
+esac
+
+# Anything else: report success with no output (callers tolerate that).
+exit 0

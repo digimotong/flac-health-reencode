@@ -83,3 +83,47 @@ album_folder/
 └── backup_FLAC_originals/
     └── original_file.flac
 ```
+
+## Testing
+
+A committed integration/unit suite lives in `tests/` and runs on every push via
+GitHub Actions (`.github/workflows/tests.yml`, `ubuntu-latest`).
+
+```bash
+# from the repository root
+bash tests/run_tests.sh
+```
+
+What it covers:
+
+- **Menu-driven integration runs** (`tests/case_scan.sh`, `case_reencode_csv.sh`,
+  `case_reencode_all.sh`, `case_reencode_new.sh`, `case_cleanup_backups.sh`)
+  actually execute the **real** `flac_health_reencode.sh` against isolated,
+  throwaway sandboxes. Each case builds its own library + config + PATH of stub
+  binaries (`tests/stub_flac`, `tests/stub_metaflac`) so the real `flac` tool is
+  **not** required and nothing outside the sandbox is touched.
+- **Source-guard unit tests** (`case_helpers.sh` + `source_guard_units.sh`)
+  `source` the real script to call `find_real_flac_files`,
+  `is_internal_flac_path`, `get_file_fingerprint` and the reencode-tracking DB
+  helpers directly. The menu does **not** auto-run when sourced thanks to the
+  `BASH_SOURCE` guard at the bottom of the production script.
+- **Exclusion & skip guarantees**: backup `backup_FLAC_originals/` copies and the
+  `.flac_scan_data/` directory are never scanned, re-encoded, or recorded in
+  `reencoded.db`.
+
+Test philosophy: assertions are intentionally **loose**. We check short, stable
+tokens (`Found 1 errors`, `SUCCESS:`, `New files found: 2`) and, most
+importantly, **observable state/behaviour** — a CSV row equals the real path, a
+file's content changed to the stub re-encode marker while its backup kept the
+original bytes, `reencoded.db` gained/lost exactly the right entries, backup
+folders disappeared. We never match the entire rendered output, progress bars,
+spacing, or timestamps, so wording-only changes don't break the suite.
+
+When adding or changing the `flac`/`metaflac` flags the real script passes, update
+the two stubs to keep matching — see the header comments in each stub.
+
+To see the suite exercise a failure, break any case (e.g. change an expected
+count) and re-run — the failed case exits non-zero and `run_tests.sh` replays its
+captured output. (You can also run a single case directly:
+`TESTS_ROOT=tests PROD_SCRIPT=$PWD/flac_health_reencode.sh bash tests/case_scan.sh`.)
+
