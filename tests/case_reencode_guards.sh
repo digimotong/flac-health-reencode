@@ -14,6 +14,10 @@
 #    the pristine first-reencode backup bytes survive the re-run.
 # C. Graceful-return guard (F4): choosing an option whose library path no
 #    longer exists returns to the main menu instead of hard-exiting the script.
+# D. Stale-residue guard (F1): a leftover 'tmp_*.part' from an interrupted run
+#    (which makes real flac's -o write refuse with "output file ... already
+#    exists") is cleared by the script before re-encoding, so a resumed full
+#    pass succeeds and leaves no residue to trip the run after it.
 ###############################################################################
 
 set -o errexit
@@ -105,3 +109,55 @@ occur_re "$MENU_TITLE"
     || _fail "main menu was not redrawn after the error return (script hard-exited?)"
 
 echo "ok: reencode_guards (missing path returns to menu)"
+
+# ===========================================================================
+# D. Stale-residue guard (F1): a leftover 'tmp_*.part' from an interrupted run
+#    blocks a re-encode unless the script clears it first.
+#
+#    REAL flac (invoked without -f) refuses to write when its -o target already
+#    exists. On a full option-5 pass over 27k files the user hit exactly that:
+#    a stale 'tmp_...part' after a previous interrupted run made flac error
+#    "output file ... already exists". This guard plants a sandbox-local flac
+#    stub that reproduces that refusal, pre-seeds the same stale residue, and
+#    verifies the script's pre-delete lets the re-encode proceed -- and that no
+#    residue remains afterward to trip the NEXT run.
+# ===========================================================================
+SBX4=''
+make_sandbox SBX4
+register_sandbox "$SBX4"
+LIB4="$SBX4/lib"
+mkdir -p "$LIB4/Album"
+
+# Plant a REAL-flac-like overwrite-refusing stub in this sandbox only.
+cat > "$SBX4/bin/flac" <<'FLAC'
+#!/usr/bin/env bash
+prev=''; out=''
+for a in "$@"; do [ "$prev" = '-o' ] && out="$a"; prev="$a"; done
+if [ -z "$out" ]; then echo "stub needs -o" >&2; exit 1; fi
+if [ -e "$out" ]; then
+    echo "ERROR: output file $out already exists, use -f to override" >&2
+    exit 1
+fi
+printf 'REENCODE_OK\n' > "$out"
+exit 0
+FLAC
+chmod +x "$SBX4/bin/flac"
+
+write_file "$LIB4/Album/track.flac"         'PRIMAL-ORIGINAL'
+# The exact residue from the user's interrupted full re-encode: a pre-existing
+# temp the script itself created on a prior (aborted) pass.
+write_file "$LIB4/Album/tmp_track.flac.part" 'pristine-debris-CORRUPT'
+
+# Option 5 = full re-encode of every *.flac in the library.
+run_script "$SBX4" '5' 'REENCODE ALL' ''
+
+# The stale .part must have been cleared BEFORE flac (no "already exists" error)
+# and the re-encode must have replaced the track with the stub marker.
+absent_re 'already exists'
+file_eq "$LIB4/Album/track.flac" "$RE_MARKER"
+# The temp was consumed by the successful mv -- nothing left to trip a future run.
+find_result="$(find "$LIB4/Album" -name 'tmp_*' -print)"
+[ -z "$find_result" ] || _fail "residue remains after successful re-encode: $find_result"
+
+echo "ok: reencode_guards (stale .part cleared before re-encode)"
+
