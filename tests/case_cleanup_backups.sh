@@ -2,8 +2,8 @@
 ###############################################################################
 # case_cleanup_backups.sh - integration: option 4 (Clean up FLAC backups)
 #
-#   A. With backups present: reports them, demands 'DELETE' + 'y', removes ONLY
-#      the backup_FLAC_originals dirs, and leaves every real FLAC + the
+#   A. With backups present: reports them, demands the 'DELETE' phrase, removes
+#      ONLY the backup_FLAC_originals dirs, and leaves every real FLAC + the
 #      .flac_scan_data directory untouched.
 #   B. With no backups: prints 'No backup folders found' and changes nothing.
 ###############################################################################
@@ -31,7 +31,7 @@ write_file "$LIB/Album2/deeper/track.flac"              'REAL-B'
 write_file "$LIB/Album2/deeper/backup_FLAC_originals/track.flac" 'BAK-B'
 write_file "$LIB/.flac_scan_data/reports/internal.flac" 'INTERNAL-NOT-BACKUP'
 
-run_script "$SBX" '4' 'DELETE' 'y' ''
+run_script "$SBX" '4' 'DELETE' ''
 
 occur_re 'Found 2 backup folders'
 occur_re "WARNING: This will PERMANENTLY delete all FLAC backups"
