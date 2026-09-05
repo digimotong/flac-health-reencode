@@ -11,7 +11,9 @@
 #   - Recursive directory scanning
 #   - Progress tracking with visual feedback
 #   - Configurable library paths (stored in JSON)
-#   - Automatic backup of original files before re-encoding
+#   - Automatic backup of original files before re-encoding (a backup is written
+#     only the first time a file is re-encoded, so the pristine original survives
+#     re-runs over the same files)
 #   - Comprehensive error logging
 #   - Persistent 'reencoded' tracking database (avoids redundant full re-encodes)
 #
@@ -374,7 +376,11 @@ reencode_one_file() {
     # Determine the file's directory and file name.
     file_dir=$(dirname "$flac_file")
     base=$(basename "$flac_file")
-    temp_file="${file_dir}/tmp_${base}"
+    # The reencode temp is named 'tmp_<base>.part' (NOT '*.flac') so it can
+    # never be mistaken for real library content: find_real_flac_files feeds on
+    # '*.flac', which keeps a live temp out of a concurrent option-5 find stream
+    # and keeps an interrupted-run leftover out of the next scan / reencode-NEW.
+    temp_file="${file_dir}/tmp_${base}.part"
 
     # Reencode the file using the specified FLAC parameters.
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
@@ -388,16 +394,24 @@ reencode_one_file() {
     mkdir -p "$backup_folder"
     backup_target="${backup_folder}/${base}"
 
-    if ! cp "$flac_file" "$backup_target"; then
+    if [ -e "$backup_target" ]; then
+        # A backup already exists for this file (e.g. a re-run over the same
+        # CSV or the option-5 full pass, where the current file may already be
+        # a reencoded version). Keep the EXISTING backup so the pristine
+        # original is never overwritten; the reencode below still proceeds.
+        echo "Backup already exists (keeping original): $backup_target" >> "$log_file"
+    elif ! cp "$flac_file" "$backup_target"; then
         write_status "WARNING: Failed to backup $flac_file. Skipping reencode for this file." "$log_file"
         rm -f "$temp_file"
         return 1
+    else
+        echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
     fi
-    echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
 
     # Replace the original file with the reencoded version.
     if ! mv "$temp_file" "$flac_file"; then
         write_status "FAILURE: Could not overwrite $flac_file with the reencoded file." "$log_file"
+        rm -f "$temp_file"
         return 1
     fi
 
@@ -430,7 +444,8 @@ scan_library() {
     # Validate the directory.
     if [ ! -d "$library_dir" ]; then
         echo "Error: The directory '$library_dir' does not exist."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Create scan data directory structure
@@ -552,7 +567,8 @@ reencode_library() {
     
     if [ ! -d "$library_dir" ]; then
         echo "Error: The directory '$library_dir' does not exist."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Locate the latest CSV file in reports directory (by modification time).
@@ -564,14 +580,16 @@ reencode_library() {
 
     if [ -z "$latest_csv" ]; then
         echo "No CSV file found in '$library_dir'. Please run a scan first."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     echo "Latest scan CSV file found: $latest_csv"
     read -rp "Type 'Y' to confirm using this CSV file for reencoding: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "User did not confirm. Aborting reencoding process."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Create scan data directory if needed
@@ -644,10 +662,11 @@ reencode_all_files() {
     fi
 
     library_dir="$library_path"
-    
+
     if [ ! -d "$library_dir" ]; then
         echo "Error: The directory '$library_dir' does not exist."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Count real FLAC files (find_real_flac_files skips the script's own backup
@@ -777,7 +796,8 @@ reencode_new_files() {
 
     if [ ! -d "$library_dir" ]; then
         echo "Error: The directory '$library_dir' does not exist."
-        exit 1
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Create scan data directory and determine tracking DB path.
@@ -937,12 +957,15 @@ cleanup_backups() {
         return 0
     fi
 
-    # Calculate total size and count
+    # Pre-measure every folder's size BEFORE any deletion (du of a removed
+    # folder reports nothing) so the summary below can report honest bytes.
     total_size=0
     total_files=0
+    backup_sizes=()
     for folder in "${backup_folders[@]}"; do
         size=$(du -sb "$folder" | cut -f1)
         files=$(find "$folder" -type f | wc -l)
+        backup_sizes+=("$size")
         total_size=$((total_size + size))
         total_files=$((total_files + files))
     done
@@ -958,15 +981,17 @@ cleanup_backups() {
         return 0
     fi
 
-    # Actually delete
+    # Actually delete. Use the pre-measured sizes (see note above) so the final
+    # byte count reflects what was actually removed.
     deleted_count=0
     deleted_size=0
+    folder_index=0
     for folder in "${backup_folders[@]}"; do
         echo "Deleting: $folder"
         rm -rf "$folder"
         deleted_count=$((deleted_count + 1))
-        size=$(du -sb "$folder" 2>/dev/null | cut -f1 || echo 0)
-        deleted_size=$((deleted_size + size))
+        deleted_size=$((deleted_size + ${backup_sizes[$folder_index]}))
+        folder_index=$((folder_index + 1))
     done
 
     hr_deleted_size=$(numfmt --to=iec --suffix=B $deleted_size)

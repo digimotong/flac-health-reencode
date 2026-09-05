@@ -4,7 +4,8 @@
 #
 #   A. With backups present: reports them, demands the 'DELETE' phrase, removes
 #      ONLY the backup_FLAC_originals dirs, and leaves every real FLAC + the
-#      .flac_scan_data directory untouched.
+#      .flac_scan_data directory untouched. The freed-size summary reports the
+#      real bytes (regression: was always "(0B)" due to a post-delete 'du').
 #   B. With no backups: prints 'No backup folders found' and changes nothing.
 ###############################################################################
 
@@ -36,6 +37,9 @@ run_script "$SBX" '4' 'DELETE' ''
 occur_re 'Found 2 backup folders'
 occur_re "WARNING: This will PERMANENTLY delete all FLAC backups"
 occur_re 'Deleted 2 backup folders'
+# The reported freed size is honest (not the "(0B)" a post-rm 'du' produced):
+# the two backups hold 5 bytes ('BAK-A' / 'BAK-B') => 10 bytes deleted.
+occur_re 'Deleted 2 backup folders .*10B)'
 
 # The two backup dirs are gone...
 miss "$LIB/Album/backup_FLAC_originals"
