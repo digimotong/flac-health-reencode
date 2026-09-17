@@ -28,7 +28,10 @@ for arg in "$@"; do
 done
 
 # Last positional argument is the input file for both -t and re-encode modes.
-infile="${@: -1}"
+# Use the array's final element directly rather than an array-to-string slice:
+# ${@: -1} would be an array assignment, which shellcheck flags (SC2124) and
+# which silently joins multiple trailing words.
+infile="${*: -1}"
 
 if [[ " $* " == *' -t '* ]]; then
     # Test mode.

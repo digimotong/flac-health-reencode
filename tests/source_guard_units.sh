@@ -59,6 +59,10 @@ done < <(find_real_flac_files "$LIB" -print0)
 
 # --- get_file_fingerprint -----------------------------------------------------
 fp=$(get_file_fingerprint "$LIB/Album/plain.flac") || fail "fingerprint failed"
+# Split the 3-field fingerprint on whitespace. Quoting is deliberately omitted:
+# the whole point is to word-split "<md5> <size> <mtime>" into $1 $2 $3 -- each
+# field is a plain hex/number token with no spaces, so no globbing can occur.
+# shellcheck disable=SC2086
 set -- $fp
 [ "$#" -eq 3 ]        || fail "fingerprint not 3 fields: <$fp>"
 case "$1" in

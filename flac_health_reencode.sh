@@ -158,6 +158,12 @@ find_real_flac_files() {
 ########################################
 is_internal_flac_path() {
     local glob
+    # Disable at the FUNCTION level: the case patterns below are deliberately
+    # UNQUOTED because the globs in FLAC_INTERNAL_PATH_GLOBS contain '*' and are
+    # meant to match as globs. Quoting them (as SC2254 suggests) would make case
+    # compare literally and every internal path would stop being recognised.
+    # (An inline directive is not allowed in front of a single case branch.)
+    # shellcheck disable=SC2254
     for glob in "${FLAC_INTERNAL_PATH_GLOBS[@]}"; do
         case "$1" in
             $glob) return 0 ;;
@@ -504,7 +510,7 @@ scan_library() {
             # error and latest progress are just plain text lines. (On a TTY the
             # initial show_progress above + the redraw below keep the animation.)
             if stdout_is_tty; then
-                printf "${RED}Error detected in:${NC} %s\n" "$flac_file"
+                printf '%b%s\n' "${RED}Error detected in:${NC} " "$flac_file"
             else
                 echo "Error detected in: $flac_file"
             fi
@@ -521,10 +527,10 @@ scan_library() {
     # Finalize the report. The CSV only exists (and only makes sense) when errors
     # were found; a clean scan removes the never-populated placeholder so option 2
     # ("reencode problematic files from latest scan") never sees an empty manifest.
-    if [ $error_count -gt 0 ]; then
+    if [ "$error_count" -gt 0 ]; then
         sed -i "s/| Errors: /| Errors: $error_count/" "$csv_output"
         if stdout_is_tty; then
-            printf "${GREEN}Scan complete.${NC}\n"
+            printf '%b\n' "${GREEN}Scan complete.${NC}"
             printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
             printf "Found ${RED}%d${NC} errors\n" "$error_count"
             printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
@@ -538,9 +544,9 @@ scan_library() {
     else
         rm -f "$csv_output"
         if stdout_is_tty; then
-            printf "${GREEN}Scan complete.${NC}\n"
+            printf '%b\n' "${GREEN}Scan complete.${NC}"
             printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
-            printf "${GREEN}No errors found.${NC}\n"
+            printf '%b\n' "${GREEN}No errors found.${NC}"
         else
             echo "Scan complete."
             echo "Scanned $processed_count files in $duration seconds"
@@ -735,10 +741,12 @@ reencode_all_files() {
     db_path=$(get_reencoded_db_path "$library_dir")
 
     log_file="${scan_data_dir}/logs/reencode_all_log_$(date +%F_%H-%M-%S).txt"
-    echo "Full library reencode started at $(date)" > "$log_file"
-    echo "Library: $library_dir" >> "$log_file"
-    echo "Total files to process: $total_files" >> "$log_file"
-    echo "" >> "$log_file"
+    {
+        echo "Full library reencode started at $(date)"
+        echo "Library: $library_dir"
+        echo "Total files to process: $total_files"
+        echo ""
+    } > "$log_file"
 
     echo ""
     echo "Starting reencode of all $total_files FLAC files..."
@@ -870,7 +878,7 @@ reencode_new_files() {
     if [ "$new_count" -eq 0 ]; then
         echo ""
         if stdout_is_tty; then
-            printf "${GREEN}All %d FLAC files have already been reencoded.${NC}\n" "$total_files"
+            printf '%b\n' "${GREEN}All $total_files FLAC files have already been reencoded.${NC}"
         else
             echo "All $total_files FLAC files have already been reencoded."
         fi
@@ -896,12 +904,14 @@ reencode_new_files() {
 
     # Create log file.
     log_file="${scan_data_dir}/logs/reencode_new_log_$(date +%F_%H-%M-%S).txt"
-    echo "New-file reencode started at $(date)" > "$log_file"
-    echo "Library: $library_dir" >> "$log_file"
-    echo "Total FLAC files found: $total_files" >> "$log_file"
-    echo "Already reencoded (skipped): $skipped_count" >> "$log_file"
-    echo "New files to process: $new_count" >> "$log_file"
-    echo "" >> "$log_file"
+    {
+        echo "New-file reencode started at $(date)"
+        echo "Library: $library_dir"
+        echo "Total FLAC files found: $total_files"
+        echo "Already reencoded (skipped): $skipped_count"
+        echo "New files to process: $new_count"
+        echo ""
+    } > "$log_file"
 
     echo ""
     echo "Starting reencode of $new_count new FLAC files..."
@@ -1072,13 +1082,13 @@ main_menu() {
     library_path=$(echo "$config" | jq -r '.library_path')
     if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
         if stdout_is_tty; then
-            printf "   ${YELLOW}Library: (not set - use option 3)${NC}\n"
+            printf '%b\n' "   ${YELLOW}Library: (not set - use option 3)${NC}"
         else
             echo "   Library: (not set - use option 3)"
         fi
     else
         if stdout_is_tty; then
-            printf "   ${GREEN}Library: %s${NC}\n" "$library_path"
+            printf '%b\n' "   ${GREEN}Library: $library_path${NC}"
         else
             echo "   Library: $library_path"
         fi

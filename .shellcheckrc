@@ -1,0 +1,9 @@
+# ShellCheck configuration for the flac-health-reencode repo.
+#
+# The test cases source their shared harness via a runtime variable:
+#     . "$TESTS_ROOT/helpers.sh"
+# ShellCheck cannot resolve that path from the variable alone, so point it at
+# the tests directory explicitly (equivalent to passing --source-path=tests).
+# Without this, every case emits SC1091 "Not following: ./helpers.sh".
+source-path=tests
+source-path=.
