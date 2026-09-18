@@ -8,7 +8,9 @@
 # .flac_scan_data file. Only the single real "problematic" file is reencoded:
 #   * the manual (newest) CSV is chosen, not the stale one
 #   * count line reflects the 1 real row
-#   * the real file is backed up and replaced with reencoded content
+#   * the real file's ORIGINAL BYTES are mirrored into the backup root (outside
+#     the library, at the album-relative path) and it is replaced with reencoded
+#     content
 #   * backup + internal files stay untouched (never re-encoded, no db rows)
 #   * the reencoded real file is recorded in reencoded.db
 ###############################################################################
@@ -73,9 +75,11 @@ file_eq "$REAL" 'REENCODE_OK' || {
     echo "   (content after run: '$(cat "$REAL" 2>/dev/null)')" >&2
     _fail "real file was not replaced by reencode marker"
 }
-# ...its backup holds the ORIGINAL bytes (never the marker)...
-file_eq "$LIB/Album Big/backup_FLAC_originals/worst.flac" 'orig-worst-bytes' \
-  || _fail "backup of real file does not preserve the original"
+# ...its ORIGINAL bytes were mirrored into the backup root (outside the library,
+# at the same album-relative path)...
+BAK="$SBX/lib_backup"
+file_eq "$BAK/Album Big/worst.flac" 'orig-worst-bytes' \
+  || _fail "mirrored backup does not preserve the original"
 # ...and the OTHER real file (stale CSV's target) was NOT re-encoded.
 file_eq "$LIB/Album Big2/other.flac" 'original-other' || _fail "stale-CSV file was re-encoded (manual CSV should win)"
 

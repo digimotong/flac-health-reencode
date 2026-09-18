@@ -21,6 +21,12 @@
 : "${TESTS_ROOT:?helpers.sh: TESTS_ROOT must be set}"
 : "${PROD_SCRIPT:?helpers.sh: PROD_SCRIPT must be set}"
 
+# PATH as it was when this file was sourced. run_script() prepends the sandbox
+# stub bin to THIS value rather than to the ambient $PATH, so a case that
+# narrows PATH for one child cannot change how later runs resolve tools.
+# shellcheck disable=SC2034  # referenced by run_script below (same file scope)
+PATH_PRE="$PATH"
+
 CURRENT_OUT=''
 # Set by run_script() for the CALLING case script to inspect (e.g. "the script
 # exited non-zero"), so it is used across files rather than inside helpers.sh.
@@ -40,19 +46,25 @@ clean_sandbox_output() {
 ###############################################################################
 
 # make_sandbox <var_name>
-#   Builds: sbx/bin/{flac,metaflac} stubs, sbx/lib (library root), the config
-#   file the production script reads (pointing at sbx/lib), and a copy of the
-#   script. Sets $<var_name> to the sbx root.
+#   Builds: sbx/bin/{flac,metaflac} stubs, sbx/lib (library root), sbx/lib_backup
+#   (the backup root the config points at), the config file the production script
+#   reads, and a copy of the script. Sets $<var_name> to the sbx root.
+#
+#   backup_path is seeded EXPLICITLY (as a sibling of the library) rather than
+#   left to the script's derived '<library>_backup' default, so cases never
+#   depend on the derivation prompt and the backup tree is always at a known
+#   path: "$sbx/lib_backup".
 make_sandbox() {
     local _vn="$1"
     local sbx
     sbx="$(mktemp -d "${TMPDIR:-/tmp}/flac_test_XXXXXX")"
-    mkdir -p "$sbx/bin" "$sbx/lib"
+    mkdir -p "$sbx/bin" "$sbx/lib" "$sbx/lib_backup"
     cp "$TESTS_ROOT/stub_flac"        "$sbx/bin/flac"
     cp "$TESTS_ROOT/stub_metaflac"    "$sbx/bin/metaflac"
     chmod +x "$sbx/bin/flac" "$sbx/bin/metaflac"
     cp "$PROD_SCRIPT" "$sbx/flac_health_reencode.sh"
-    printf "{\"library_path\": \"%s\"}\n" "$sbx/lib" > "$sbx/flac_health_config.json"
+    printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
+        "$sbx/lib" "$sbx/lib_backup" > "$sbx/flac_health_config.json"
     printf -v "$_vn" '%s' "$sbx"
 }
 
@@ -82,7 +94,11 @@ register_sandbox() {
 run_script() {
     local sbx="$1"; shift
     CURRENT_OUT="$sbx/output.log"
-    if printf '%s\n' "$@" | PATH="$sbx/bin:$PATH" bash "$sbx/flac_health_reencode.sh" \
+    # PATH_PRE is the environment PATH captured at source time. The inherited
+    # PATH cannot be used here: 'source' snapshotting aside, a test case that
+    # narrows PATH for its own child (case_requirements.sh) must not leak that
+    # narrowing into these unrelated runs.
+    if printf '%s\n' "$@" | PATH="$sbx/bin:$PATH_PRE" bash "$sbx/flac_health_reencode.sh" \
             > "$CURRENT_OUT" 2>&1; then
         LAST_STATUS=0
     else

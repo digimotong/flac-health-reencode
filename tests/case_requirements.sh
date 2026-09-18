@@ -49,6 +49,42 @@ run_script_missing() {
     return 0
 }
 
+# run_script_missing_hermetic <sbx> <tool-to-hide> [stdin lines...]
+#   Sibling of run_script_missing for the tools that are NOT stubbed in $sbx/bin
+#   (jq): the child's PATH holds ONLY $sbx/bin_hermetic, so the tool under test
+#   is unreachable no matter where the host keeps it.
+#
+#   Two deliberate details keep this hermetic without breaking the script under
+#   test:
+#     - The script is launched as /bin/bash, not as bare 'bash'. With PATH set to
+#       just $bindir, a bare 'bash' would not resolve, and the failure would be a
+#       shell error rather than the tool gate this case exists to exercise.
+#     - $bindir is seeded with the stubs plus the handful of REAL utilities the
+#       script legitimately touches on its way to the gate (dirname/realpath for
+#       CONFIG_FILE, cat/tr/grep for config probing). Everything else genuine
+#       stays out of reach, which is the point: jq must be absent here.
+run_script_missing_hermetic() {
+    local sbx="$1" hidden="$2"; shift 2
+    local bindir="$sbx/bin_hermetic"
+    rm -rf "$bindir"; mkdir -p "$bindir"
+    local f p
+    for f in flac metaflac; do
+        [ "$f" = "$hidden" ] && continue
+        ln -s "$sbx/bin/$f" "$bindir/$f"
+    done
+    for p in dirname realpath cat tr grep; do
+        ln -s "$(command -v "$p")" "$bindir/$p"
+    done
+    CURRENT_OUT="$sbx/output.log"
+    if printf '%s\n' "$@" | PATH="$bindir" /bin/bash "$sbx/flac_health_reencode.sh" \
+            > "$CURRENT_OUT" 2>&1; then
+        LAST_STATUS=0
+    else
+        LAST_STATUS=$?
+    fi
+    return 0
+}
+
 # ===========================================================================
 # A. 'flac' missing -> exit 1, tool named, no menu, no side effects.
 # ===========================================================================
@@ -118,3 +154,38 @@ occur_re "$MENU_TITLE"
 [ "$LAST_STATUS" -eq 0 ] || _fail "control run exited $LAST_STATUS, expected 0"
 
 echo "ok: case_requirements (control: both tools present)"
+
+# ===========================================================================
+# E. 'jq' absent: the gate must catch it. jq is not stubbed in $sbx/bin and
+#    lives on the host, so the case runs the script against a hermetic PATH that
+#    holds the stubs plus the few real utilities the script needs pre-gate. The
+#    config is deliberately removed first: the interesting property is that the
+#    gate fires BEFORE anything creates one, so no zero-byte config is left.
+# ===========================================================================
+SBX_NOJQ=''
+make_sandbox SBX_NOJQ
+register_sandbox "$SBX_NOJQ"
+rm -f "$SBX_NOJQ/flac_health_config.json"
+
+run_script_missing_hermetic "$SBX_NOJQ" jq 'q'
+occur_re "The 'jq' command is not installed"
+[ "$LAST_STATUS" -eq 1 ] || _fail "no jq exited $LAST_STATUS, expected 1"
+absent_re "$MENU_TITLE"
+[ ! -e "$SBX_NOJQ/flac_health_config.json" ] \
+    || _fail "no jq still created a config file"
+
+# F. The hint must name the tool's own package. A single hardcoded
+#    "apt-get install flac" (the pre-fix behaviour) would misdirect a user whose
+#    jq is missing, so the no-jq run must suggest jq. The flac hint itself is
+#    checked in case A, where flac is the reported tool: asserting it HERE would
+#    be wrong, since the jq message legitimately never mentions flac.
+occur_re 'apt-get install jq'
+absent_re 'apt-get install flac'
+
+# G. Control for F: with every tool installed the hint itself never appears,
+#    so the F assertions above are about the failure path only.
+run_script "$SBX_OK" 'q'
+absent_re "apt-get install"
+[ "$LAST_STATUS" -eq 0 ] || _fail "jq-present control exited $LAST_STATUS, expected 0"
+
+echo "ok: case_requirements (jq missing is gated, with the right hint)"

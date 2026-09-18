@@ -11,7 +11,8 @@
 #    of scans / reencode-NEW discovery.
 # B. Backup-preservation guard (F3): re-encoding the SAME file twice (as a
 #    re-run over the same CSV would) must NOT overwrite the original backup --
-#    the pristine first-reencode backup bytes survive the re-run.
+#    the pristine first-reencode backup bytes survive the re-run. The backup now
+#    lives in the mirrored backup root outside the library.
 # C. Graceful-return guard (F4): choosing an option whose library path no
 #    longer exists returns to the main menu instead of hard-exiting the script.
 # D. Stale-residue guard (F1): a leftover 'tmp_*.part' from an interrupted run
@@ -69,20 +70,23 @@ LIB2="$SBX2/lib"
 mkdir -p "$LIB2/Albums"
 write_file "$LIB2/Albums/song.flac" 'PRIMAL-ORIGINAL'
 
-# First reencode: scan it (clean), then reencode via option 6 (new-file set).
-run_script "$SBX2" '6' 'y' ''
-# song.flac was reencoded -> now holds the stub marker; a backup now exists.
-BACKUP2="$LIB2/Albums/backup_FLAC_originals/song.flac"
+# song.flac was reencoded -> now holds the stub marker; a backup now exists in
+# the MIRRORED backup root, outside the library (option 5 = NEW files).
+run_script "$SBX2" '5' 'y' ''
+BACKUP2="$SBX2/lib_backup/Albums/song.flac"
 exist "$BACKUP2"
 file_eq "$BACKUP2" 'PRIMAL-ORIGINAL'   # first backup = pristine original
 file_eq "$LIB2/Albums/song.flac" "$RE_MARKER"
+# No legacy in-library backup folder was created for the new backup.
+miss "$LIB2/Albums/backup_FLAC_originals"
 
 # Second reencode of the very same file (simulates a re-run: the file is no
-# longer 'new' only because option 5 reencodes everything, so use the full
+# longer 'new' only because option 4 reencodes everything, so use the full
 # pass). The re-run must NOT clobber the FIRST backup with the reencoded bytes.
-run_script "$SBX2" '5' 'REENCODE ALL' ''
+run_script "$SBX2" '4' 'REENCODE ALL' ''
 file_eq "$BACKUP2" 'PRIMAL-ORIGINAL'   # STILL the pristine original
 file_eq "$LIB2/Albums/song.flac" "$RE_MARKER"
+[ "$(find "$SBX2/lib_backup" -type f | wc -l)" -eq 1 ] || _fail "re-run duplicated the mirrored backup"
 
 echo "ok: reencode_guards (re-run preserves original backup)"
 
@@ -93,12 +97,13 @@ SBX3=''
 make_sandbox SBX3
 register_sandbox "$SBX3"
 LIB3="$SBX3/lib"
-# Point the sandbox config at a path that does not exist, then pick option 1.
-printf '{"library_path": "%s"}\n' "$LIB3/no-such-dir" > "$SBX3/flac_health_config.json"
+# Point the sandbox config at a path that does not exist, then pick option 2.
+printf '{"library_path": "%s", "backup_path": "%s"}\n' \
+    "$LIB3/no-such-dir" "$SBX3/lib_backup" > "$SBX3/flac_health_config.json"
 
-run_script "$SBX3" '1' '' ''
+run_script "$SBX3" '2' '' ''
 
-# Option 1 printed the error, consumed "Press Enter to return to main menu",
+# Option 2 printed the error, consumed "Press Enter to return to main menu",
 # and control came back to the main-menu loop (the banner is drawn AGAIN)
 # instead of hard-exiting the whole script on the missing directory.
 occur_re "The directory '$LIB3/no-such-dir' does not exist"
@@ -115,7 +120,7 @@ echo "ok: reencode_guards (missing path returns to menu)"
 #    blocks a re-encode unless the script clears it first.
 #
 #    REAL flac (invoked without -f) refuses to write when its -o target already
-#    exists. On a full option-5 pass over 27k files the user hit exactly that:
+#    exists. On a full option-4 pass over 27k files the user hit exactly that:
 #    a stale 'tmp_...part' after a previous interrupted run made flac error
 #    "output file ... already exists". This guard plants a sandbox-local flac
 #    stub that reproduces that refusal, pre-seeds the same stale residue, and
@@ -148,8 +153,8 @@ write_file "$LIB4/Album/track.flac"         'PRIMAL-ORIGINAL'
 # temp the script itself created on a prior (aborted) pass.
 write_file "$LIB4/Album/tmp_track.flac.part" 'pristine-debris-CORRUPT'
 
-# Option 5 = full re-encode of every *.flac in the library.
-run_script "$SBX4" '5' 'REENCODE ALL' ''
+# Option 4 = full re-encode of every *.flac in the library.
+run_script "$SBX4" '4' 'REENCODE ALL' ''
 
 # The stale .part must have been cleared BEFORE flac (no "already exists" error)
 # and the re-encode must have replaced the track with the stub marker.
