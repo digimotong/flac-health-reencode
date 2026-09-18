@@ -5,12 +5,23 @@ backup of every original it replaces.
 
 ## Features
 
-- Full-library scan for corrupted FLACs, written to a CSV report
-- Re-encode just the reported files, the whole library, or only files that
-  haven't been re-encoded before
-- Original files mirrored into a backup directory outside the library
-- Color-coded terminal output with progress tracking
-- Per-run logs and a small JSON config file
+- **Health scanning**: runs `flac -t` over the whole library and writes the
+  failures to a timestamped CSV report
+- **Three re-encode modes**:
+  - the files listed in the latest scan report
+  - every FLAC file in the library (with a confirmation prompt)
+  - only files that have not been re-encoded before
+- **Backups outside the library**: each original is mirrored into a backup
+  directory that copies the library's layout, so no media scanner ever indexes a
+  backup as a duplicate track
+- **Safe by default**: a file is only replaced after the new copy has been
+  verified, and never without a backup first; unsafe backup destinations are
+  refused
+- **Lossless re-encode**: `flac --verify --decode-through-errors` with
+  `--preserve-modtime`, so timestamps survive
+- **Resumable tracking**: successful re-encodes are recorded by FLAC audio MD5,
+  size and mtime in `.flac_scan_data/reencoded.db`
+- **Reporting**: color-coded progress, per-run logs, and a small JSON config
 
 ## Install & Run
 
@@ -35,15 +46,24 @@ directory.
 6) Quit
 ```
 
-- Options 2, 4 and 5 mirror each original into the configured backup directory
-  before replacing it with the re-encoded copy.
-- The script never scans, re-encodes or backs up files inside its own
-  `backup_FLAC_originals/` folders (legacy, see [Migration](#migration)) or its
-  `.flac_scan_data/` directory.
-- Option 4 re-encodes everything and asks you to confirm first. Expect it to be
-  slow on a large library, and make sure there's disk space for the backups.
-  Option 5 only processes files it hasn't recorded yet, so after an initial
-  option 4 run you can use it to pick up newly added albums.
+The menu also prints the active library and backup directory, and accepts `q` as
+a shortcut for quitting.
+
+| Option | Action | Notes |
+|--------|--------|-------|
+| `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. |
+| `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
+| `3` | Set/Update library path & backup directory | First-run setup. Validates that the backup destination is safe. |
+| `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
+| `5` | Reencode NEW FLAC files only | Skips files already recorded in the tracking database. Use it after an option 4 run to pick up newly added albums. |
+| `6` | Quit | Same as `q`. |
+
+Options 2, 4 and 5 always mirror each original into the configured backup
+directory before replacing it with the re-encoded copy.
+
+Files inside the script's own `backup_FLAC_originals/` folders (in-library
+backups written by older versions) and its `.flac_scan_data/` directory are never
+scanned, re-encoded or backed up.
 
 ## Configuration
 
@@ -57,6 +77,12 @@ Set both paths from the menu, or edit the file directly:
   "version": "1.1"
 }
 ```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `library_path` | yes | Absolute path to the FLAC library to scan and re-encode. |
+| `backup_path` | no | Absolute path for the mirrored originals. Left empty, it is derived on the next re-encode. |
+| `version` | — | Written and read by the script; leave it alone. |
 
 - `backup_path` may be left empty or absent: the script then derives
   `<library_path>_backup` (a sibling of the library) and offers it as the default
@@ -81,30 +107,19 @@ is backed up to `<backup>/2Pac/All Eyez on Me (1996)/01 - Ambitionz.flac`.
 Keeping originals out of the library has two practical benefits:
 
 - **No duplicate tracks.** Plex, Roon, Navidrome and friends index anything that
-  looks like audio. Backups stored inside an album folder show up as a second
-  copy of every track; outside the library they are ignored entirely.
+  looks like audio; backups stored outside the library are ignored entirely.
 - **One-place cleanup.** Verify your re-encodes, then delete the whole backup
-  tree (`rm -rf /music_backup`) when you no longer need it. No per-album hunting.
+  tree (`rm -rf /music_backup`) when you no longer need it.
 
 Rules enforced by the script:
 
-- The backup directory must be an **absolute** path. A bare relative answer (e.g.
-  a stray `y` typed into the prompt) is refused instead of being resolved against
-  the working directory and scattering backups unpredictably.
-- The backup directory may not be the library, inside the library, or a parent of
-  the library. All three would either destroy the originals or the library
-  itself, so they are rejected with an explanation.
-- Backups are never overwritten. If a backup already exists for a file, the
-  existing one is kept (the pristine original survives re-runs) and the re-encode
-  still proceeds.
-- If a file cannot be backed up, it is **not** re-encoded. Nothing is re-encoded
-  without a backup first — including files listed in a scan CSV that sit outside
-  the library, which are skipped with a warning.
-- The backup directory is created and write-probed *before* the first file is
-  touched, and only once you have committed to the run — so cancelling leaves no
-  stray directory behind. A read-only or full destination aborts the run with
-  nothing changed. Missing parent directories are created as needed, so you can
-  point `backup_path` at a path that does not exist yet.
+| Rule | Behavior |
+|------|----------|
+| Absolute path required | A relative answer (e.g. a stray `y` typed into the prompt) is refused instead of being resolved against the working directory and scattering backups unpredictably. |
+| No overlap with the library | The backup directory may not be the library, inside it, or a parent of it — all three would destroy the originals or the library — so they are rejected with an explanation. |
+| Backups are never overwritten | If a backup already exists for a file, the existing one is kept so the pristine original survives re-runs; the re-encode still proceeds. |
+| No backup, no re-encode | If a file cannot be backed up it is not re-encoded — including files listed in a scan CSV that sit outside the library, which are skipped with a warning. |
+| Created only once you commit | The destination is created and write-probed *before* the first file is touched, and only after you confirm the run, so cancelling leaves no stray directory. A read-only or full destination aborts with nothing changed. Missing parent directories are created as needed. |
 
 ### When the backup directory is not set yet
 
@@ -132,39 +147,6 @@ cp -p /music_backup/2Pac/All\ Eyez\ on\ Me\ \(1996\)/01\ -\ Ambitionz.flac \
 To find every file a run touched, check the run log written to
 `<library>/.flac_scan_data/logs/`: it records `Backup created for: <original> ->
 <backup copy>` for each file.
-
-## Migration
-
-Older versions (config `version` `1.0`) wrote backups into a
-`backup_FLAC_originals/` folder next to each album, inside the library. Those
-copies are untouched by this version — they are still excluded from scans and
-re-encodes, so they cannot be mistaken for real library content — but new backups
-go to the configured backup directory instead.
-
-To move an existing library over:
-
-1. Set the new backup directory (option 3). The default suggestion is
-   `<library>_backup`, a sibling of the library.
-2. Move the old in-library backups into the new tree, preserving each album's
-   relative path:
-
-   ```bash
-   cd /music
-   find . -type d -name backup_FLAC_originals | while read -r d; do
-       rel="${d%/backup_FLAC_originals}"
-       mkdir -p "/music_backup/$rel"
-       cp -p "$d"/*.flac "/music_backup/$rel/" 2>/dev/null
-   done
-   ```
-
-3. Verify the copies, then remove the old folders:
-
-   ```bash
-   find /music -type d -name backup_FLAC_originals -exec rm -rf {} +
-   ```
-
-Leaving them in place is harmless — they are simply ignored — so this cleanup is
-optional and can wait until you are confident in the new location.
 
 ## What the Script Writes in Your Library
 
@@ -202,7 +184,7 @@ from ones it has already processed.
 
 ## Development
 
-Requires Bash, `jq`, and `shellcheck` for linting.
+Requires Bash 4.0+, `jq`, and `shellcheck` for linting.
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -211,12 +193,13 @@ bash tests/lint.sh                     # shellcheck
 
 The suite drives the real script inside throwaway sandboxes with stubbed `flac`
 and `metaflac` binaries, so it needs no FLAC tools and touches nothing outside a
-sandbox. It runs in CI on every push. If you change the `flac`/`metaflac` flags
-the script passes, update `tests/stub_flac` and `tests/stub_metaflac` to match.
+sandbox. It runs in CI on every push and pull request. If you change the
+`flac`/`metaflac` flags the script passes, update `tests/stub_flac` and
+`tests/stub_metaflac` to match.
 
 ## Requirements
 
-- Bash
+- Bash 4.0+ (the script uses associative arrays)
 - `flac` (which also provides `metaflac`) and `jq`
 
 ```bash
