@@ -531,14 +531,22 @@ backup_root_writable() {
 
 ########################################
 # FUNCTION: resolve_backup_path
-# Resolves, validates and prepares the backup directory for a re-encode run.
+# Decides WHICH backup directory a re-encode run will use, and validates it.
+# Deliberately PURE with respect to the backup tree: it may read the config and
+# prompt, but it never creates a directory. Creating the destination is
+# ensure_backup_root's job, so a caller that is merely DISPLAYING the path - e.g.
+# option 4's warning panel, which the user may still cancel - cannot leave an
+# empty stray directory behind.
 # Order of operations:
 #   1. read backup_path from the config;
 #   2. if unset, offer the derived '<library>_backup' as the prompt default and
 #      persist whatever is accepted - unless prompting is suppressed;
 #   3. validate against validate_backup_root (rejecting the unsafe ancestor
-#      arrangements and relative paths);
-#   4. mkdir -p + writability probe.
+#      arrangements and relative paths).
+# It DOES write to the config (an accepted prompt answer is persisted), which is
+# why the config write stays here rather than moving to ensure_backup_root: the
+# answer is the user's choice about configuration, not a side effect of run
+# preparation, and it must survive even if the run is abandoned afterwards.
 # On ANY failure the reason is printed and nothing is returned, so every caller
 # aborts before touching a single audio file.
 # Progress/notice lines and any error go to STDERR; the returned path is the only
@@ -549,8 +557,8 @@ backup_root_writable() {
 #   $1 - Library root directory (must exist)
 #   $2 - Optional '--no-prompt': never read from the terminal. When the config
 #        has no backup_path, the DERIVED default is used silently. Callers that
-#        must not interrupt a confirmation flow (e.g. option 4, where the warning
-#        displays the resolved path before the user commits) pass this.
+#        must not interrupt a confirmation flow (e.g. option 4, which resolves
+#        before its warning but creates only after the user commits) pass this.
 # Returns 0 with the resolved path on stdout, or 1 with the error on stderr.
 ########################################
 resolve_backup_path() {
@@ -589,6 +597,25 @@ resolve_backup_path() {
         fi
     fi
 
+    printf '%s\n' "$backup_root"
+}
+
+########################################
+# FUNCTION: ensure_backup_root
+# Creates the backup directory (with any missing parents) and proves it actually
+# accepts a write. This is the ONLY function that creates the backup tree, and
+# every re-encode path calls it after its final confirmation and before the first
+# flac invocation - so the "nothing is re-encoded without a backup" guarantee is
+# unchanged, while a run the user cancels leaves no stray directory behind.
+# Failure is reported and returned, never fatal to the shell, so the caller can
+# print its own "return to menu" prompt.
+# Arguments:
+#   $1 - Backup root directory (already resolved + validated)
+# Returns 0 on success, 1 with the reason on stderr.
+########################################
+ensure_backup_root() {
+    local backup_root="${1%/}"
+
     if ! mkdir -p "$backup_root"; then
         echo "Error: Could not create the backup directory '$backup_root'." >&2
         return 1
@@ -597,8 +624,7 @@ resolve_backup_path() {
         echo "Error: The backup directory '$backup_root' is not writable." >&2
         return 1
     fi
-
-    printf '%s\n' "$backup_root"
+    return 0
 }
 
 ########################################
@@ -892,9 +918,16 @@ reencode_library() {
 
     # Resolve/create/validate the backup directory BEFORE any file is touched.
     # A failure here (unsafe location, unwritable export) aborts the run rather
-    # than re-encoding a single file without a backup.
+    # than re-encoding a single file without a backup. Resolution and creation are
+    # two steps (see resolve_backup_path / ensure_backup_root) purely so callers
+    # that only DISPLAY a path cannot create anything; here both happen up front
+    # because the user already confirmed the CSV ('Y' immediately above).
     backup_root=""
     if ! backup_root=$(resolve_backup_path "$library_dir"); then
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+    if ! ensure_backup_root "$backup_root"; then
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
@@ -1003,12 +1036,15 @@ reencode_all_files() {
         return
     fi
 
-    # Resolve/create/validate the backup directory BEFORE any file is touched.
-    # '--no-prompt' because the warning below has to SHOW the destination before
-    # the user commits: an interactive question here would appear before the
+    # RESOLVE the backup directory before any file is touched, so the warning can
+    # show the concrete destination. Resolution alone creates nothing (see
+    # resolve_backup_path), so cancelling the warning leaves no stray directory:
+    # the actual mkdir happens below, after 'REENCODE ALL' is typed, and still
+    # before the first flac invocation.
+    # '--no-prompt' because an interactive question here would appear before the
     # warning that justifies it (and before the 'REENCODE ALL' confirmation,
-    # which would swallow the answer). An unset backup_path therefore resolves
-    # to the derived default here, and option 2/5 will still offer to ask.
+    # which would then have its answer swallowed). An unset backup_path therefore
+    # resolves to the derived default here, and options 2/5 still offer to ask.
     backup_root=""
     if ! backup_root=$(resolve_backup_path "$library_dir" --no-prompt); then
         read -rp "Press Enter to return to main menu..."
@@ -1034,6 +1070,14 @@ reencode_all_files() {
     read -rp "Type 'REENCODE ALL' to confirm: " confirm
     if [ "$confirm" != "REENCODE ALL" ]; then
         echo "Reencode cancelled."
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+
+    # The user has committed: create + write-probe the destination now. Still
+    # before ANY file is touched, so an unwritable NAS export aborts here rather
+    # than after audio has been rewritten.
+    if ! ensure_backup_root "$backup_root"; then
         read -rp "Press Enter to return to main menu..."
         return
     fi
@@ -1227,6 +1271,13 @@ reencode_new_files() {
         return
     fi
     echo "Backups will be written to: $backup_root"
+
+    # The user committed to the reencode just above, so create + write-probe the
+    # destination now - still before any file is touched.
+    if ! ensure_backup_root "$backup_root"; then
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
 
     # Create log file.
     log_file="${scan_data_dir}/logs/reencode_new_log_$(date +%F_%H-%M-%S).txt"

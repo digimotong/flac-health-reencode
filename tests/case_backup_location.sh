@@ -203,4 +203,42 @@ file_eq "$LIB3/Album/new.flac" "$RE_MARKER"
 
 echo "ok: backup_location (derived '<library>_backup' default)"
 
+# ===========================================================================
+# E. Resolution is PURE: a cancelling run creates no backup directory.
+#    resolve_backup_path only decides+validates; ensure_backup_root is what
+#    mkdirs, and it runs only after the user commits. Otherwise answering the
+#    option-4 warning with a typo would leave an empty stray directory behind
+#    (and, for a destination on a mounted share, a needless mount write).
+# ===========================================================================
+SBX4=''
+make_sandbox SBX4
+register_sandbox "$SBX4"
+LIB4="$SBX4/lib"
+mkdir -p "$LIB4/Album"
+write_file "$LIB4/Album/song.flac" 'CANCEL-ME'
+# A DEEP path in which NO parent exists yet: proves nothing short of a committed
+# run builds the chain (and that mkdir -p still handles a missing parent when it
+# finally does run).
+DEEP="$SBX4/deep/nested/backup"
+printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
+    "$LIB4" "$DEEP" > "$SBX4/flac_health_config.json"
+
+# The warning must still SHOW the destination it resolved (resolution happens
+# before the confirmation, so the user knows where originals will go) ...
+run_script "$SBX4" '4' 'nope' ''
+occur_re "Mirror each original into"
+occur_re "$DEEP"
+occur_re 'Reencode cancelled'
+# ... yet nothing may have been created and nothing re-encoded.
+miss "$SBX4/deep"
+miss "$DEEP"
+file_eq "$LIB4/Album/song.flac" 'CANCEL-ME'
+
+# The committed run DOES create the chain and mirrors into it.
+run_script "$SBX4" '4' 'REENCODE ALL' ''
+file_eq "$DEEP/Album/song.flac" 'CANCEL-ME' \
+    || _fail "committed run did not mirror into the deep backup root"
+file_eq "$LIB4/Album/song.flac" "$RE_MARKER"
+echo "ok: backup_location (cancelled run creates no backup dir)"
+
 

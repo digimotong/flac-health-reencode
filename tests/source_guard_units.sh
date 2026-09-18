@@ -83,4 +83,36 @@ load_reencoded_set "$DB"
 # Path-with-spaces round-trips through the DB (path is the LAST field).
 grep -qE 'track one\.flac$' "$DB" || fail "db missing path with spaces"
 
+# --- derive_backup_path -------------------------------------------------------
+# Pure: '<library>_backup', with any trailing slash normalised away first so
+# '/media/Music/' cannot yield '/media/Music/_backup'.
+[ "$(derive_backup_path "/media/Music")"  = "/media/Music_backup" ]  || fail "derive (plain) wrong"
+[ "$(derive_backup_path "/media/Music/")" = "/media/Music_backup" ]  || fail "derive (trailing slash) wrong"
+[ "$(derive_backup_path "/m/My Music")"   = "/m/My Music_backup" ]   || fail "derive (space) wrong"
+
+# --- get_backup_target --------------------------------------------------------
+# Pure: the library root prefix is replaced by the backup root, preserving the
+# relative chain (this is the mirroring contract).
+[ "$(get_backup_target "/m/Music" "/m/Music_backup" "/m/Music/2Pac/X/a.flac")" \
+    = "/m/Music_backup/2Pac/X/a.flac" ] || fail "get_backup_target mapping wrong"
+[ "$(get_backup_target "/m/Music/" "/m/Music_backup/" "/m/Music/A/b.flac")" \
+    = "/m/Music_backup/A/b.flac" ] || fail "get_backup_target trailing-slash wrong"
+# A file NOT under the library has no backup home: must return 1 and print nothing.
+if out=$(get_backup_target "/m/Music" "/m/Music_backup" "/elsewhere/a.flac"); then
+    fail "get_backup_target accepted an out-of-library path"
+fi
+[ -z "$out" ] || fail "get_backup_target printed something for an out-of-library path"
+
+# --- validate_backup_root -----------------------------------------------------
+# Refuses the three ancestor arrangements plus relative paths; accepts a sibling.
+VB_LIB="$LIB/Album"
+validate_backup_root "$VB_LIB" "$VB_LIB"            && fail "accepted backup == library"
+validate_backup_root "$VB_LIB" "$VB_LIB/inner"      && fail "accepted backup inside library"
+validate_backup_root "$VB_LIB" "$LIB"               && fail "accepted library inside backup"
+validate_backup_root "$VB_LIB" "relative_backup"    && fail "accepted a relative backup path"
+validate_backup_root "$VB_LIB" ""                   && fail "accepted an empty backup path"
+validate_backup_root "$VB_LIB" "$LIB/Album_backup"  || fail "rejected a legitimate sibling backup"
+# The near-miss: a SIBLING sharing a name prefix must not be treated as inside.
+validate_backup_root "$VB_LIB" "$LIB/Album_backup/sub" || fail "rejected a legitimate sibling subtree"
+
 echo "ok: source-guard units"

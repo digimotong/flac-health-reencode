@@ -82,7 +82,10 @@ Rules enforced by the script:
   without a backup first — including files listed in a scan CSV that sit outside
   the library, which are skipped with a warning.
 - The backup directory is created and write-probed *before* the first file is
-  touched. A read-only or full destination aborts the run with nothing changed.
+  touched, and only once you have committed to the run — so cancelling leaves no
+  stray directory behind. A read-only or full destination aborts the run with
+  nothing changed. Missing parent directories are created as needed, so you can
+  point `backup_path` at a path that does not exist yet.
 
 ### When the backup directory is not set yet
 
@@ -95,6 +98,8 @@ sibling of the library):
   will use and you confirm from there. Nothing is written to the config in this
   case, so the menu keeps showing the path as derived until you set one
   explicitly with option 3.
+- In every case the directory is only created after you commit to the run, so
+  backing out of a confirmation leaves nothing behind.
 
 ### Restoring an original
 
