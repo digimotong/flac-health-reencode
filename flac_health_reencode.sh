@@ -10,7 +10,7 @@
 # Features:
 #   - Recursive directory scanning
 #   - Progress tracking with visual feedback
-#   - Configurable library paths (stored in JSON)
+#   - Configurable library + backup paths (stored in JSON)
 #   - Automatic backup of original files before re-encoding (a backup is written
 #     only the first time a file is re-encoded, so the pristine original survives
 #     re-runs over the same files)
@@ -30,10 +30,9 @@
 #      - Re-encode problematic files (from the latest scan report)
 #      - Reencode ALL FLAC files
 #      - Reencode NEW FLAC files only (skip already-processed)
-#      - Manage library path
-#      - Clean up backups
+#      - Set/Update the library path and the backup directory
 #
-#   Note: an invalid or empty menu entry re-prompts; type 'q' or '7' to quit.
+#   Note: an invalid or empty menu entry re-prompts; type 'q' or '6' to quit.
 # Reencoded-file Tracking:
 #   After a successful reencode a file is recorded in
 #   '<library>/.flac_scan_data/reencoded.db' using its FLAC audio MD5 (from
@@ -42,14 +41,21 @@
 #   (or freshly downloaded, previously deleted) albums are reliably detected.
 #
 # Important Notes:
-#   - Backups are stored in 'backup_FLAC_originals' subdirectories
+#   - Backups are stored OUTSIDE the library, in a single backup directory that
+#     mirrors the library's layout (library '/m/2Pac/All Eyez on Me (1996)'
+#     -> backup '/m_backup/2Pac/All Eyez on Me (1996)'). Keeping them out of the
+#     library means no media scanner can ever index a backup copy as a duplicate
+#     track, and clearing them is a single 'rm -rf' the user performs directly.
+#     When no backup_path is configured the script suggests '<library>_backup';
+#     options 2/5 ask before using it, option 4 just shows it in its warning.
 #   - Scan reports are saved in '.flac_scan_data/reports'
 #   - Operation logs are saved in '.flac_scan_data/logs'
 #   - Reencoded-file DB is saved as '.flac_scan_data/reencoded.db'
 #   - Uses FLAC's --decode-through-errors for maximum recovery
 #   - All real-FLAC operations (scan, reencode-from-CSV, reencode ALL/NEW) skip
-#     the script's own 'backup_FLAC_originals' copies and '.flac_scan_data'
-#     directory so backup/internal copies are never scanned or re-encoded.
+#     the script's own internal paths ('backup_FLAC_originals' copies left by
+#     older versions, and '.flac_scan_data') so they are never scanned,
+#     re-encoded, or backed up a second time.
 ###############################################################################
 
 # flac_health_reencode.sh
@@ -90,11 +96,14 @@ set -o pipefail
 
 ########################################
 # FUNCTION: load_config
-# Loads configuration from file or creates default
+# Loads configuration from file or creates default. A missing file is created
+# with an EMPTY library_path and EMPTY backup_path, which the menu renders as
+# "(not set - use option 3)" and resolve_backup_path turns into a derived
+# default on the first re-encode run.
 ########################################
 load_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        jq -n '{library_path: "", version: "1.0"}' > "$CONFIG_FILE"
+        jq -n '{library_path: "", backup_path: "", version: "1.1"}' > "$CONFIG_FILE"
     fi
     config=$(cat "$CONFIG_FILE")
     echo "$config"
@@ -102,13 +111,23 @@ load_config() {
 
 ########################################
 # FUNCTION: save_config
-# Saves configuration to file
+# Saves configuration to file.
 # Arguments:
 #   $1 - New library path
+#   $2 - (optional) New backup directory. When omitted the existing backup_path
+#        is left untouched, so a caller that only means to change the library
+#        (and every pre-existing call site) cannot silently drop the backup
+#        location.
 ########################################
 save_config() {
     local new_path="$1"
-    config=$(jq --arg path "$new_path" '.library_path = $path' "$CONFIG_FILE")
+    local new_backup="${2:-}"
+    if [ -n "$new_backup" ]; then
+        config=$(jq --arg path "$new_path" --arg backup "$new_backup" \
+            '.library_path = $path | .backup_path = $backup' "$CONFIG_FILE")
+    else
+        config=$(jq --arg path "$new_path" '.library_path = $path' "$CONFIG_FILE")
+    fi
     echo "$config" > "$CONFIG_FILE"
 }
 
@@ -121,9 +140,16 @@ for cmd in flac metaflac; do
 done
 
 # Paths the script itself creates inside a library. These must never be treated
-# as real library content: pre-reencode backup copies (backup_FLAC_originals/)
-# and the internal scan/tracking directory (.flac_scan_data/). Defined once here
-# so callers can build consistent find predicates or path tests.
+# as real library content: pre-reencode backup copies and the internal
+# scan/tracking directory (.flac_scan_data/). Defined once here so callers can
+# build consistent find predicates or path tests.
+#
+# The 'backup_FLAC_originals' entry is LEGACY: current versions write backups to
+# the configured backup directory outside the library, but an install that was
+# upgraded from an older version still holds its pristine originals in those
+# folders. Without this exclusion such a folder would suddenly count as real
+# library content, and options 4/5 would happily re-encode it and back up the
+# backups. The entry stays until in-library backups are long gone.
 readonly FLAC_INTERNAL_PATH_GLOBS=(
     '*backup_FLAC_originals/*'
     '*/.flac_scan_data/*'
@@ -251,7 +277,7 @@ clear_progress() {
 # Outputs one SUCCESS/FAILURE/WARNING status line. The line is ALWAYS appended
 # to the run log; it is additionally echoed to the terminal only while
 # STATUS_TO_CONSOLE is 1 (the non-tty settings, and all option-2 runs). During
-# the option 5/6 single-line-bar mode on a live terminal STATUS_TO_CONSOLE is
+# the option 4/5 single-line-bar mode on a live terminal STATUS_TO_CONSOLE is
 # 0, so per-file progress does not glue onto / scatter the bar; the log file
 # still receives every line.
 # Arguments:
@@ -358,9 +384,227 @@ mark_as_reencoded() {
 }
 
 ########################################
+# FUNCTION: derive_backup_path
+# Returns the default backup directory for a library: the library path with
+# '_backup' appended, i.e. '/media/Music' -> '/media/Music_backup'. Sibling of
+# the library, so the backups land on the same storage pool by default (the user
+# can point the backup directory anywhere, including another disk).
+# Arguments:
+#   $1 - Library root directory
+########################################
+derive_backup_path() {
+    local library_dir="${1%/}"
+    printf '%s_backup\n' "$library_dir"
+}
+
+########################################
+# FUNCTION: canonical_dir
+# Echoes the canonical (symlink-resolved, absolute) form of a directory that
+# EXISTS. Uses 'cd -P && pwd' rather than 'realpath --relative-to' so the helper
+# stays portable: realpath's --relative-to and -m are GNU coreutils extensions,
+# while 'cd -P'/pwd is POSIX and works on the macOS/BSD boxes the README also
+# targets. Returns 1 if the directory cannot be entered.
+# Arguments:
+#   $1 - Directory path
+########################################
+canonical_dir() {
+    ( cd "$1" 2>/dev/null && pwd -P )
+}
+
+########################################
+# FUNCTION: validate_backup_root
+# Returns 0 if the backup directory is a safe place to write originals, 1 (with
+# the reason on stderr) otherwise. The library and backup may share NO ancestor
+# relationship at all:
+#   * identical paths would make every backup overwrite the file it backs up;
+#   * a backup INSIDE the library would recreate the media-scanner problem this
+#     layout exists to solve, and would be walked by the scanner;
+#   * a library INSIDE the backup is worse still - the user's own cleanup (the
+#     documented 'rm -rf "$backup"') would then delete the library itself.
+# A RELATIVE candidate is rejected outright as well: it is nearly always a
+# mis-typed answer to the prompt rather than a deliberate choice, and resolving
+# it against the caller's CWD would scatter backups unpredictably.
+# Canonicalises both sides when they exist so symlinked spellings of the same
+# location are caught too.
+# Arguments:
+#   $1 - Library root directory (must exist)
+#   $2 - Backup directory
+########################################
+validate_backup_root() {
+    local library_dir="${1%/}"
+    local backup_root="${2%/}"
+
+    if [ -z "$backup_root" ]; then
+        echo "Error: No backup directory configured." >&2
+        return 1
+    fi
+
+    # A relative candidate is almost always a mis-typed answer to the prompt
+    # (e.g. a 'y' meant for the confirmation that follows). Resolving it against
+    # the CWD would silently scatter backups into the working directory, so an
+    # absolute path is required. The derived default is always absolute because
+    # it is built from the library path, so this costs an honest user nothing.
+    case "$backup_root" in
+        /*) : ;;
+        *)
+            echo "Error: The backup directory must be an absolute path (got '$backup_root')." >&2
+            return 1
+            ;;
+    esac
+
+    # Canonicalise when possible; fall back to the given spelling (the backup
+    # directory legitimately may not exist yet - resolve_backup_path creates it).
+    local lib_real bak_real
+    lib_real="$(canonical_dir "$library_dir")" || lib_real="$library_dir"
+    bak_real="$(canonical_dir "$backup_root")" || bak_real="$backup_root"
+
+    if [ "$lib_real" = "$bak_real" ]; then
+        echo "Error: The backup directory cannot be the library itself ($bak_real)." >&2
+        return 1
+    fi
+    case "$bak_real" in
+        "$lib_real"/*)
+            echo "Error: The backup directory cannot be inside the library ($bak_real is under $lib_real)." >&2
+            return 1
+            ;;
+    esac
+    case "$lib_real" in
+        "$bak_real"/*)
+            echo "Error: The library cannot be inside the backup directory ($lib_real is under $bak_real)." >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+########################################
+# FUNCTION: get_backup_target
+# Maps a library file onto its backup path: the library root prefix is replaced
+# by the backup root, so the backup tree mirrors the library exactly.
+#   library '/m/Music', backup '/m/Music_backup', file '/m/Music/2Pac/X/a.flac'
+#   -> '/m/Music_backup/2Pac/X/a.flac'
+# PURE: touches nothing on disk, which is what makes it directly unit-testable.
+# Returns 1 (printing nothing) when the file is not under the library root - a
+# path outside the library has no backup home (see reencode_one_file, which
+# refuses to re-encode without a backup).
+# Arguments:
+#   $1 - Library root directory
+#   $2 - Backup root directory
+#   $3 - File path
+########################################
+get_backup_target() {
+    local library_dir="${1%/}"
+    local backup_root="${2%/}"
+    local file="$3"
+    local rel
+
+    rel="${file#"$library_dir"/}"
+    if [ "$rel" = "$file" ] || [ -z "$rel" ]; then
+        # The prefix did not strip: the file is not under the library root.
+        return 1
+    fi
+    printf '%s/%s\n' "$backup_root" "$rel"
+}
+
+########################################
+# FUNCTION: backup_root_writable
+# Returns 0 if the backup root exists and accepts a real file, 1 otherwise.
+# Probed by WRITING, not by 'test -w': on a root-squashed NFS export (common on
+# a NAS, which is exactly where these libraries live) a mode test can claim the
+# directory is writable while every cp still fails. Creating and deleting a
+# uniquely-named probe file answers the question that actually matters.
+# Arguments:
+#   $1 - Backup root directory (must already exist)
+########################################
+backup_root_writable() {
+    local backup_root="${1%/}"
+    local probe="${backup_root}/.flac_health_write_test.$$"
+    if ! mkdir -p "$backup_root" 2>/dev/null; then
+        return 1
+    fi
+    if ! : > "$probe" 2>/dev/null; then
+        return 1
+    fi
+    rm -f "$probe"
+    return 0
+}
+
+########################################
+# FUNCTION: resolve_backup_path
+# Resolves, validates and prepares the backup directory for a re-encode run.
+# Order of operations:
+#   1. read backup_path from the config;
+#   2. if unset, offer the derived '<library>_backup' as the prompt default and
+#      persist whatever is accepted - unless prompting is suppressed;
+#   3. validate against validate_backup_root (rejecting the unsafe ancestor
+#      arrangements and relative paths);
+#   4. mkdir -p + writability probe.
+# On ANY failure the reason is printed and nothing is returned, so every caller
+# aborts before touching a single audio file.
+# Progress/notice lines and any error go to STDERR; the returned path is the only
+# thing on STDOUT. That split is what lets callers do
+# 'backup_root=$(resolve_backup_path ...)' without capturing chatter, and it is
+# why an interactive prompt here is safe to call from a command substitution.
+# Arguments:
+#   $1 - Library root directory (must exist)
+#   $2 - Optional '--no-prompt': never read from the terminal. When the config
+#        has no backup_path, the DERIVED default is used silently. Callers that
+#        must not interrupt a confirmation flow (e.g. option 4, where the warning
+#        displays the resolved path before the user commits) pass this.
+# Returns 0 with the resolved path on stdout, or 1 with the error on stderr.
+########################################
+resolve_backup_path() {
+    local library_dir="${1%/}"
+    local no_prompt="${2:-}"
+    local configured derived backup_root
+
+    configured=$(load_config | jq -r '.backup_path // empty')
+
+    if [ -z "$configured" ]; then
+        derived="$(derive_backup_path "$library_dir")"
+        if [ "$no_prompt" = "--no-prompt" ]; then
+            # Nothing to ask: fall back to the derived sibling. NOT persisted -
+            # only an explicit user answer is written to the config, so the
+            # menu's "(derived; set with option 3)" hint keeps telling the truth
+            # about the user never having chosen a directory.
+            backup_root="$derived"
+        else
+            echo "Backup directory not set. Original files are kept outside the library." >&2
+            read -rp "Backup directory [$derived]: " backup_root
+            if [ -z "$backup_root" ]; then
+                backup_root="$derived"
+            fi
+            backup_root="${backup_root%/}"
+            if ! validate_backup_root "$library_dir" "$backup_root"; then
+                return 1
+            fi
+            save_config "$library_dir" "$backup_root"
+            echo "Backup directory set to: $backup_root" >&2
+        fi
+    else
+        backup_root="${configured%/}"
+        if ! validate_backup_root "$library_dir" "$backup_root"; then
+            echo "Fix it with option 3 (Set/Update library & backup paths)." >&2
+            return 1
+        fi
+    fi
+
+    if ! mkdir -p "$backup_root"; then
+        echo "Error: Could not create the backup directory '$backup_root'." >&2
+        return 1
+    fi
+    if ! backup_root_writable "$backup_root"; then
+        echo "Error: The backup directory '$backup_root' is not writable." >&2
+        return 1
+    fi
+
+    printf '%s\n' "$backup_root"
+}
+
+########################################
 # FUNCTION: reencode_one_file
 # Core single-file reencode logic shared by every reencode path.
-# Backs up the original to backup_FLAC_originals, runs flac with
+# Backs the original up into the mirrored backup tree, runs flac with
 # --verify --compression-level-0 --decode-through-errors --preserve-modtime,
 # then replaces the original with the reencoded temp file on success.
 # SUCCESS/FAILURE/WARNING lines are always appended to the run log and echoed to
@@ -370,21 +614,25 @@ mark_as_reencoded() {
 #   $1 - Absolute path to the FLAC file
 #   $2 - Tracking database path (for mark_as_reencoded)
 #   $3 - Log file path
+#   $4 - Library root directory (prefix stripped to build the backup path)
+#   $5 - Backup root directory (mirrored copy of the library)
 # Returns 0 on success, 1 on failure.
 ########################################
 reencode_one_file() {
     local flac_file="$1"
     local db_path="$2"
     local log_file="$3"
+    local library_dir="${4%/}"
+    local backup_root="${5%/}"
 
-    local file_dir base temp_file backup_folder backup_target
+    local file_dir base temp_file backup_target
 
     # Determine the file's directory and file name.
     file_dir=$(dirname "$flac_file")
     base=$(basename "$flac_file")
     # The reencode temp is named 'tmp_<base>.part' (NOT '*.flac') so it can
     # never be mistaken for real library content: find_real_flac_files feeds on
-    # '*.flac', which keeps a live temp out of a concurrent option-5 find stream
+    # '*.flac', which keeps a live temp out of a concurrent option-4 find stream
     # and keeps an interrupted-run leftover out of the next scan / reencode-NEW.
     temp_file="${file_dir}/tmp_${base}.part"
 
@@ -394,6 +642,16 @@ reencode_one_file() {
     # always safe: no stale residue can ever block a fresh run.
     rm -f "$temp_file"
 
+    # Mirror the file's library path into the backup tree. A file that is not
+    # under the library root (possible for a row in a hand-edited/older scan CSV)
+    # has nowhere to be backed up, so it is refused rather than re-encoded
+    # unprotected: every reencode in this script is preceded by a backup.
+    backup_target="$(get_backup_target "$library_dir" "$backup_root" "$flac_file")"
+    if [ -z "$backup_target" ]; then
+        write_status "WARNING: $flac_file is not under the library ($library_dir); cannot back it up. Skipping reencode." "$log_file"
+        return 1
+    fi
+
     # Reencode the file using the specified FLAC parameters.
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
         write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
@@ -401,18 +659,25 @@ reencode_one_file() {
         return 1
     fi
 
-    # Create a backup folder in the same directory as the file.
-    backup_folder="${file_dir}/backup_FLAC_originals"
-    mkdir -p "$backup_folder"
-    backup_target="${backup_folder}/${base}"
+    # Create the mirrored backup folder, i.e. '<backup_root>/<artist>/<album>'.
+    # mkdir -p builds the whole relative chain in one go, so a fresh backup root
+    # needs no pre-created skeleton.
+    if ! mkdir -p "$(dirname "$backup_target")"; then
+        write_status "WARNING: Failed to create backup directory for $flac_file. Skipping reencode for this file." "$log_file"
+        rm -f "$temp_file"
+        return 1
+    fi
 
     if [ -e "$backup_target" ]; then
         # A backup already exists for this file (e.g. a re-run over the same
-        # CSV or the option-5 full pass, where the current file may already be
+        # CSV or the full-library pass, where the current file may already be
         # a reencoded version). Keep the EXISTING backup so the pristine
         # original is never overwritten; the reencode below still proceeds.
         echo "Backup already exists (keeping original): $backup_target" >> "$log_file"
-    elif ! cp "$flac_file" "$backup_target"; then
+    elif ! cp -p "$flac_file" "$backup_target"; then
+        # -p keeps timestamps/permissions, so the backup is a faithful snapshot
+        # that 'diff'/'rsync' can compare against, and a restored file keeps its
+        # original mtime (which is what --preserve-modtime aims for too).
         write_status "WARNING: Failed to backup $flac_file. Skipping reencode for this file." "$log_file"
         rm -f "$temp_file"
         return 1
@@ -438,8 +703,9 @@ reencode_one_file() {
 ########################################
 # FUNCTION: scan_library
 # Prompts for a music library directory, then recursively scans all real FLAC
-# files using 'flac -t'. The script's own backup_FLAC_originals copies and the
-# .flac_scan_data/ tracking dir are excluded. Any file that fails the test is
+# files using 'flac -t'. The script's own internal paths (legacy
+# backup_FLAC_originals copies) and the .flac_scan_data/ tracking dir are
+# excluded. Any file that fails the test is
 # recorded (with quotes) in a CSV file stored in the library directory.
 ########################################
 scan_library() {
@@ -580,8 +846,11 @@ scan_library() {
 # backup_FLAC_originals/ or .flac_scan_data/), e.g. from an older/exported CSV.
 #
 # Backup Behavior:
-#   For each file, a backup folder is created within its directory (if not already present)
-#   and the original file is backed up there before it is replaced by the reencoded version.
+#   The backup directory is resolved once (see resolve_backup_path) and each file
+#   is mirrored into it - the library root prefix is replaced by the backup root,
+#   so 'Album/song.flac' is backed up as '<backup>/Album/song.flac'. Originals
+#   are never stored inside the library, so a media scanner cannot pick them up
+#   as duplicate tracks.
 ########################################
 reencode_library() {
     config=$(load_config)
@@ -621,6 +890,15 @@ reencode_library() {
         return 0
     fi
 
+    # Resolve/create/validate the backup directory BEFORE any file is touched.
+    # A failure here (unsafe location, unwritable export) aborts the run rather
+    # than re-encoding a single file without a backup.
+    backup_root=""
+    if ! backup_root=$(resolve_backup_path "$library_dir"); then
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+
     # Create scan data directory if needed
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
@@ -630,7 +908,13 @@ reencode_library() {
 
     # Generate a log file for the reencoding process.
     log_file="${scan_data_dir}/logs/reencode_log_$(date +%F_%H-%M-%S).txt"
-    echo "Reencoding started at $(date)" > "$log_file"
+    {
+        echo "Reencoding started at $(date)"
+        echo "Library: $library_dir"
+        echo "Backups: $backup_root"
+        echo "CSV: $latest_csv"
+        echo ""
+    } > "$log_file"
 
     total_files=0
     success_count=0
@@ -654,10 +938,18 @@ reencode_library() {
             continue
         fi
 
+        # A path outside the library has no home in the mirrored backup tree, so
+        # it cannot be backed up. Skip it loudly instead of re-encoding it
+        # unprotected (this is also how the internal-path filter above behaves).
+        if ! get_backup_target "$library_dir" "$backup_root" "$flac_file" >/dev/null; then
+            echo "Skipping path outside the library: $flac_file"
+            continue
+        fi
+
         total_files=$((total_files + 1))
         echo "Processing file: $flac_file"
 
-        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
@@ -668,6 +960,7 @@ reencode_library() {
     echo "Total files processed: $total_files" | tee -a "$log_file"
     echo "Successful reencodes: $success_count" | tee -a "$log_file"
     echo "Failed reencodes: $fail_count" | tee -a "$log_file"
+    echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
     read -rp "Press Enter to return to main menu..."
 }
@@ -676,10 +969,11 @@ reencode_library() {
 # FUNCTION: reencode_all_files
 # Reencodes EVERY "real" FLAC file in the library (not just problematic ones).
 # Shows a prominent warning and requires explicit confirmation before proceeding.
-# Each original file is backed up to a backup_FLAC_originals folder.
-# The script's own backup_FLAC_originals copies and the .flac_scan_data tracking
-# dir are excluded (both the count and the processed set) so backups are never
-# re-encoded into nested backups themselves.
+# Each original file is mirrored into the configured backup directory (outside
+# the library) before it is replaced.
+# The script's own internal paths (legacy 'backup_FLAC_originals' copies and the
+# .flac_scan_data tracking dir) are excluded (both the count and the processed
+# set) so they are never re-encoded or backed up a second time.
 ########################################
 reencode_all_files() {
     config=$(load_config)
@@ -698,8 +992,8 @@ reencode_all_files() {
         return 0
     fi
 
-    # Count real FLAC files (find_real_flac_files skips the script's own backup
-    # copies and the .flac_scan_data tracking dir, consistent with reencode_new_files).
+    # Count real FLAC files (find_real_flac_files skips the script's own internal
+    # paths and the .flac_scan_data tracking dir, consistent with reencode_new_files).
     echo "Counting FLAC files..."
     total_files=$(find_real_flac_files "$library_dir" | wc -l)
     
@@ -709,7 +1003,17 @@ reencode_all_files() {
         return
     fi
 
-    # Prominent warning
+    # Resolve/create/validate the backup directory BEFORE any file is touched.
+    # '--no-prompt' because the warning below has to SHOW the destination before
+    # the user commits: an interactive question here would appear before the
+    # warning that justifies it (and before the 'REENCODE ALL' confirmation,
+    # which would swallow the answer). An unset backup_path therefore resolves
+    # to the derived default here, and option 2/5 will still offer to ask.
+    backup_root=""
+    if ! backup_root=$(resolve_backup_path "$library_dir" --no-prompt); then
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
     echo ""
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     echo "!!                              WARNING                                   !!"
@@ -719,7 +1023,8 @@ reencode_all_files() {
     echo "!!                                                                        !!"
     echo "!!  This will:                                                            !!"
     echo "!!    - Reencode every FLAC file (not just corrupted ones)                !!"
-    echo "!!    - Create backups in 'backup_FLAC_originals' folders                 !!"
+    echo "!!    - Mirror each original into:                                        !!"
+    echo "!!      $backup_root"
     echo "!!    - Replace each original with the reencoded version                  !!"
     echo "!!                                                                        !!"
     echo "!!  This process can take a VERY LONG TIME for large libraries.           !!"
@@ -744,6 +1049,7 @@ reencode_all_files() {
     {
         echo "Full library reencode started at $(date)"
         echo "Library: $library_dir"
+        echo "Backups: $backup_root"
         echo "Total files to process: $total_files"
         echo ""
     } > "$log_file"
@@ -784,7 +1090,7 @@ reencode_all_files() {
             last_update=$((processed_count * 100 / total_files))
         fi
 
-        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
@@ -803,6 +1109,7 @@ reencode_all_files() {
     echo "Total files processed: $processed_count" | tee -a "$log_file"
     echo "Successful reencodes: $success_count" | tee -a "$log_file"
     echo "Failed reencodes: $fail_count" | tee -a "$log_file"
+    echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Duration: ${duration} seconds" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
     read -rp "Press Enter to return to main menu..."
@@ -813,6 +1120,8 @@ reencode_all_files() {
 # into the original format by this script (i.e. not present in the tracking DB).
 # Newly added albums and freshly re-downloaded (previously deleted) albums are
 # detected via MD5+size and reencoded; everything else is skipped.
+# Each original file is mirrored into the configured backup directory (outside
+# the library) before it is replaced.
 ########################################
 reencode_new_files() {
     config=$(load_config)
@@ -831,6 +1140,12 @@ reencode_new_files() {
         return 0
     fi
 
+    # NOTE: the backup directory is NOT resolved here. resolve_backup_path may
+    # PROMPT (when no backup_path is configured yet), and prompting before the
+    # user has confirmed the destructive operation would both interrupt the flow
+    # and swallow a line of stdin meant for the confirmation below. It runs
+    # after the confirmation instead - still before any file is touched.
+
     # Create scan data directory and determine tracking DB path.
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
@@ -841,8 +1156,8 @@ reencode_new_files() {
     load_reencoded_set "$db_path"
     db_entries=${#REENCODED_SET[@]}
 
-    # Count real FLAC files (find_real_flac_files skips the script's own backup
-    # copies and the .flac_scan_data tracking dir so incremental reencodes stay accurate).
+    # Count real FLAC files (find_real_flac_files skips the script's own internal
+    # paths and the .flac_scan_data tracking dir so incremental reencodes stay accurate).
     echo "Counting FLAC files..."
     total_files=$(find_real_flac_files "$library_dir" | wc -l)
 
@@ -894,7 +1209,7 @@ reencode_new_files() {
     else
         echo "Found $new_count new FLAC file(s) out of $total_files total that have never been reencoded."
     fi
-    echo "Each will be reencoded with --verify and backed up to 'backup_FLAC_originals' before replacing."
+    echo "Each will be reencoded with --verify and its original mirrored into the backup directory."
     read -rp "Reencode these ${new_count} file(s)? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Reencode cancelled."
@@ -902,11 +1217,23 @@ reencode_new_files() {
         return
     fi
 
+    # Resolve/create/validate the backup directory now that the user has
+    # committed to the run. Still before any file is touched: an unsafe or
+    # unwritable destination aborts here rather than after audio has been
+    # rewritten.
+    backup_root=""
+    if ! backup_root=$(resolve_backup_path "$library_dir"); then
+        read -rp "Press Enter to return to main menu..."
+        return
+    fi
+    echo "Backups will be written to: $backup_root"
+
     # Create log file.
     log_file="${scan_data_dir}/logs/reencode_new_log_$(date +%F_%H-%M-%S).txt"
     {
         echo "New-file reencode started at $(date)"
         echo "Library: $library_dir"
+        echo "Backups: $backup_root"
         echo "Total FLAC files found: $total_files"
         echo "Already reencoded (skipped): $skipped_count"
         echo "New files to process: $new_count"
@@ -943,7 +1270,7 @@ reencode_new_files() {
             last_update=$((processed_count * 100 / new_count))
         fi
 
-        if reencode_one_file "$flac_file" "$db_path" "$log_file"; then
+        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
             success_count=$((success_count + 1))
         else
             fail_count=$((fail_count + 1))
@@ -965,101 +1292,85 @@ reencode_new_files() {
     echo "New files processed: $processed_count" | tee -a "$log_file"
     echo "Successful reencodes: $success_count" | tee -a "$log_file"
     echo "Failed reencodes: $fail_count" | tee -a "$log_file"
+    echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Duration: ${duration} seconds" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
     read -rp "Press Enter to return to main menu..."
 }
 
 ########################################
-# FUNCTION: cleanup_backups
-# Finds and removes all backup_FLAC_originals folders
+# FUNCTION: set_paths
+# Allows the user to set or update BOTH the library path and the backup
+# directory. Either prompt accepts a blank answer to keep the current value.
+# Changing the library with a blank backup keeps the existing backup directory
+# (save_config leaves the key alone), so the two can be edited independently.
+# The candidate backup path is validated before it is written to the config: an
+# unsafe value is refused here, at the keyboard, rather than at the start of a
+# long re-encode run.
 ########################################
-cleanup_backups() {
-    config=$(load_config)
-    library_path=$(echo "$config" | jq -r '.library_path')
-    
-    if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
-        read -rp "Enter the library path to clean backups from: " library_path
-    fi
-
-    if [ ! -d "$library_path" ]; then
-        echo "Error: Directory '$library_path' does not exist."
-        return 1
-    fi
-
-    # Find all backup folders
-    backup_folders=()
-    while IFS= read -r -d '' folder; do
-        backup_folders+=("$folder")
-    done < <(find "$library_path" -type d -name "backup_FLAC_originals" -print0)
-
-    if [ ${#backup_folders[@]} -eq 0 ]; then
-        echo "No backup folders found in '$library_path'"
-        return 0
-    fi
-
-    # Pre-measure every folder's size BEFORE any deletion (du of a removed
-    # folder reports nothing) so the summary below can report honest bytes.
-    total_size=0
-    total_files=0
-    backup_sizes=()
-    for folder in "${backup_folders[@]}"; do
-        size=$(du -sb "$folder" | cut -f1)
-        files=$(find "$folder" -type f | wc -l)
-        backup_sizes+=("$size")
-        total_size=$((total_size + size))
-        total_files=$((total_files + files))
-    done
-
-    # Human readable size
-    hr_size=$(numfmt --to=iec --suffix=B $total_size)
-
-    echo "Found ${#backup_folders[@]} backup folders containing $total_files files (total $hr_size)"
-    echo "WARNING: This will PERMANENTLY delete all FLAC backups"
-    read -rp "Type 'DELETE' to confirm: " confirm
-    if [ "$confirm" != "DELETE" ]; then
-        echo "Backup cleanup cancelled."
-        return 0
-    fi
-
-    # Actually delete. Use the pre-measured sizes (see note above) so the final
-    # byte count reflects what was actually removed.
-    deleted_count=0
-    deleted_size=0
-    folder_index=0
-    for folder in "${backup_folders[@]}"; do
-        echo "Deleting: $folder"
-        rm -rf "$folder"
-        deleted_count=$((deleted_count + 1))
-        deleted_size=$((deleted_size + ${backup_sizes[$folder_index]}))
-        folder_index=$((folder_index + 1))
-    done
-
-    hr_deleted_size=$(numfmt --to=iec --suffix=B $deleted_size)
-    echo "Deleted $deleted_count backup folders ($hr_deleted_size)"
-    read -rp "Press Enter to return to main menu..."
-}
-
-########################################
-# FUNCTION: set_library_path
-# Allows user to set or update the default library path
-########################################
-set_library_path() {
+set_paths() {
     config=$(load_config)
     current_path=$(echo "$config" | jq -r '.library_path')
-    
+    current_backup=$(echo "$config" | jq -r '.backup_path // empty')
+
     if [ -z "$current_path" ] || [ "$current_path" == "null" ]; then
         echo "No library path is currently configured."
     else
         echo "Current library path: $current_path"
     fi
-    
-    read -rp "Enter new library path (leave blank to keep current): " new_path
-    if [ -n "$new_path" ]; then
-        save_config "$new_path"
-        echo "Library path updated to: $new_path"
+    if [ -n "$current_backup" ]; then
+        echo "Current backup directory: $current_backup"
     else
-        echo "Library path remains unchanged."
+        echo "No backup directory is currently configured (will be derived as '<library>_backup')."
+    fi
+
+    read -rp "Enter new library path (leave blank to keep current): " new_path
+    if [ -z "$new_path" ]; then
+        new_path="$current_path"
+        if [ -n "$current_path" ] && [ "$current_path" != "null" ]; then
+            echo "Library path remains unchanged."
+        fi
+    fi
+
+    read -rp "Enter new backup directory (leave blank to keep current): " new_backup
+    if [ -z "$new_backup" ]; then
+        # Blank keeps the current value. When nothing was configured either, the
+        # derived sibling is offered as the value that will actually be used.
+        if [ -z "$current_backup" ] && [ -n "$new_path" ] && [ "$new_path" != "null" ]; then
+            new_backup="$(derive_backup_path "${new_path%/}")"
+            echo "Using derived backup directory: $new_backup"
+        else
+            new_backup="$current_backup"
+        fi
+    fi
+    new_backup="${new_backup%/}"
+
+    if [ -z "$new_path" ] || [ "$new_path" == "null" ]; then
+        echo "Error: A library path is required."
+        read -rp "Press Enter to return to main menu..."
+        return 1
+    fi
+
+    # The library may be entered for the first time here, so an existence check
+    # gives the error message the user needs to fix the typo.
+    if [ ! -d "$new_path" ]; then
+        echo "Error: The directory '$new_path' does not exist."
+        read -rp "Press Enter to return to main menu..."
+        return 1
+    fi
+
+    if [ -n "$new_backup" ] && ! validate_backup_root "$new_path" "$new_backup"; then
+        echo "Backup directory not changed."
+        read -rp "Press Enter to return to main menu..."
+        return 1
+    fi
+
+    save_config "$new_path" "$new_backup"
+    echo "Library path updated to: $new_path"
+    if [ -n "$new_backup" ]; then
+        echo "Backup directory updated to: $new_backup"
+    else
+        echo "Backup directory will be derived on the next re-encode: $(derive_backup_path "${new_path%/}")"
     fi
     read -rp "Press Enter to return to main menu..."
 }
@@ -1074,12 +1385,13 @@ main_menu() {
     echo "   FLAC Health Check & Reencode Script"
     echo "$menu_bar"
 
-    # Show the currently-configured library so the user knows what a bulk
-    # operation (options 1/2/5/6) would act on. Colors are only used on a live
+    # Show the currently-configured library and backup directory so the user
+    # knows what a bulk operation would act on. Colors are only used on a live
     # terminal so captured/redirected output stays plain.
-    local config library_path
+    local config library_path backup_path
     config=$(load_config)
     library_path=$(echo "$config" | jq -r '.library_path')
+    backup_path=$(echo "$config" | jq -r '.backup_path // empty')
     if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
         if stdout_is_tty; then
             printf '%b\n' "   ${YELLOW}Library: (not set - use option 3)${NC}"
@@ -1093,27 +1405,34 @@ main_menu() {
             echo "   Library: $library_path"
         fi
     fi
+    if [ -z "$backup_path" ]; then
+        if [ -n "$library_path" ] && [ "$library_path" != "null" ]; then
+            echo "   Backups: ${library_path%/}_backup (derived; set with option 3)"
+        else
+            echo "   Backups: (derived from the library; set with option 3)"
+        fi
+    else
+        echo "   Backups: $backup_path"
+    fi
     echo "$menu_bar"
 
     echo " 1) Scan music library for errors"
     echo " 2) Reencode problematic FLAC files (from latest scan)"
-    echo " 3) Set/Update default library path"
-    echo " 4) Clean up FLAC backups"
-    echo " 5) Reencode ALL FLAC files (with backups & warning)"
-    echo " 6) Reencode NEW FLAC files only"
-    echo " 7) Quit"
+    echo " 3) Set/Update library path & backup directory"
+    echo " 4) Reencode ALL FLAC files (with backups & warning)"
+    echo " 5) Reencode NEW FLAC files only"
+    echo " 6) Quit"
     echo "$menu_bar"
-    read -rp "Enter your selection (1-7, or q to quit): " selection
+    read -rp "Enter your selection (1-6, or q to quit): " selection
 
     case "$selection" in
         1) scan_library ;;
         2) reencode_library ;;
-        3) set_library_path ;;
-        4) cleanup_backups ;;
-        5) reencode_all_files ;;
-        6) reencode_new_files ;;
-        7 | q | Q) echo "Exiting..."; exit 0 ;;
-        *) echo "Invalid selection. Please choose a number from 1-7 (or q to quit)." ;;
+        3) set_paths ;;
+        4) reencode_all_files ;;
+        5) reencode_new_files ;;
+        6 | q | Q) echo "Exiting..."; exit 0 ;;
+        *) echo "Invalid selection. Please choose a number from 1-6 (or q to quit)." ;;
     esac
 }
 
