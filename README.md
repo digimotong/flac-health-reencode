@@ -126,16 +126,36 @@ bash tests/run_tests.sh
 ### Linting
 
 CI runs `shellcheck` at the strictest `-S style` threshold over the production
-script and the test suite, in a separate `lint` job. Run it locally with:
+script and the test suite, in a separate `lint` job. The job runs
+`tests/lint.sh`, which is the single source of truth for how this repo is
+linted, so the local and CI commands cannot drift apart. Run it locally with:
+
+```bash
+bash tests/lint.sh
+```
+
+It performs exactly the two invocations CI has always used:
 
 ```bash
 shellcheck -S style flac_health_reencode.sh
 shellcheck -S style tests/*.sh tests/stub_flac tests/stub_metaflac
 ```
 
-`.shellcheckrc` points `shellcheck` at `tests/` so the cases' dynamic
-`. "$TESTS_ROOT/helpers.sh"` sourcing resolves instead of raising SC1091. The
-few remaining diagnostics that are intentional (an unquoted glob in a `case`
+`.shellcheckrc` supplies two independent settings, and both are needed:
+
+- `source-path=tests` tells ShellCheck *where* to look. The cases source their
+  shared harness through a runtime variable
+  (`. "$TESTS_ROOT/helpers.sh"`), which ShellCheck cannot resolve from the
+  variable alone. It must be `tests` rather than `.` because the cases are
+  analysed as `tests/case_*.sh`.
+- `external-sources=true` grants permission to *follow* what was found.
+  ShellCheck only follows a source when the sourced file is an input on the
+  command line or when external sources are enabled. The second invocation
+  above analyses the test tree without the production script in the file list,
+  so `tests/source_guard_units.sh` sourcing `../flac_health_reencode.sh` raised
+  SC1091 in CI even though a combined local command passed.
+
+The few remaining diagnostics that are intentional (an unquoted glob in a `case`
 pattern, and variables published for sourcing case scripts) carry a
 `# shellcheck disable=` line explaining why.
 
