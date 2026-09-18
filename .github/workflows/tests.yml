@@ -54,6 +54,7 @@ jobs:
           for f in \
               flac_health_reencode.sh \
               README.md \
+              LICENSE \
               .shellcheckrc \
               .gitignore \
               .github/workflows/tests.yml \
