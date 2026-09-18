@@ -13,19 +13,7 @@ backup of every original it replaces.
 - Color-coded terminal output with progress tracking
 - Per-run logs and a small JSON config file
 
-## Requirements
-
-Bash, `flac` (which also provides `metaflac`), and `jq`.
-
-```bash
-# Debian / Ubuntu
-sudo apt-get install flac jq
-
-# macOS
-brew install flac jq
-```
-
-## Install & run
+## Install & Run
 
 ```bash
 git clone https://github.com/digimotong/flac-health-reencode.git
@@ -36,31 +24,27 @@ chmod +x flac_health_reencode.sh
 
 On first run, use option 3 to point the script at your music library.
 
-## Menu
+## Usage
 
 ```
-1) Full scan music library
-2) Reencode problematic FLAC files (with local backups)
+1) Scan music library for errors
+2) Reencode problematic FLAC files (from latest scan)
 3) Set/Update default library path
 4) Clean up FLAC backups
 5) Reencode ALL FLAC files (with backups & warning)
-6) Reencode NEW FLAC files only (skips already-reencoded)
+6) Reencode NEW FLAC files only
 7) Quit
 ```
 
-Notes before picking a re-encode option:
-
 - Options 2, 5 and 6 back up each original to a `backup_FLAC_originals/` folder
   next to it, then replace it with the re-encoded copy. Option 4 deletes those
-  backup folders afterwards.
+  backup folders afterwards, so only run it once you've verified the re-encodes.
 - The script never scans or re-encodes files inside its own
   `backup_FLAC_originals/` folders or the `.flac_scan_data/` directory.
 - Option 5 re-encodes everything and asks you to confirm first. Expect it to be
   slow on a large library, and make sure there's disk space for the backups.
-- Option 6 only processes files it hasn't recorded yet. Each successful
-  re-encode records the file's FLAC audio MD5, size and mtime in
-  `.flac_scan_data/reencoded.db`, so after an initial option 5 run you can use
-  it to pick up newly added albums without re-encoding the whole library.
+  Option 6 only processes files it hasn't recorded yet, so after an initial
+  option 5 run you can use it to pick up newly added albums.
 
 ## Configuration
 
@@ -74,7 +58,7 @@ Set the library path from the menu, or edit the file directly:
 }
 ```
 
-## What the script writes in your library
+## What the Script Writes in Your Library
 
 ```
 <library>/
@@ -87,75 +71,45 @@ Set the library path from the menu, or edit the file directly:
     └── reencoded.db             # fingerprints of re-encoded files
 ```
 
-## Tests
+Each successful re-encode records the file's FLAC audio MD5, size and mtime in
+`.flac_scan_data/reencoded.db`, which is what option 6 uses to tell new files
+from ones it has already processed.
 
-`tests/` holds the integration and unit suite. It runs the real script against
-throwaway sandboxes with stubbed `flac` and `metaflac` binaries, so no FLAC
-tools are needed and nothing outside a sandbox is touched. The same suite runs
-in CI (GitHub Actions) on every push.
+## Troubleshooting
 
-```bash
-bash tests/run_tests.sh
-```
+- `flac`, `metaflac` and `jq` are checked before the menu appears. A missing tool
+  exits with status `1` and a message naming the command, so install it and run
+  the script again.
+- A file that fails to re-encode is logged as `FAILURE` and left untouched: the
+  original is only replaced after the new copy is verified. Backups are never
+  overwritten, so re-running an option over the same files cannot lose a pristine
+  original — restore one by copying it back out of `backup_FLAC_originals/`.
+- Scan reports and per-run logs live in `.flac_scan_data/` inside your library,
+  so a failed run can be reviewed after the fact.
 
-- Integration cases drive the interactive menu end to end: scan, re-encode from
-  a scan report, re-encode all / new files, and backup cleanup.
-- Configuration and menu navigation are covered too: `load_config` creating a
-  default config, option 3 setting / keeping / first-setting the library path,
-  the "not set" banner, quitting, and an invalid selection re-prompting.
-- Startup requirements are covered: a missing `flac` or `metaflac` must name the
-  tool and exit 1 before the menu appears.
-- The interactive rendering branch is covered as well. Every other case
-  redirects the script's stdout, so `[ -t 1 ]` is always false and the TTY-only
-  code (animated progress bar, colourised summary) is unreachable; `case_tty.sh`
-  re-runs the script under a real PTY via `script -qec` and asserts the escapes
-  appear — with a non-TTY control run asserting they do not. It reports SKIP if
-  `script`/a PTY is unavailable.
-- Unit cases source `flac_health_reencode.sh` (safe thanks to the `BASH_SOURCE`
-  guard) and call helper functions directly.
-- Assertions match short, stable output markers and real state changes (file
-  contents, backups, `reencoded.db` rows), not full rendered output, so wording
-  changes don't break the suite.
-- Each case is wrapped in a wall-clock `timeout` (default 60s, override with
-  `CASE_TIMEOUT=<secs>`); a hung case fails by name while the rest still run.
-- If you change the `flac`/`metaflac` flags the script passes, update
-  `tests/stub_flac` and `tests/stub_metaflac` to match.
-- Break an assertion in a case to watch the suite fail. To run a single case:
-  `TESTS_ROOT=tests PROD_SCRIPT=$PWD/flac_health_reencode.sh bash tests/case_scan.sh`
+## Development
 
-### Linting
-
-CI runs `shellcheck` at the strictest `-S style` threshold over the production
-script and the test suite, in a separate `lint` job. The job runs
-`tests/lint.sh`, which is the single source of truth for how this repo is
-linted, so the local and CI commands cannot drift apart. Run it locally with:
+Requires Bash, `jq`, and `shellcheck` for linting.
 
 ```bash
-bash tests/lint.sh
+bash tests/run_tests.sh                # test suite
+bash tests/lint.sh                     # shellcheck
 ```
 
-It performs exactly the two invocations CI has always used:
+The suite drives the real script inside throwaway sandboxes with stubbed `flac`
+and `metaflac` binaries, so it needs no FLAC tools and touches nothing outside a
+sandbox. It runs in CI on every push. If you change the `flac`/`metaflac` flags
+the script passes, update `tests/stub_flac` and `tests/stub_metaflac` to match.
+
+## Requirements
+
+- Bash
+- `flac` (which also provides `metaflac`) and `jq`
 
 ```bash
-shellcheck -S style flac_health_reencode.sh
-shellcheck -S style tests/*.sh tests/stub_flac tests/stub_metaflac
+# Debian / Ubuntu
+sudo apt-get install flac jq
+
+# macOS
+brew install flac jq
 ```
-
-`.shellcheckrc` supplies two independent settings, and both are needed:
-
-- `source-path=tests` tells ShellCheck *where* to look. The cases source their
-  shared harness through a runtime variable
-  (`. "$TESTS_ROOT/helpers.sh"`), which ShellCheck cannot resolve from the
-  variable alone. It must be `tests` rather than `.` because the cases are
-  analysed as `tests/case_*.sh`.
-- `external-sources=true` grants permission to *follow* what was found.
-  ShellCheck only follows a source when the sourced file is an input on the
-  command line or when external sources are enabled. The second invocation
-  above analyses the test tree without the production script in the file list,
-  so `tests/source_guard_units.sh` sourcing `../flac_health_reencode.sh` raised
-  SC1091 in CI even though a combined local command passed.
-
-The few remaining diagnostics that are intentional (an unquoted glob in a `case`
-pattern, and variables published for sourcing case scripts) carry a
-`# shellcheck disable=` line explaining why.
-
