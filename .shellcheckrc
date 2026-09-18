@@ -1,0 +1,26 @@
+# ShellCheck configuration for the flac-health-reencode repo.
+#
+# Locating a sourced file and being allowed to FOLLOW it are two separate
+# settings. Both are needed here:
+#
+#   source-path=tests
+#       WHERE to look. The cases source their shared harness through a runtime
+#       variable -- `. "$TESTS_ROOT/helpers.sh"` -- which ShellCheck cannot
+#       resolve from the variable alone, so it must be told the directory
+#       (equivalent to passing --source-path=tests). It must be `tests` and not
+#       `.` because the cases are analysed as `tests/case_*.sh`, so their
+#       relative path is already `./helpers.sh`.
+#
+#   external-sources=true
+#       PERMISSION to read what was located. ShellCheck only follows a source
+#       when the sourced file is an input on the command line *or* external
+#       sources are enabled. The `lint` job analyses the test tree WITHOUT the
+#       production script in the file list, so tests/source_guard_units.sh
+#       sourcing ../flac_health_reencode.sh raised SC1091 there while a combined
+#       local invocation passed and masked it. Enabling this makes both
+#       invocations behave identically. (Equivalent to passing -x.)
+#
+# This is safe: the only files sourced anywhere in the repo are helpers.sh and
+# the production script, both fully trusted and tracked in-repo.
+source-path=tests
+external-sources=true

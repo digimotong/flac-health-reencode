@@ -100,12 +100,62 @@ bash tests/run_tests.sh
 
 - Integration cases drive the interactive menu end to end: scan, re-encode from
   a scan report, re-encode all / new files, and backup cleanup.
+- Configuration and menu navigation are covered too: `load_config` creating a
+  default config, option 3 setting / keeping / first-setting the library path,
+  the "not set" banner, quitting, and an invalid selection re-prompting.
+- Startup requirements are covered: a missing `flac` or `metaflac` must name the
+  tool and exit 1 before the menu appears.
+- The interactive rendering branch is covered as well. Every other case
+  redirects the script's stdout, so `[ -t 1 ]` is always false and the TTY-only
+  code (animated progress bar, colourised summary) is unreachable; `case_tty.sh`
+  re-runs the script under a real PTY via `script -qec` and asserts the escapes
+  appear — with a non-TTY control run asserting they do not. It reports SKIP if
+  `script`/a PTY is unavailable.
 - Unit cases source `flac_health_reencode.sh` (safe thanks to the `BASH_SOURCE`
   guard) and call helper functions directly.
 - Assertions match short, stable output markers and real state changes (file
   contents, backups, `reencoded.db` rows), not full rendered output, so wording
   changes don't break the suite.
+- Each case is wrapped in a wall-clock `timeout` (default 60s, override with
+  `CASE_TIMEOUT=<secs>`); a hung case fails by name while the rest still run.
 - If you change the `flac`/`metaflac` flags the script passes, update
   `tests/stub_flac` and `tests/stub_metaflac` to match.
 - Break an assertion in a case to watch the suite fail. To run a single case:
   `TESTS_ROOT=tests PROD_SCRIPT=$PWD/flac_health_reencode.sh bash tests/case_scan.sh`
+
+### Linting
+
+CI runs `shellcheck` at the strictest `-S style` threshold over the production
+script and the test suite, in a separate `lint` job. The job runs
+`tests/lint.sh`, which is the single source of truth for how this repo is
+linted, so the local and CI commands cannot drift apart. Run it locally with:
+
+```bash
+bash tests/lint.sh
+```
+
+It performs exactly the two invocations CI has always used:
+
+```bash
+shellcheck -S style flac_health_reencode.sh
+shellcheck -S style tests/*.sh tests/stub_flac tests/stub_metaflac
+```
+
+`.shellcheckrc` supplies two independent settings, and both are needed:
+
+- `source-path=tests` tells ShellCheck *where* to look. The cases source their
+  shared harness through a runtime variable
+  (`. "$TESTS_ROOT/helpers.sh"`), which ShellCheck cannot resolve from the
+  variable alone. It must be `tests` rather than `.` because the cases are
+  analysed as `tests/case_*.sh`.
+- `external-sources=true` grants permission to *follow* what was found.
+  ShellCheck only follows a source when the sourced file is an input on the
+  command line or when external sources are enabled. The second invocation
+  above analyses the test tree without the production script in the file list,
+  so `tests/source_guard_units.sh` sourcing `../flac_health_reencode.sh` raised
+  SC1091 in CI even though a combined local command passed.
+
+The few remaining diagnostics that are intentional (an unquoted glob in a `case`
+pattern, and variables published for sourcing case scripts) carry a
+`# shellcheck disable=` line explaining why.
+

@@ -22,6 +22,9 @@
 : "${PROD_SCRIPT:?helpers.sh: PROD_SCRIPT must be set}"
 
 CURRENT_OUT=''
+# Set by run_script() for the CALLING case script to inspect (e.g. "the script
+# exited non-zero"), so it is used across files rather than inside helpers.sh.
+# shellcheck disable=SC2034  # read by case_*.sh after sourcing this file
 LAST_STATUS=0
 
 # Strip color / progress escape sequences for the loose text grep. The script
@@ -71,6 +74,11 @@ register_sandbox() {
 #   NOT a failure of this helper, so the pipeline runs under an `if` to keep it
 #   from tripping the case's `set -e`. The child's exit code is recorded in
 #   LAST_STATUS for cases that want to inspect it.
+#
+# LAST_STATUS / CURRENT_OUT are the helper's public outputs: the case scripts
+# that source this file read them after the call, so shellcheck's "appears
+# unused" (SC2034) does not apply within this file.
+# shellcheck disable=SC2034
 run_script() {
     local sbx="$1"; shift
     CURRENT_OUT="$sbx/output.log"
@@ -151,7 +159,6 @@ db_has_path() {
         [ "$rest" = "$path" ] && return 0
     done < "$db"
     _fail "db lacks entry for: $path"
-    return 1
 }
 
 ###############################################################################
@@ -166,6 +173,8 @@ write_file() { printf '%s' "$2" > "$1"; }
 #   * a successful stub reencode REPLACES the target file with content
 #     'REENCODE_OK' -- backups tracked by these tests never carry it, so
 #     "backup untouched by reencode" is checked via file_eq against the marker.
+# Read by case_*.sh (which source this file), not within helpers.sh itself.
+# shellcheck disable=SC2034
 RE_MARKER='REENCODE_OK'
 
 

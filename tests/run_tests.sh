@@ -29,6 +29,11 @@ case "${1:-}" in
     --help|-h|"") : ;;
     *) echo "run_tests.sh: unrecognized option: $1" >&2; exit 2 ;;
 esac
+# VERBOSE is accepted for interface stability (and to keep a future per-case
+# output dump opt-in), but the runner always replays a failing case's captured
+# log, so there is nothing extra to print on success yet. Export it so the
+# value is available to any case that wants to honour it.
+export VERBOSE
 
 # 1. Syntax gate ----------------------------------------------------------------
 if ! bash -n "$PROD_SCRIPT"; then
@@ -62,7 +67,17 @@ export PROD_SCRIPT="$PROD_SCRIPT"
 total=0
 passed=0
 failed=0
+skipped=0
 failed_names=()
+skipped_names=()
+
+# Per-case wall-clock ceiling. The cases are black-box and complete in well
+# under a second; anything approaching this bound means a case is stuck in an
+# unbounded read or wait (e.g. the script blocked on a prompt that no longer
+# reads, or a PTY never closing). The CI job also wraps the whole run in
+# `timeout 300`, but a per-case bound fails the RESPONSIBLE case and still lets
+# the remaining cases run, which is far more useful when triaging.
+CASE_TIMEOUT="${CASE_TIMEOUT:-60}"
 
 echo ""
 echo "== running test cases =="
@@ -72,13 +87,28 @@ for case in "$THIS_DIR"/case_*.sh; do
     total=$((total + 1))
 
     log="$(mktemp "${TMPDIR:-/tmp}/${name}.XXXXXX")"
-    if bash "$case" >"$log" 2>&1; then
-        passed=$((passed + 1))
-        echo "  PASS  $name"
+    if timeout "$CASE_TIMEOUT" bash "$case" >"$log" 2>&1; then
+        # A case may self-declare a SKIP for a missing environment feature
+        # (e.g. no PTY available for case_tty). That is neither pass nor fail,
+        # but it must never be a silent pass: surface it as SKIP.
+        if grep -q '^SKIP:' "$log"; then
+            skipped=$((skipped + 1))
+            skipped_names+=("$name")
+            echo "  SKIP  $name"
+            sed 's/^/        /' "$log"
+        else
+            passed=$((passed + 1))
+            echo "  PASS  $name"
+        fi
     else
+        rc=$?
         failed=$((failed + 1))
         failed_names+=("$name")
-        echo "  FAIL  $name"
+        if [ "$rc" -eq 124 ]; then
+            echo "  FAIL  $name (timed out after ${CASE_TIMEOUT}s)"
+        else
+            echo "  FAIL  $name"
+        fi
         echo "  -------- $name output --------"
         cat "$log"
         echo "  ------------------------------"
@@ -89,11 +119,15 @@ done
 echo ""
 echo "=============================================="
 if [ "$failed" -eq 0 ]; then
-    echo "ALL $passed CASE(S) PASSED"
+    if [ "$skipped" -eq 0 ]; then
+        echo "ALL $passed CASE(S) PASSED"
+    else
+        echo "ALL $passed CASE(S) PASSED ($skipped SKIPPED: ${skipped_names[*]})"
+    fi
     echo "=============================================="
     exit 0
 else
-    echo "RESULT: $passed passed, $failed failed (of $total)"
+    echo "RESULT: $passed passed, $failed failed, $skipped skipped (of $total)"
     printf 'failed: %s\n' "${failed_names[*]}"
     echo "=============================================="
     exit 1

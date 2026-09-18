@@ -4,12 +4,21 @@ on:
   push:
   pull_request:
 
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -20,5 +29,86 @@ jobs:
         shell: bash
 
       - name: Run FLAC health/re-encode test suite
-        run: bash tests/run_tests.sh
+        # A hung case must fail rather than burn the job's full timeout. The
+        # suite runs each case in its own subprocess, so 300s is a generous
+        # ceiling for a healthy suite (it completes in a few seconds locally)
+        # that still catches an unbounded read/wait loop.
+        run: timeout 300 bash tests/run_tests.sh
+        shell: bash
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The repo's .gitignore denies everything by default and re-allows a short
+      # allowlist. A file the build needs can therefore be silently ignored by
+      # git (this actually happened to .shellcheckrc) and CI breaks on a clean
+      # clone while the developer's working tree looks fine. Assert the tracked
+      # set directly: `git ls-files` reads the INDEX, so a file that is present
+      # locally but ignored is simply absent from this list.
+      - name: Assert required files are tracked by git
+        run: |
+          missing=0
+          for f in \
+              flac_health_reencode.sh \
+              README.md \
+              .shellcheckrc \
+              .gitignore \
+              .github/workflows/tests.yml \
+              .github/dependabot.yml \
+              tests/run_tests.sh \
+              tests/lint.sh \
+              tests/helpers.sh \
+              tests/stub_flac \
+              tests/stub_metaflac \
+              tests/source_guard_units.sh; do
+            if ! git ls-files --error-unmatch "$f" > /dev/null 2>&1; then
+              echo "::error file=$f::$f is not tracked by git (check .gitignore allowlist)"
+              missing=1
+            fi
+          done
+          # Every test case must be tracked too, so a new tests/case_*.sh cannot
+          # be written, run locally, and then silently never run in CI.
+          while IFS= read -r case_file; do
+            if ! git ls-files --error-unmatch "$case_file" > /dev/null 2>&1; then
+              echo "::error file=$case_file::$case_file is not tracked by git (check .gitignore allowlist)"
+              missing=1
+            fi
+          done < <(find tests -maxdepth 1 -name 'case_*.sh' | sort)
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: required files are ignored by git; CI cannot see them."
+            exit 1
+          fi
+          echo "ok: all required files are tracked."
+        shell: bash
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+        shell: bash
+
+      # The runner script is the single source of truth for how the repo is
+      # linted, so CI cannot invoke shellcheck differently from a developer.
+      # It prints the resolved version, which is also what the pin below is
+      # asserted against: if apt starts shipping a different shellcheck, this
+      # fails with a clear message instead of surfacing as mystery diagnostics.
+      - name: Pin the shellcheck major.minor version
+        run: |
+          want="0.9"
+          got="$(shellcheck --version | awk '/^version:/ {print $2}')"
+          echo "shellcheck $got (pinned to $want.x)"
+          if [ "${got%.*}" != "$want" ]; then
+            echo "::error::shellcheck $got found, but the repo is pinned to $want.x;"
+            echo "::error::review the new diagnostics (0.10 dropped e.g. --rcfile) before bumping."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Run shellcheck on the production script and the test suite
+        # A hung or wildly slow lint must fail rather than burn the job's full
+        # timeout; the suite lints in about a second locally.
+        run: timeout 120 bash tests/lint.sh
         shell: bash

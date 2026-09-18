@@ -6,6 +6,7 @@
 !flac_health_reencode.sh
 
 # Test suite + CI config (see tests/README-free run_tests.sh; README notes)
+!.shellcheckrc
 !tests/
 !tests/*
 !.github/
