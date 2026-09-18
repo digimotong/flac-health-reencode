@@ -45,6 +45,25 @@ directory.
   Option 5 only processes files it hasn't recorded yet, so after an initial
   option 4 run you can use it to pick up newly added albums.
 
+## Configuration
+
+On first run the script creates `flac_health_config.json` next to itself.
+Set both paths from the menu, or edit the file directly:
+
+```json
+{
+  "library_path": "/path/to/music",
+  "backup_path": "/path/to/music_backup",
+  "version": "1.1"
+}
+```
+
+- `backup_path` may be left empty or absent: the script then derives
+  `<library_path>_backup` (a sibling of the library) and offers it as the default
+  the first time you re-encode. Setting it explicitly is recommended when backup
+  storage lives elsewhere, e.g. `/mnt/backup/music`.
+- Both paths must be absolute, and trailing slashes are accepted on either.
+
 ## Backups
 
 **Backups live outside the library.** The backup directory mirrors the library's
@@ -92,8 +111,8 @@ Rules enforced by the script:
 If the config has no `backup_path`, the script suggests `<library>_backup` (a
 sibling of the library):
 
-- Option 2 and option 5 **ask** before using it, and store the answer you accept
-  ("leave blank" accepts the suggestion).
+- Option 2 and option 5 **ask** before using it, and store the answer you accept:
+  the prompt shows the suggestion as its default, so pressing Enter takes it.
 - Option 4 does **not** interrupt: its warning panel prints the destination it
   will use and you confirm from there. Nothing is written to the config in this
   case, so the menu keeps showing the path as derived until you set one
@@ -147,25 +166,6 @@ To move an existing library over:
 Leaving them in place is harmless — they are simply ignored — so this cleanup is
 optional and can wait until you are confident in the new location.
 
-## Configuration
-
-On first run the script creates `flac_health_config.json` next to itself.
-Set both paths from the menu, or edit the file directly:
-
-```json
-{
-  "library_path": "/path/to/music",
-  "backup_path": "/path/to/music_backup",
-  "version": "1.1"
-}
-```
-
-- `backup_path` may be left empty or absent: the script then derives
-  `<library_path>_backup` (a sibling of the library) and offers it as the default
-  the first time you re-encode. Setting it explicitly is recommended when backup
-  storage lives elsewhere, e.g. `/mnt/backup/music`.
-- Both paths must be absolute, and trailing slashes are accepted on either.
-
 ## What the Script Writes in Your Library
 
 ```
@@ -187,19 +187,16 @@ from ones it has already processed.
 
 ## Troubleshooting
 
-- `flac`, `metaflac` and `jq` are checked before the menu appears. A missing tool
-  exits with status `1` and a message naming the command, so install it and run
-  the script again.
+- `flac`, `metaflac` and `jq` are checked before the menu appears. A missing
+  tool exits with status `1` and a message naming the command, so install it and
+  run the script again.
 - A file that fails to re-encode is logged as `FAILURE` and left untouched: the
-  original is only replaced after the new copy is verified. Backups are never
-  overwritten, so re-running an option over the same files cannot lose a pristine
-  original — restore one as shown in [Backups](#backups).
-- `Error: The backup directory cannot be inside the library (...)` means the two
-  paths overlap. Pick a backup directory that is neither inside, equal to, nor a
-  parent of the library path, then re-run.
-- `Error: The backup directory must be an absolute path (...)` means a relative
-  name reached the config, usually a mis-typed prompt answer. Set it again from
-  option 3 with a full path such as `/mnt/backup/music`.
+  original is only replaced after the new copy is verified, and it can be
+  restored from the backup tree (see [Backups](#backups)).
+- `Error: The backup directory cannot be inside the library (...)` or `Error: The
+  backup directory must be an absolute path (...)` means the destination is
+  relative or overlaps the library. See [Backups](#backups) for the rules and
+  pick a path that is neither inside, equal to, nor a parent of the library.
 - Scan reports and per-run logs live in `.flac_scan_data/` inside your library,
   so a failed run can be reviewed after the fact.
 

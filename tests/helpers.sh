@@ -21,6 +21,12 @@
 : "${TESTS_ROOT:?helpers.sh: TESTS_ROOT must be set}"
 : "${PROD_SCRIPT:?helpers.sh: PROD_SCRIPT must be set}"
 
+# PATH as it was when this file was sourced. run_script() prepends the sandbox
+# stub bin to THIS value rather than to the ambient $PATH, so a case that
+# narrows PATH for one child cannot change how later runs resolve tools.
+# shellcheck disable=SC2034  # referenced by run_script below (same file scope)
+PATH_PRE="$PATH"
+
 CURRENT_OUT=''
 # Set by run_script() for the CALLING case script to inspect (e.g. "the script
 # exited non-zero"), so it is used across files rather than inside helpers.sh.
@@ -88,7 +94,11 @@ register_sandbox() {
 run_script() {
     local sbx="$1"; shift
     CURRENT_OUT="$sbx/output.log"
-    if printf '%s\n' "$@" | PATH="$sbx/bin:$PATH" bash "$sbx/flac_health_reencode.sh" \
+    # PATH_PRE is the environment PATH captured at source time. The inherited
+    # PATH cannot be used here: 'source' snapshotting aside, a test case that
+    # narrows PATH for its own child (case_requirements.sh) must not leak that
+    # narrowing into these unrelated runs.
+    if printf '%s\n' "$@" | PATH="$sbx/bin:$PATH_PRE" bash "$sbx/flac_health_reencode.sh" \
             > "$CURRENT_OUT" 2>&1; then
         LAST_STATUS=0
     else

@@ -131,10 +131,17 @@ save_config() {
     echo "$config" > "$CONFIG_FILE"
 }
 
-# Ensure required commands are available.
-for cmd in flac metaflac; do
+# Ensure required commands are available. NOTE: jq is required too -
+# and a bare "jq: command not found" would kill the script with status 127
+# and leave a zero-byte config behind. The package to suggest differs per
+# tool, so map the command to its Debian/Ubuntu package.
+for cmd in flac metaflac jq; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: The '$cmd' command is not installed. Please install it (e.g., sudo apt-get install flac) and try again."
+        case "$cmd" in
+            jq) pkg=jq ;;
+            *)  pkg=flac ;;   # the flac package also provides metaflac
+        esac
+        echo "Error: The '$cmd' command is not installed. Please install it (e.g., sudo apt-get install $pkg) and try again."
         exit 1
     fi
 done
