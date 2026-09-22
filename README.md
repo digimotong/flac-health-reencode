@@ -37,17 +37,9 @@ directory.
 
 ## Usage
 
-```
-1) Scan music library for errors
-2) Reencode problematic FLAC files (from latest scan)
-3) Set/Update library path & backup directory
-4) Reencode ALL FLAC files (with backups & warning)
-5) Reencode NEW FLAC files only
-6) Quit
-```
-
-The menu also prints the active library and backup directory, and accepts `q` as
-a shortcut for quitting.
+Running the script draws a numbered menu; the table below is what each option
+does. The menu also prints the active library and backup directory, and accepts
+`q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
@@ -81,14 +73,10 @@ Set both paths from the menu, or edit the file directly:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `library_path` | yes | Absolute path to the FLAC library to scan and re-encode. |
-| `backup_path` | no | Absolute path for the mirrored originals. Left empty, it is derived on the next re-encode. |
-| `version` | — | Written and read by the script; leave it alone. |
+| `backup_path` | no | Absolute path for the mirrored originals. Left empty or absent, the script derives `<library_path>_backup` (a sibling of the library) and offers it as the default the first time you re-encode. Setting it explicitly is recommended when backup storage lives elsewhere, e.g. `/mnt/backup/music`. |
+| `version` | — | Written when the script creates the file; the script never reads it back, so leave it alone. |
 
-- `backup_path` may be left empty or absent: the script then derives
-  `<library_path>_backup` (a sibling of the library) and offers it as the default
-  the first time you re-encode. Setting it explicitly is recommended when backup
-  storage lives elsewhere, e.g. `/mnt/backup/music`.
-- Both paths must be absolute, and trailing slashes are accepted on either.
+Both paths must be absolute, and trailing slashes are accepted on either.
 
 ## Backups
 
@@ -124,16 +112,11 @@ Rules enforced by the script:
 ### When the backup directory is not set yet
 
 If the config has no `backup_path`, the script suggests `<library>_backup` (a
-sibling of the library):
-
-- Option 2 and option 5 **ask** before using it, and store the answer you accept:
-  the prompt shows the suggestion as its default, so pressing Enter takes it.
-- Option 4 does **not** interrupt: its warning panel prints the destination it
-  will use and you confirm from there. Nothing is written to the config in this
-  case, so the menu keeps showing the path as derived until you set one
-  explicitly with option 3.
-- In every case the directory is only created after you commit to the run, so
-  backing out of a confirmation leaves nothing behind.
+sibling of the library). Options 2 and 5 **ask** before using it and store the
+answer you accept, showing the suggestion as the prompt's default; option 4 does
+**not** interrupt, and only prints the destination in its warning panel. In every
+case nothing is written to the config here, so the menu keeps showing the path as
+derived until you set one explicitly with option 3.
 
 ### Restoring an original
 
@@ -162,10 +145,6 @@ To find every file a run touched, check the run log written to
 
 Re-encoded originals are **not** written here; they go to the backup directory
 described in [Backups](#backups).
-
-Each successful re-encode records the file's FLAC audio MD5, size and mtime in
-`.flac_scan_data/reencoded.db`, which is what option 5 uses to tell new files
-from ones it has already processed.
 
 ## Troubleshooting
 
