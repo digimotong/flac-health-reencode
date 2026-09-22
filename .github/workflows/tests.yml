@@ -13,6 +13,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Both job ids below are required status checks on `main`, so their *names* are
+# load-bearing: the ruleset matches on `test` and `lint`, and renaming a job (or
+# matrixing it, which would rename it to `lint (3.12)`) leaves that required
+# context reporting nothing. An unreported required check does not fail - it
+# blocks every merge behind "Expected - waiting for status to be reported".
+#
+# The bare `push:`/`pull_request:` triggers above are load-bearing in the same
+# way: a `paths:`/`branches:` filter would skip the whole run on matching PRs,
+# which is precisely when the required checks have to report.
+#
+# tests/case_workflow_contract.sh pins all of this, including that the job set
+# stays mutable and that neither job grows a `strategy:`, a `name:`, an `if:` or
+# a `needs:`. The taggers require more contexts than this repo does (`parity`,
+# `dockerfile`, and a matrixed `test`), so the ruleset and the guard's
+# REQUIRED_JOBS list are per-repository and must be changed together.
 jobs:
   test:
     runs-on: ubuntu-latest
