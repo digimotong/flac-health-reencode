@@ -16,8 +16,11 @@
 #   3. Adding a `strategy:`/matrix to a job, or a job-level `name:`. Either
 #      renames the reported context (`lint` becomes `lint (3.12)`, or whatever
 #      `name:` says), so the required bare `lint` stops reporting.
+#   4. Adding a job-level `if:`/`needs:`. A skipped job reports nothing at all,
+#      so a `if:` that is false on pull_request, or a `needs:` chain through a
+#      job that is itself skipped, leaves the required context unreported.
 #
-# The sibling tagger repos assert the same three properties in
+# The sibling tagger repos assert the same properties in
 # tests/test_twin_parity.py (TestWorkflowKeepsTheParityCheckUsable), but they do
 # it with PyYAML because their comments NAME `paths:` and `branches:` while
 # explaining that filters must not be used, so a substring match cannot tell the
@@ -27,6 +30,11 @@
 # this comment-proof: whole-line comments are discarded before anything is
 # compared, and property A reads line numbers and nesting depth rather than
 # values, so a future comment mentioning `paths:` cannot be mistaken for a filter.
+#
+# The two suites differ in one deliberate way: there the matrix on `test` is
+# REQUIRED (the ruleset demands `test (3.12)`/`(3.13)`/`(3.14)`), so its absence
+# is the failure; here any `strategy:` on a required job is the failure. Each
+# side asserts what its own ruleset matches, so they must not be copied across.
 #
 # Deliberately NOT asserted: step names, wording, which tools a step installs,
 # the shellcheck pin, the workflow's own `name:`, or the exact set of jobs.
@@ -53,6 +61,13 @@ exist "$WORKFLOW"
 # branch ruleset matches on - so pinning them here is the point, not a hardcoded
 # fact that would go stale. Renaming a job is a deliberate act that has to be
 # mirrored in the ruleset, so failing here is the correct outcome.
+#
+# The list mirrors the ruleset exactly, so it has to be edited together with it,
+# in the same change. The taggers require `parity` and `dockerfile` on top of
+# `lint` and matrix `test`; this repo has neither job and requires neither, so a
+# ruleset or job list copied between the repos would ask a check to report that
+# nothing ever produces - which blocks every merge. The workflow's comment above
+# `jobs:` names these same two contexts, which is where they are documented.
 REQUIRED_JOBS='test lint'
 
 # awk source for "print the body of a block". Shared so the extraction rule is
@@ -229,29 +244,40 @@ echo "ok: case_workflow_contract (required jobs declared: $REQUIRED_JOBS)"
 # bare `lint` then never reports - the same silent block as B, but produced by an
 # edit that looks purely additive.
 #
-# These two keys are named explicitly rather than matched by class: they are
-# exactly the keys GitHub uses to change a check's name, so listing them is the
-# rule, not a sample of it. Any other job-level key (`runs-on:`, `steps:`, a new
-# `env:` ...) is legitimate and must pass.
+# These four keys are named explicitly rather than matched by class: the first
+# two are exactly the keys GitHub uses to change a check's name, and the last two
+# are the keys that stop a job from running at all - and a job that does not run
+# reports nothing, which is the same silent block reached by a different route:
+#
+#   strategy  -> the check is renamed `lint (3.12)`
+#   name      -> the check is whatever `name:` says
+#   if        -> the job is skipped whenever the condition is false (e.g. an
+#                `if:` that only holds on push leaves every PR unreported)
+#   needs     -> the job is skipped whenever a dependency is skipped or fails,
+#                so one `if:` upstream silently takes this check down with it
+#
+# Listing them is the rule, not a sample of it: every other job-level key
+# (`runs-on:`, `steps:`, a new `env:` ...) is legitimate and must pass.
 #
 # Indentation is what makes this safe to check by pattern. Job ids sit at two
 # spaces and a job's own keys at four, while step entries are nested one level
 # deeper and are introduced by `- ` (`      - name: Checkout`); anchoring on
 # exactly four spaces + a word character therefore matches job-level keys only,
-# so a step's `name:` can neither satisfy nor trip this. Job bodies come from
-# body_of_job, which stops at the next job id, so one job's keys can never be
+# so a step's `name:` or `if:` can neither satisfy nor trip this. Job bodies come
+# from body_of_job, which stops at the next job id, so one job's keys can never be
 # attributed to another.
 for job in $REQUIRED_JOBS; do
-    renames="$(body_of_job "$job" | grep -E '^    (strategy|name):' || true)"
+    renames="$(body_of_job "$job" | grep -E '^    (strategy|name|if|needs):' || true)"
     [ -z "$renames" ] || _fail "the '$job' job grew a job-level key that renames
-       the reported status check, so the required '$job' context stops reporting
-       and every PR is blocked:
+       the reported status check or stops it running, so the required '$job'
+       context stops reporting and every PR is blocked:
 
 $(printf '%s\n' "$renames" | sed 's/^/         /')
 
        A 'strategy:' makes the check '$job (3.12)'; a 'name:' replaces it
-       outright. Fix the workflow - matrix or rename a job that is NOT required,
-       or update the ruleset in the same change."
+       outright; an 'if:' or 'needs:' skips the job, and a skipped job reports
+       nothing. Fix the workflow - matrix, rename, guard or chain a job that is
+       NOT required - or update the ruleset in the same change."
 done
 
-echo "ok: case_workflow_contract (required jobs un-matrixed and unnamed)"
+echo "ok: case_workflow_contract (required jobs un-matrixed, unnamed and unconditional)"
