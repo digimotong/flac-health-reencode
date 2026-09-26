@@ -107,16 +107,46 @@ $expected"
         mlib_fail "jobs=$jobs: track04.flac was not actually replaced"
     fi
 
-    # The repaired audio must have the same stream properties as the pristine
-    # original: a re-encode that "passes -t" but is a different length or depth
-    # would be silent data loss.
-    local want_info got_info
-    want_info="$(metaflac --show-total-samples --show-bps --show-sample-rate \
-                    --show-channels "$pristine/track02.flac" | tr '\n' ' ')"
-    got_info="$(metaflac --show-total-samples --show-bps --show-sample-rate \
-                    --show-channels "$sbx/lib/track02.flac" | tr '\n' ' ')"
-    [ "$want_info" = "$got_info" ] \
-        || mlib_fail "jobs=$jobs: repaired track02 stream properties changed: '$want_info' -> '$got_info'"
+    # The repaired files must keep the pristine FORMAT and carry exactly the audio
+    # the damaged bytes still allowed.
+    #
+    # NOT "same total-samples as the pristine original": mlib_corrupt_truncate drops
+    # the last 6KB, so track02's trailing frames are gone before the script ever sees
+    # the file, and no repair can put them back (the decoded-audio comment further
+    # down says the same thing). The script re-encodes the DAMAGED bytes
+    # (reencode_one_file), so the honest bound is "what a real decoder can still
+    # salvage from them" - measured by running the same repair command on the copy of
+    # the damaged file the script saw:
+    #
+    #   fewer samples -> frames the decoder could have salvaged were dropped;
+    #   more samples  -> audio was invented.
+    #
+    # KEEP THIS COMMAND IN STEP WITH reencode_one_file() in flac_health_reencode.sh
+    # (its 'flac --verify --compression-level-0 --decode-through-errors' line): that
+    # is what defines "salvageable", so both sides must use the same flags.
+    local n want_format got_format salvageable got_samples
+    for n in 02 04; do
+        want_format="$(metaflac --show-bps --show-sample-rate --show-channels \
+                        "$pristine/track$n.flac" | tr '\n' ' ')"
+        got_format="$(metaflac --show-bps --show-sample-rate --show-channels \
+                        "$sbx/lib/track$n.flac" | tr '\n' ' ')"
+        [ "$want_format" = "$got_format" ] \
+            || mlib_fail "jobs=$jobs: repaired track$n format changed: '$want_format' -> '$got_format'"
+
+        # A measurement, not a fixture: outside the library and the backup tree, so
+        # it can skew neither the residue checks nor the backup count.
+        flac --verify --compression-level-0 --decode-through-errors --preserve-modtime \
+             --silent -o "$sbx/salvage$n.flac" "$pristine/track$n.corrupt" \
+            || mlib_fail "jobs=$jobs: could not measure the salvageable length of track$n"
+        salvageable="$(metaflac --show-total-samples "$sbx/salvage$n.flac")"
+        got_samples="$(metaflac --show-total-samples "$sbx/lib/track$n.flac")"
+        if [ -z "$salvageable" ] || [ -z "$got_samples" ]; then
+            mlib_fail "jobs=$jobs: track$n reports no sample count (repair '$got_samples', salvageable '$salvageable')"
+        fi
+        [ "$got_samples" -eq "$salvageable" ] \
+            || mlib_fail "jobs=$jobs: repair of track$n carries $got_samples samples, but the damaged bytes still held $salvageable"
+        mlib_log "jobs=$jobs: track$n keeps its format and all $got_samples salvageable samples"
+    done
 
     # --- backups (checked BEFORE the option-4 pass below) --------------------
     # track02 and track04 were damaged, so option 2's backup for each is a copy of
