@@ -445,3 +445,160 @@ occur_re 'No errors found'
 
 echo "ok: case_parallel (scan path pooled, order preserved)"
 
+# ===========================================================================
+# Run 5: option 5 (RE-ENCODE NEW) is pooled too -- the last uncovered entry
+#
+# reencode_library (option 2) and reencode_all_files (option 4) are covered above
+# and by the real-flac harness, but reencode_new_files reaches run_file_pool
+# through a DIFFERENT caller with its own discovery pass (it fingerprints every
+# file and keeps only those absent from the tracking DB). Nothing else in either
+# suite runs it with jobs > 1, so a regression that pooled it wrongly, or that
+# mis-counted the new files it hands the pool, would go unnoticed. Its contract:
+#
+#   * only files MISSING from the tracking DB are reencoded; tracked ones are
+#     counted as 'Already reencoded (skipped)' and left byte-identical;
+#   * the pool is really used (measured occupancy, as elsewhere);
+#   * the tally distinguishes total / skipped / found / processed;
+#   * the DB ends up covering every file.
+# ===========================================================================
+NEW_TOTAL=14
+# Files 1..TRACKED are seeded into the tracking DB, so option 5 must treat them as
+# already done; the rest must be seen as new. Kept well below NEW_TOTAL so the second
+# run (with no DB seeding at all) still has more files than workers.
+NEW_ALREADY=(1 2 3 4)
+NEW_ALREADY_COUNT=${#NEW_ALREADY[@]}
+NEW_COUNT=$((NEW_TOTAL - NEW_ALREADY_COUNT))
+
+# new_fixture [tracked_count]
+#   Rebuild the library, then seed the tracking DB with the fingerprints of the first
+#   <tracked_count> files (default: ${#NEW_ALREADY[@]}). Passing 0 leaves the DB empty,
+#   making every file new - the shape where new files outnumber workers. The DB row
+#   format is "md5 size mtime path" (see record_reencoded_to) and the discovery pass
+#   keys on "md5|size", so a wrong md5 or size here would silently make a tracked file
+#   look new; the assertions below catch exactly that.
+new_fixture() {
+    local tracked="${1:-$NEW_ALREADY_COUNT}" i path
+    rm -rf "$LIB"
+    mkdir -p "$LIB/Album"
+    for i in $(seq 1 "$NEW_TOTAL"); do
+        write_file "$LIB/Album/track$i.flac" "orig-$i"
+    done
+    mkdir -p "$LIB/.flac_scan_data"
+    : > "$DB"
+    for i in $(seq 1 "$tracked"); do
+        path="$LIB/Album/track$i.flac"
+        printf '%s %s %s %s\n' \
+            "$(md5sum "$path" | awk '{print $1}')" \
+            "$(wc -c < "$path")" \
+            "$(date +%s)" \
+            "$path" >> "$DB"
+    done
+}
+
+# new_run <out_var> : option 5 with 4 workers, in the CURRENT shell so
+# run_script_env's output variables survive for the assertions below.
+new_run() {
+    local out_var="$1"
+    set_jobs 4
+    probe_reset
+    run_script_env "$SBX" "STUB_FLAC_SLEEP=$STUB_SLEEP" \
+        "STUB_FLAC_SLOT_DIR=$PROBE" -- '5' 'y' ''
+    printf -v "$out_var" '%s' "$CURRENT_OUT"
+}
+
+echo "  .. jobs=4 option-5 run ($NEW_COUNT new of $NEW_TOTAL files)"
+new_fixture
+# NEW_OUT captures the run's log path through printf -v (see new_run); the value is not
+# read afterwards, the assertions work off CURRENT_OUT, so no pre-declaration is needed.
+new_run NEW_OUT
+
+# ---- the discovery pass classified correctly -------------------------------
+occur_re "Found $NEW_COUNT new FLAC file\\(s\\) out of $NEW_TOTAL total"
+# The tally entries are 'label: N', so captured_count's ([0-9]+) extracts the number
+# and each comparison becomes numeric - a wrong count cannot pass as a substring,
+# and the labels stay pinned by that same regex (grep -oE must match literally).
+[ "$(captured_count 'Already reencoded \(skipped\): ([0-9]+)')" -eq "$NEW_ALREADY_COUNT" ] \
+    || _fail "option 5: skipped count != $NEW_ALREADY_COUNT"
+[ "$(captured_count 'New files found: ([0-9]+)')" -eq "$NEW_COUNT" ] \
+    || _fail "option 5: 'new files found' != $NEW_COUNT"
+[ "$(captured_count 'New files processed: ([0-9]+)')" -eq "$NEW_COUNT" ] \
+    || _fail "option 5: 'new files processed' != $NEW_COUNT"
+[ "$(captured_count 'Successful reencodes: ([0-9]+)')" -eq "$NEW_COUNT" ] \
+    || _fail "option 5: success count != $NEW_COUNT"
+[ "$(captured_count 'Failed reencodes: ([0-9]+)')" -eq 0 ] \
+    || _fail "option 5: failure count != 0"
+[ "$(captured_count 'Total FLAC files in library: ([0-9]+)')" -eq "$NEW_TOTAL" ] \
+    || _fail "option 5: library total != $NEW_TOTAL"
+occur_re "Processing $NEW_COUNT file\\(s\\) with 4 worker\\(s\\)"
+occur_re "Processing $NEW_COUNT file\\(s\\) with 4 worker\\(s\\)"
+
+# ---- only the NEW files were touched --------------------------------------
+# The decisive assertion on this path: a file the DB already covers must be left
+# exactly as it was, or option 5 would re-encode the whole library every time.
+for i in "${NEW_ALREADY[@]}"; do
+    file_eq "$LIB/Album/track$i.flac" "orig-$i" \
+        || _fail "option 5: tracked track$i was reencoded"
+done
+for i in $(seq 1 "$NEW_TOTAL"); do
+    case " ${NEW_ALREADY[*]} " in
+        *" $i "*) continue ;;
+    esac
+    file_eq "$LIB/Album/track$i.flac" 'REENCODE_OK' \
+        || _fail "option 5: new track$i was not reencoded"
+    file_eq "$BAKROOT/Album/track$i.flac" "orig-$i" \
+        || _fail "option 5: missing/wrong backup for new track$i"
+done
+# One SUCCESS line per new file, not per file in the library.
+[ "$(message_count 'SUCCESS:')" -eq "$NEW_COUNT" ] \
+    || _fail "option 5: expected exactly $NEW_COUNT SUCCESS lines"
+
+# ---- the pool is really used, exactly once per new file --------------------
+# Peak occupancy can only reach min(workers, new files): the dispatch loop starts at
+# most ONE worker per file, so a peak BELOW 4 here is correct behavior, NOT a degraded
+# pool. Asserting min() rather than a flat 4 is what keeps this honest, and it covers
+# the "more workers than files" shape no other run produces. Degrees are pinned to 4
+# by the 8-file runs above (and by the >workers run below).
+NEW_EXPECT_PEAK=$(( NEW_COUNT < 4 ? NEW_COUNT : 4 ))
+assert_peak "$NEW_EXPECT_PEAK" 'option 5 jobs=4 (new files < workers)' "$NEW_COUNT"
+
+# Same path with MORE new files than workers: now the peak must reach the full worker
+# count, which is the assertion that would fail a pool silently capped at 2-3.
+echo "  .. jobs=4 option-5 run again ($NEW_TOTAL new files > workers)"
+new_fixture 0
+probe_reset
+run_script_env "$SBX" "STUB_FLAC_SLEEP=$STUB_SLEEP" \
+    "STUB_FLAC_SLOT_DIR=$PROBE" -- '5' 'y' ''
+[ "$(captured_count 'New files found: ([0-9]+)')" -eq "$NEW_TOTAL" ] \
+    || _fail "option 5: all $NEW_TOTAL files should be new after a DB-less reset"
+occur_re "Processing $NEW_TOTAL file\\(s\\) with 4 worker\\(s\\)"
+assert_peak 4 'option 5 jobs=4 (new files > workers)' "$NEW_TOTAL"
+
+# ---- the DB now covers every file, with no duplicate rows ------------------
+[ "$(wc -l < "$DB")" -eq "$NEW_TOTAL" ] \
+    || _fail "option 5: DB should hold exactly $NEW_TOTAL rows"
+for i in $(seq 1 "$NEW_TOTAL"); do
+    db_has_path "$SBX" "$LIB/Album/track$i.flac"
+done
+
+# ---- hygiene, as on the other pooled paths --------------------------------
+LEFTOVER=$(count_find "$LIB/.flac_scan_data" -type f \
+    \( -name '*.result' -o -name '*_w*.log' -o -name '*_w*.db' -o -name '*.index' \))
+[ "$LEFTOVER" -eq 0 ] \
+    || _fail "option 5: $LEFTOVER shard/index file(s) left behind"
+SEEDLIST=$(count_find "$LIB/.flac_scan_data/seed" -name '*.paths')
+[ "$SEEDLIST" -eq 0 ] \
+    || _fail "option 5: $SEEDLIST seed list(s) left behind"
+
+# ---- ...and a second run finds nothing new (the DB really was updated) ------
+echo "  .. jobs=4 option-5 re-run (expects nothing to do)"
+probe_reset
+run_script_env "$SBX" "STUB_FLAC_SLEEP=$STUB_SLEEP" \
+    "STUB_FLAC_SLOT_DIR=$PROBE" -- '5' '' ''
+occur_re "All $NEW_TOTAL FLAC files have already been reencoded"
+occur_re 'Nothing to do'
+# It really did no work: the stub was never invoked to re-encode anything.
+[ "$(probe_records)" -eq 0 ] \
+    || _fail "option 5 re-run: the stub was invoked $(probe_records) time(s), expected 0"
+
+echo "ok: case_parallel (option 5 pooled, only new files reencoded)"
+

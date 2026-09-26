@@ -138,10 +138,15 @@ at any worker count.
 
 The suite above stubs `flac`/`metaflac`, so it proves the scheduler but never the
 audio. `tests/manual/` covers that gap with real binaries: it generates real FLACs,
-damages them, and checks that the repaired files verify, decode to identical
-samples, and that backups are byte-identical copies of the originals. It also
-interrupts a concurrent run mid-flight to prove no worker (or its `flac` child) is
-left running and no temp file survives.
+damages them, and checks that the repaired files verify with the real `flac -t`,
+keep the original bit depth/sample rate/channels, and carry exactly the audio still
+salvageable from the damaged bytes - truncation removes trailing frames outright,
+so the check is calibrated against `flac --decode-through-errors` itself rather than
+against the pristine original. The strongest claim, byte-identical decoded samples,
+is made only for an **intact** file re-encoded through option 4, where equality is
+actually achievable; backups are required to be byte-identical copies of the
+*damaged* originals they replaced. It also interrupts a concurrent run mid-flight to
+prove no worker (or its `flac` child) is left running and no temp file survives.
 
 ```bash
 bash tests/manual/run_manual.sh        # needs the real flac package

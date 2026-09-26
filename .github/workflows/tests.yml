@@ -165,6 +165,18 @@ jobs:
           # jq/md5sum inspect the script's output; flac/metaflac are the real
           # binaries under test (the harness SKIPs without them).
           sudo apt-get install -y --no-install-recommends jq flac
+          # Assert the tools are really here. The harness exits 0 when they are
+          # missing (each script prints 'SKIP:' and run_manual.sh counts that as a
+          # pass), so without this an apt outage or a renamed package would turn
+          # this job into a green check that verified nothing. Failing here keeps
+          # the distinction the tally prints explicit: "3 passed, 0 skipped".
+          for tool in flac metaflac; do
+            if ! command -v "$tool" > /dev/null 2>&1; then
+              echo "::error::$tool was not installed; the harness would SKIP and this job would verify nothing."
+              exit 1
+            fi
+          done
+          flac --version
         shell: bash
 
       - name: Run the real-flac manual harness
