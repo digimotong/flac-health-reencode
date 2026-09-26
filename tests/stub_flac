@@ -15,6 +15,31 @@
 #
 # If the real script ever changes the flac flags it passes, update this stub to
 # keep matching (see Tests in README).
+#
+# STUB_FLAC_SLEEP (optional, seconds) makes the re-encode path sleep before it
+# writes its output. Default 0 keeps every existing case instant. It exists so
+# case_parallel.sh can hold N reencodes open at the same time and therefore
+# observe real overlap: without a delay a stub reencode finishes in under a
+# millisecond and even a serial implementation can look parallel.
+#
+# STUB_FLAC_SLOT_DIR (optional, directory) turns the stub into a CONCURRENCY
+# PROBE, and is what makes the parallel case's overlap assertion exact rather
+# than a proxy. When set, each re-encode claims the lowest-numbered free slot
+# directory under it and holds it until exit:
+#
+#   * the claim is `mkdir`, which is atomic, so a process that wins slot N has
+#     PROVEN that N-1 sibling re-encodes were in flight at that same instant;
+#   * therefore the highest rank anyone claims IS the peak concurrency, with no
+#     clock, no timestamp ordering, and no float comparison involved;
+#   * one record file per process (`<pid>.rank`) rather than a shared append, so
+#     concurrent writers can never interleave a partial line.
+#
+# A leaked slot would inflate the next run's ranking, so the slot is released
+# from an EXIT trap: that fires on every exit path, including the failure return
+# for an unreadable input, where a plain trailing rmdir would be skipped.
+#
+# It is deliberately gated on the env var because the probe is only meaningful
+# for the parallel case; unset, it costs this stub a single `[ -n ]` test.
 ###############################################################################
 
 out=''
@@ -39,6 +64,34 @@ if [[ " $* " == *' -t '* ]]; then
         exit 1
     fi
     exit 0
+fi
+
+# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Placed after the -t early
+# return so verification passes are not counted as re-encode occupancy, and
+# before the sleep so the slot is held for the whole duration of this re-encode.
+slot=''
+if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
+    mkdir -p "$STUB_FLAC_SLOT_DIR"
+    n=0
+    while :; do
+        n=$((n + 1))
+        mkdir "$STUB_FLAC_SLOT_DIR/$n" 2>/dev/null && break
+        # 64 is far above any worker count a test uses; the guard exists only so
+        # a leaked slot cannot spin here forever.
+        if [ "$n" -ge 64 ]; then
+            n=0
+            break
+        fi
+    done
+    slot="$STUB_FLAC_SLOT_DIR/$n"
+    printf '%s\n' "$n" > "$STUB_FLAC_SLOT_DIR/$$.rank"
+    trap 'rmdir "$slot" 2>/dev/null || true' EXIT
+fi
+
+# Hold this reencode open when asked, so a concurrent run has a window in which
+# several workers are genuinely in flight at once (see STUB_FLAC_SLEEP above).
+if [ -n "${STUB_FLAC_SLEEP:-}" ]; then
+    sleep "$STUB_FLAC_SLEEP"
 fi
 
 # Re-encode mode: overwrite the temp target with a single, file-INDEPENDENT

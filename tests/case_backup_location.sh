@@ -52,8 +52,14 @@ MANUAL="$LIB/.flac_scan_data/reports/flac_scan_manual.csv"
 
 run_script "$SBX" '2' 'Y' ''
 
-occur_re "Processing file: $REAL"
-occur_re "SUCCESS:.*worst\\.flac reencoded successfully"
+# Per-file feedback: option 2 goes through the shared worker pool. In a captured
+# (non-tty) run — which is what the harness does — the pool replays each file's
+# SUCCESS/FAILURE line in FILE ORDER, so the file is still named on the terminal
+# exactly once. The pre-pool "Processing file: <path>" dispatch line is gone;
+# the same information now lives in the "Processing N file(s) with M worker(s)"
+# header plus the per-file result lines.
+occur_re "Processing 1 file\\(s\\) with [0-9]+ worker\\(s\\)"
+occur_re "SUCCESS: $REAL reencoded successfully"
 # The out-of-library row is skipped, so only the real in-library file counts.
 occur_re "Skipping path outside the library: $OUTSIDE"
 [ "$(captured_count 'Total files processed: ([0-9]+)')" -eq 1 ] || _fail "option2 total != 1"

@@ -11,14 +11,29 @@
 #   - Recursive directory scanning
 #   - Progress tracking with visual feedback
 #   - Configurable library + backup paths (stored in JSON)
+#   - Parallel reencodes: up to 'jobs' files are processed at once (see the
+#     Parallel Reencodes notes below)
 #   - Automatic backup of original files before re-encoding (a backup is written
 #     only the first time a file is re-encoded, so the pristine original survives
 #     re-runs over the same files)
 #   - Comprehensive error logging
 #   - Persistent 'reencoded' tracking database (avoids redundant full re-encodes)
 #
+# Parallel Reencodes:
+#   The stock 'flac' CLI is single-threaded per file (it has no thread-count
+#   option), so the only way to use more than one core is to reencode several
+#   FILES at once. All three reencode paths (2/4/5) therefore run up to 'jobs'
+#   files concurrently through a shared worker pool (run_reencode_pool).
+#   'jobs' is resolved by get_jobs(): $FLAC_HEALTH_JOBS, else the config's
+#   "jobs" key, else a default of min(4, nproc). Set it to 1 for the old
+#   strictly-sequential behavior; an explicit value is honored as-is, so a user
+#   who has measured their storage can ask for more workers than the default.
+#   Per-file work is unchanged (temp -> backup -> atomic mv), and each worker
+#   logs to its own shard (run log + tracking DB) which the parent merges
+#   afterwards, so no two workers ever append to the same file.
+#
 # Requirements:
-#   - bash 4.0+ (associative arrays)
+#   - bash 4.3+ (associative arrays, 'wait -n' for the worker pool)
 #   - flac command line tool
 #   - metaflac (included with the flac package)
 #   - jq for JSON processing
@@ -85,6 +100,21 @@ declare -g STDOUT_IS_TTY=''
 # onto / scatter the bar; the statuses still reach the log either way.
 declare -g STATUS_TO_CONSOLE=1
 
+# Pool state -----------------------------------------------------------------
+# POOL_WORKERS_USED is the PARENT-visible output of run_reencode_pool: the
+# high-water worker id, i.e. how many per-worker shards the run created. Worker
+# ids are allocated per FILE (not per worker slot), so it is normally larger
+# than the job count, and it is 0 for a sequential (jobs=1) run, which creates
+# no shards at all. Initialised here because callers under 'set -u' read it
+# right after the call to decide what merge_reencode_shards must fold in.
+declare -g POOL_WORKERS_USED=0
+
+# POOL_PROCESSED / POOL_SUCCESS / POOL_FAIL are run_reencode_pool's completion
+# tally. They are re-initialised per run inside the function.
+declare -g POOL_PROCESSED=0
+declare -g POOL_SUCCESS=0
+declare -g POOL_FAIL=0
+
 # Set of successfully reencoded files, keyed by md5|size (see load_reencoded_set).
 # global associative array
 declare -A REENCODED_SET
@@ -118,17 +148,73 @@ load_config() {
 #        is left untouched, so a caller that only means to change the library
 #        (and every pre-existing call site) cannot silently drop the backup
 #        location.
+#   $3 - (optional) New worker count (see get_jobs). Omitted leaves the
+#        existing "jobs" key untouched, for the same reason as $2. The literal
+#        "default" clears the key instead, so get_jobs() re-derives it.
 ########################################
 save_config() {
     local new_path="$1"
     local new_backup="${2:-}"
+    local new_jobs="${3:-}"
     if [ -n "$new_backup" ]; then
         config=$(jq --arg path "$new_path" --arg backup "$new_backup" \
             '.library_path = $path | .backup_path = $backup' "$CONFIG_FILE")
     else
         config=$(jq --arg path "$new_path" '.library_path = $path' "$CONFIG_FILE")
     fi
+    # 'jobs' is only rewritten when a caller passes one, exactly like
+    # backup_path above: a library-only update must not silently reset the
+    # user's worker count back to the default. The sentinel "default" deletes the
+    # key so the auto-detected value takes over again.
+    if [ "$new_jobs" = "default" ]; then
+        config=$(jq 'del(.jobs)' <<< "$config")
+    elif [ -n "$new_jobs" ]; then
+        config=$(jq --argjson jobs "$new_jobs" '.jobs = $jobs' <<< "$config")
+    fi
     echo "$config" > "$CONFIG_FILE"
+}
+
+########################################
+# FUNCTION: get_jobs
+# Resolves the number of concurrent reencode workers, in precedence order:
+#   1. $FLAC_HEALTH_JOBS  (per-run override)
+#   2. the config file's "jobs" key
+#   3. a default of min(4, nproc)
+# An EXPLICIT value (1 or 2 above) is returned as-is - a user who has measured
+# their storage may deliberately ask for more workers than the default. Only a
+# value that is absent, non-numeric or < 1 falls back to the default. The
+# dependency check runs first, so jq/nproc are guaranteed to exist here.
+# Output: a positive integer, 1 meaning "strictly sequential".
+########################################
+get_jobs() {
+    local raw=""
+
+    if [ -n "${FLAC_HEALTH_JOBS:-}" ]; then
+        raw="$FLAC_HEALTH_JOBS"
+    elif [ -f "$CONFIG_FILE" ]; then
+        raw=$(jq -r '(.jobs // empty) | if type == "number" then tostring else . end' "$CONFIG_FILE" 2>/dev/null)
+    fi
+
+    if [[ ! "$raw" =~ ^[0-9]+$ ]] || [ "$raw" -lt 1 ]; then
+        raw=""
+    fi
+
+    # Default: modest even on a big box. Every file moves roughly 3x its size
+    # through the filesystem (source read, temp write, backup copy), so an
+    # unbounded pool saturates the storage pool - and that pool is usually also
+    # serving media players - long before it saturates the CPU.
+    if [ -z "$raw" ]; then
+        local cores
+        cores=$(nproc 2>/dev/null) || cores=2
+        [[ "$cores" =~ ^[0-9]+$ ]] || cores=2
+        raw=4
+        if [ "$cores" -lt "$raw" ]; then
+            raw="$cores"
+        fi
+        [ "$raw" -lt 1 ] && raw=1
+    fi
+
+    printf '%s\n' "$raw"
 }
 
 # Ensure required commands are available. NOTE: jq is required too -
@@ -361,6 +447,33 @@ load_reencoded_set() {
         [ -z "$md5" ] && continue
         REENCODED_SET["$md5|$size"]=1
     done < "$db_path"
+}
+
+########################################
+# FUNCTION: record_reencoded_to
+# Appends a successfully reencoded file's fingerprint to an ARBITRARY file
+# instead of the shared tracking DB. This is what makes parallel workers safe:
+# each worker writes its own shard, so no two processes ever append to the same
+# file (whose append atomicity is NOT guaranteed anyway on NFS/SMB, where a
+# media library commonly lives). The parent concatenates the shards into
+# reencoded.db afterwards (see merge_reencode_shards).
+# The line format is identical to mark_as_reencoded's, so a shard is
+# indistinguishable from a real DB once merged.
+# Arguments:
+#   $1 - Target file (a per-worker shard, or the DB itself when jobs=1)
+#   $2 - FLAC file path
+# Returns non-zero if the fingerprint could not be generated.
+########################################
+record_reencoded_to() {
+    local target_path="$1"
+    local file="$2"
+    local fp
+
+    fp=$(get_file_fingerprint "$file") || return 1
+
+    mkdir -p "$(dirname "$target_path")"
+    printf '%s %s\n' "$fp" "$file" >> "$target_path"
+    return 0
 }
 
 ########################################
@@ -640,13 +753,19 @@ ensure_backup_root() {
 # Backs the original up into the mirrored backup tree, runs flac with
 # --verify --compression-level-0 --decode-through-errors --preserve-modtime,
 # then replaces the original with the reencoded temp file on success.
-# SUCCESS/FAILURE/WARNING lines are always appended to the run log and echoed to
-# the terminal depending on STATUS_TO_CONSOLE (see write_status); the quieter
-# "Backup created for:" line goes to the log file only.
+# SUCCESS/FAILURE/WARNING lines are appended to whichever log file is passed in
+# and echoed to the terminal depending on STATUS_TO_CONSOLE (see write_status);
+# the quieter "Backup created for:" line goes to the log file only.
+#
+# Parallel safety: the two write targets are PARAMETERS, not globals. The pool
+# hands each worker its own per-process log shard (LOG_SHARD) and DB shard
+# (DB_SHARD), so concurrent workers never append to the same file and no
+# locking or O_APPEND atomicity assumption is needed.
 # Arguments:
 #   $1 - Absolute path to the FLAC file
-#   $2 - Tracking database path (for mark_as_reencoded)
-#   $3 - Log file path
+#   $2 - Tracking file for successful reencodes: the DB itself when running
+#        sequentially, otherwise this worker's DB shard (merged later)
+#   $3 - Log file path (the run log, or this worker's log shard)
 #   $4 - Library root directory (prefix stripped to build the backup path)
 #   $5 - Backup root directory (mirrored copy of the library)
 # Returns 0 on success, 1 on failure.
@@ -726,10 +845,467 @@ reencode_one_file() {
     fi
 
     write_status "SUCCESS: $flac_file reencoded successfully." "$log_file"
-    if ! mark_as_reencoded "$db_path" "$flac_file"; then
+    if ! record_reencoded_to "$db_path" "$flac_file"; then
         # Reencode succeeded but recording failed (should be extremely rare).
         write_status "WARNING: Reencode succeeded but could not record '$flac_file' in the tracking database." "$log_file"
     fi
+    return 0
+}
+########################################
+# FUNCTION: shard_dir_for
+# Returns the directory holding a run's per-worker shards: a 'shards' directory
+# SIBLING to the run log, i.e. '.flac_scan_data/shards'. Never named '*.flac'
+# and never under a path find_real_flac_files scans, so a stray shard can never
+# be mistaken for library content or for a reencode temp.
+# Arguments:
+#   $1 - Run log path
+########################################
+shard_dir_for() {
+    printf '%s/shards\n' "$(dirname "$1")"
+}
+
+########################################
+# FUNCTION: shard_path_for
+# Returns the shard path of one kind for one worker, namespaced by the RUN LOG's
+# basename. The basename is unique per run, so two overlapping runs (e.g. option 4
+# started while an option 5 run is still finishing) can never share a shard -
+# the same reasoning that makes reencode temps per-file.
+# Arguments:
+#   $1 - Run log path
+#   $2 - Worker id
+#   $3 - 'log', 'db', or 'result'
+########################################
+shard_path_for() {
+    local log_file="$1"
+    local worker_id="$2"
+    local kind="$3"
+    local ext
+
+    # Explicit mapping with no default fallthrough: a typo'd kind must not
+    # silently alias onto the log shard, which would make several workers
+    # append to one file.
+    case "$kind" in
+        log)    ext="log" ;;
+        db)     ext="db" ;;
+        result) ext="result" ;;
+        *)
+            echo "shard_path_for: unknown shard kind '$kind'" >&2
+            return 1
+            ;;
+    esac
+
+    printf '%s/%s_w%s.%s\n' "$(dirname "$log_file")" \
+        "$(basename "$log_file")" "$worker_id" "$ext"
+}
+
+
+
+########################################
+# FUNCTION: merge_reencode_shards
+# Concatenates a run's per-worker shards into the real run log and tracking DB,
+# then removes them. Runs only AFTER every worker has finished (run_reencode_pool
+# drains first), so the merge itself is single-threaded.
+# The DB shard holds exactly the "<md5> <size> <mtime> <path>" lines
+# record_reencoded_to wrote - byte-identical in format to a directly-appended DB
+# line - so the merge is a plain append and a pre-existing DB is preserved.
+# A worker that failed a file still writes its log shard (that is the point),
+# while its DB shard may be absent or empty; both cases are handled. Only ids
+# that actually own a shard are ever touched, so the directory can be cleaned up
+# even when other runs' shards are still present.
+# Arguments:
+#   $1 - Run log path (final destination)
+#   $2 - Tracking DB path (final destination)
+#   $3 - High-water worker id from the pool (POOL_WORKERS_USED): worker ids are
+#        allocated per FILE, so this is usually larger than the job count
+########################################
+merge_reencode_shards() {
+    local log_file="$1"
+    local db_path="$2"
+    local workers="$3"
+    local id db_sh log_sh
+
+    for (( id = 0; id < workers; id++ )); do
+        db_sh=$(shard_path_for "$log_file" "$id" db)
+        log_sh=$(shard_path_for "$log_file" "$id" log)
+        if [ -f "$db_sh" ]; then
+            if [ -s "$db_sh" ]; then
+                mkdir -p "$(dirname "$db_path")"
+                cat "$db_sh" >> "$db_path"
+            fi
+            rm -f "$db_sh"
+        fi
+        if [ -f "$log_sh" ]; then
+            if [ -s "$log_sh" ]; then
+                cat "$log_sh" >> "$log_file"
+            fi
+            rm -f "$log_sh"
+        fi
+    done
+    # Remove the shard directory if this run was its last user.
+    rmdir "$(shard_dir_for "$log_file")" 2>/dev/null || true
+}
+
+########################################
+# FUNCTION: run_reencode_pool
+# The shared worker pool behind ALL three reencode paths (2/4/5). Reads
+# NUL-separated file paths from the file at $6, keeps up to $1 workers busy, and
+# calls reencode_one_file for each file inside a worker.
+#
+# 'wait -n' (bash 4.3+) is used rather than a wave/barrier pool on purpose: a
+# corrupt file rescued with --decode-through-errors can take an order of
+# magnitude longer than a healthy one, so "dispatch N, wait for all, repeat"
+# would idle the other workers for the rest of every batch. wait -n backfills
+# the moment any single worker exits, and it lets the progress bar advance
+# continuously instead of lurching in N-file steps.
+#
+# Results travel through the two side channels any pool of this shape needs:
+# a WORKER_EXIT map from pid to worker id (a guard against pid reuse), and the
+# per-worker DB/log shards plus a dispatch-ordered index. The parent tallies
+# completions by sweeping pids for liveness ('kill -0'), which never consumes a
+# status it could not read.
+#
+# Arguments:
+#   $1 - Worker count (1 = strictly sequential, no children at all)
+#   $2 - Run log path (shard naming is derived from it)
+#   $3 - Tracking DB path (written directly only on the sequential path)
+#   $4 - Library root directory
+#   $5 - Backup root directory
+#   $6 - NUL-separated input list (must be fully written before the call)
+#   $7 - Output mode: 0 = animated single-line bar, 1 = quiet (statuses stay in
+#        the log shards), 2 = replay per-file lines from the shards afterwards
+#   $8 - Label for the bar's tallies ("Failed" is the historical wording)
+# Sets (globals, read by the caller for its summary):
+#   POOL_PROCESSED, POOL_SUCCESS, POOL_FAIL, POOL_MODE
+########################################
+run_reencode_pool() {
+    local jobs="$1"
+    local log_file="$2"
+    local db_path="$3"
+    local library_dir="${4%/}"
+    local backup_root="${5%/}"
+    local list_path="$6"
+    local label="${8:-Failed}"
+
+    POOL_MODE="$7"
+    POOL_PROCESSED=0
+    POOL_SUCCESS=0
+    POOL_FAIL=0
+
+    # Sequential mode: no pool at all. This is the 'jobs=1' escape hatch and it
+    # is kept equivalent to the pre-parallel behavior - no child processes, no
+    # shards, and per-file statuses land in the run log in file order.
+    if [ "$jobs" -le 1 ]; then
+        local flac_file total_files
+        total_files=$(_count_nul_list "$list_path")
+        while IFS= read -r -d '' flac_file; do
+            POOL_PROCESSED=$((POOL_PROCESSED + 1))
+            if [ "$POOL_MODE" -eq 0 ]; then
+                show_progress "$POOL_PROCESSED" "$total_files" "$POOL_FAIL" "$label"
+            fi
+            if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
+                POOL_SUCCESS=$((POOL_SUCCESS + 1))
+            else
+                POOL_FAIL=$((POOL_FAIL + 1))
+            fi
+        done < "$list_path"
+        return 0
+    fi
+
+    _pool_setup_state "$jobs" "$log_file"
+    _pool_dispatch_loop "$list_path" "$jobs" "$log_file" "$db_path" \
+        "$library_dir" "$backup_root" "$label"
+    _pool_drain "$label"
+
+    # Tally completions from the workers' result files FIRST, then replay the
+    # per-file lines: the replay's output would otherwise appear before the
+    # summary counts it is meant to accompany.
+    _pool_tally_results
+    if [ "$POOL_MODE" -eq 2 ]; then
+        _pool_replay_status_lines
+    fi
+    # Publish the pool's high-water worker id BEFORE releasing the per-run state:
+    # it is what tells the caller how many shards this run created, and ids are
+    # allocated per file rather than per worker slot.
+    POOL_WORKERS_USED="$POOL_NEXT_ID"
+    _pool_cleanup_state
+    return 0
+}
+
+
+# files using 'flac -t'. The script's own internal paths (legacy
+# backup_FLAC_originals copies) and the .flac_scan_data/ tracking dir are
+# excluded. Any file that fails the test is
+# recorded (with quotes) in a CSV file stored in the library directory.
+########################################
+_count_nul_list() {
+    local count=0
+    while IFS= read -r -d '' _rec <&4; do
+        count=$((count + 1))
+    done 4< "$1"
+    printf '%s\n' "$count"
+}
+
+########################################
+# FUNCTION: _pool_setup_state
+# Creates the shard directory and initialises the parent's in-flight bookkeeping
+# for one pooled run: the dispatch index (file order, used to make the replay
+# deterministic) and the pid -> worker-id map.
+# Arguments:
+#   $1 - Worker count
+#   $2 - Run log path
+########################################
+_pool_setup_state() {
+    # shellcheck disable=SC2034  # POOL_JOBS/POOL_WORKER_EXIT are pool-wide state
+    # read by _pool_dispatch_loop and _pool_sweep_finished below: they are the
+    # in-flight bookkeeping shared through script scope, like POOL_PIDS.
+    POOL_JOBS="$1"
+    POOL_LOG_FILE="$2"
+    POOL_SHARD_DIR="$(shard_dir_for "$POOL_LOG_FILE")"
+    POOL_INDEX="${POOL_SHARD_DIR}/$(basename "$POOL_LOG_FILE").index"
+    POOL_NEXT_ID=0
+    POOL_PIDS=()
+    mkdir -p "$POOL_SHARD_DIR"
+    : > "$POOL_INDEX"
+    declare -gA POOL_WORKER_EXIT=()
+    return 0
+}
+########################################
+# FUNCTION: _pool_start_worker
+# Forks one worker for one file. A FAILED fork (not a failed reencode) is counted
+# as a failure rather than aborting: one momentary resource shortage must not
+# kill a multi-hour run. The worker re-encodes the file writing to ITS OWN shards
+# and exits with the per-file status, which the dispatch loop harvests by pid.
+# Arguments:
+#   $1 - Worker id
+#   $2 - FLAC file path
+#   $3 - Run log path
+#   $4 - Library root directory
+#   $5 - Backup root directory
+########################################
+_pool_start_worker() {
+    local worker_id="$1"
+    local flac_file="$2"
+    local log_file="$3"
+    local library_dir="$4"
+    local backup_root="$5"
+    local pid
+
+    (
+        # Bind this worker's shards. They are LOCAL to the child and passed
+        # explicitly to reencode_one_file, so no shared global decides where a
+        # worker writes.
+        local log_shard db_shard result_shard rc
+        log_shard="$(shard_path_for "$log_file" "$worker_id" log)"
+        db_shard="$(shard_path_for "$log_file" "$worker_id" db)"
+        result_shard="$(shard_path_for "$log_file" "$worker_id" result)"
+        # Per-file status text must never reach the screen while the parent owns
+        # the animated bar line; every status still reaches the log shard.
+        STATUS_TO_CONSOLE=0
+        if reencode_one_file "$flac_file" "$db_shard" "$log_shard" \
+                "$library_dir" "$backup_root"; then
+            rc=0
+        else
+            rc=1
+        fi
+        # Publish this worker's outcome for the parent to tally. Written by the
+        # worker (not the parent) so the count reflects what actually ran, and
+        # one record per file so the parent's sum is an exact file count. A
+        # failed worker still records FAIL, so nothing is lost.
+        printf 'PROCESSED=1\nFAIL=%s\n' "$rc" > "$result_shard"
+        exit "$rc"
+    ) &
+    pid=$!
+    # shellcheck disable=SC2034  # read by _pool_sweep_finished (same script scope)
+    POOL_WORKER_EXIT["$pid"]="$worker_id"
+    POOL_PIDS+=("$pid")
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_sweep_finished
+# Removes every pid that has already exited from the in-flight list and returns
+# how many were still running (in POOL_RUNNING). Uses 'kill -0' as the liveness
+# probe: portable, and unlike 'wait -n' it never consumes a status that this
+# function would then be unable to report.
+########################################
+_pool_sweep_finished() {
+    local remaining=() p
+    for p in "${POOL_PIDS[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then
+            remaining+=("$p")
+        else
+            unset 'POOL_WORKER_EXIT[$p]'
+        fi
+    done
+    POOL_PIDS=("${remaining[@]}")
+    POOL_RUNNING=${#POOL_PIDS[@]}
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_dispatch_loop
+# Feeds the file list to the pool, keeping exactly POOL_JOBS workers in flight.
+# Every dispatched path is appended to the index (so a replayed status list keeps
+# file order), and completions are swept before each new file is started so a
+# long-running file cannot leave finished workers' pids sitting in the list.
+# Arguments:
+#   $1 - NUL-separated input list
+#   $2 - Worker count
+#   $3 - Run log path
+#   $4 - DB path (unused by the parent here; kept for call-site symmetry)
+#   $5 - Library root directory
+#   $6 - Backup root directory
+#   $7 - Bar label
+########################################
+_pool_dispatch_loop() {
+    local list_path="$1"
+    local jobs="$2"
+    local log_file="$3"
+    local library_dir="$5"
+    local backup_root="$6"
+    local label="$7"
+    local flac_file total_files
+
+    total_files=$(_count_nul_list "$list_path")
+
+    exec 3< "$list_path"
+    while IFS= read -r -d '' flac_file <&3; do
+        printf '%s\n' "$flac_file" >> "$POOL_INDEX"
+
+        # Backpressure: once the pool is full, block on ANY single worker
+        # finishing (wait -n) and then sweep, so the freed slot is refilled
+        # immediately instead of after the whole batch.
+        while :; do
+            _pool_sweep_finished
+            [ "$POOL_RUNNING" -lt "$jobs" ] && break
+            wait -n "${POOL_PIDS[@]}" 2>/dev/null || true
+        done
+
+        if ! _pool_start_worker "$POOL_NEXT_ID" "$flac_file" "$log_file" \
+                "$library_dir" "$backup_root"; then
+            POOL_FAIL=$((POOL_FAIL + 1))
+            POOL_PROCESSED=$((POOL_PROCESSED + 1))
+        fi
+        POOL_NEXT_ID=$((POOL_NEXT_ID + 1))
+
+        # The bar is redrawn on EVERY dispatch in non-tty mode (cheap, plain
+        # text lines) and ONLY on completions in tty mode, so the animated line
+        # always reflects finished files rather than merely dispatched ones.
+        if [ "$POOL_MODE" -eq 1 ]; then
+            _pool_report_progress "$total_files" "$label"
+        elif [ "$POOL_MODE" -eq 0 ]; then
+            :
+        fi
+    done
+    exec 3<&-
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_drain
+# Waits for the last in-flight workers, sweeping completions as they land. A
+# non-blocking first sweep means a pool whose workers all finished before this
+# call returns immediately instead of blocking on a phantom wait.
+# Arguments:
+#   $1 - Bar label
+########################################
+_pool_drain() {
+    local label="$1"
+    while :; do
+        _pool_sweep_finished
+        [ "$POOL_RUNNING" -eq 0 ] && break
+        wait -n "${POOL_PIDS[@]}" 2>/dev/null || true
+    done
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_report_progress
+# Renders one progress update on a non-tty destination from the COMPLETION
+# tally (POOL_PROCESSED/POOL_FAIL) plus the dispatched-file index count, so a
+# captured run's footer numbers match the per-file lines it replays.
+# Arguments:
+#   $1 - Total file count
+#   $2 - Bar label
+########################################
+_pool_report_progress() {
+    local total="$1"
+    local label="$2"
+    show_progress "$POOL_PROCESSED" "$total" "$POOL_FAIL" "$label"
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_tally_results
+# Reads the KEY=VALUE result records every worker wrote into its own
+# '<shard>.result' file and updates POOL_PROCESSED/POOL_SUCCESS/POOL_FAIL. One
+# record per file, written by the worker itself, so a worker's outcome is
+# accounted exactly once and a crash cannot double-count or lose a file.
+# The files are removed as they are read, making this idempotent.
+########################################
+_pool_tally_results() {
+    local shard_path result_file key value
+
+    # Worker ids are handed out per FILE, not per worker slot, so a run that
+    # processes 8 files with 4 workers owns the shards w0..w7. Hence the
+    # high-water id (POOL_NEXT_ID) rather than the job count.
+    for (( shard = 0; shard < POOL_NEXT_ID; shard++ )); do
+        result_file="$(shard_path_for "$POOL_LOG_FILE" "$shard" result)"
+        [ -s "$result_file" ] || continue
+        while IFS='=' read -r key value; do
+            case "$key" in
+                PROCESSED) POOL_PROCESSED=$((POOL_PROCESSED + ${value:-0})) ;;
+                FAIL)      POOL_FAIL=$((POOL_FAIL + ${value:-0})) ;;
+            esac
+        done < "$result_file"
+        rm -f "$result_file"
+    done
+    # Successes are derived, never tracked separately: every file ends as
+    # either a success or a failure, so this keeps the three numbers
+    # consistent even if a worker died before recording its result.
+    POOL_SUCCESS=$((POOL_PROCESSED - POOL_FAIL))
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_replay_status_lines
+# For a captured (non-tty) pooled run, prints the per-file SUCCESS/FAILURE lines
+# in FILE ORDER at the end. During the run they went only to the workers' log
+# shards (which merge_reencode_shards then folds into the run log), so this
+# gives a piped run the same visible per-file feedback a sequential run has,
+# without letting out-of-order worker output interleave on the terminal.
+# Ordering comes from the dispatch index, not from completion order.
+########################################
+_pool_replay_status_lines() {
+    local flac_file shard_path
+
+    [ -s "$POOL_INDEX" ] || return 0
+
+    while IFS= read -r flac_file; do
+        for (( shard = 0; shard < POOL_NEXT_ID; shard++ )); do
+            shard_path="$(shard_path_for "$POOL_LOG_FILE" "$shard" log)"
+            [ -s "$shard_path" ] || continue
+            # The shard's SUCCESS/FAILURE lines are per-FILE, and each file is
+            # handled by exactly one worker, so a grep against this file's path
+            # pulls just its line(s) - including any WARNING lines it produced.
+            grep -F -- "$flac_file" "$shard_path" 2>/dev/null || true
+        done
+    done < "$POOL_INDEX"
+    return 0
+}
+
+########################################
+# FUNCTION: _pool_cleanup_state
+# Releases the parent's per-run pool state (index, pid map, id counter) once a
+# run is fully accounted for, so a later run in the same invocation cannot see
+# stale entries. The shard DIRECTORY is removed by merge_reencode_shards.
+# POOL_NEXT_ID is deliberately NOT cleared on the sequential path, where it is
+# still 0 and tells the caller that no shards exist to merge.
+########################################
+_pool_cleanup_state() {
+    rm -f "$POOL_INDEX" 2>/dev/null || true
+    POOL_PIDS=()
+    POOL_RUNNING=0
     return 0
 }
 
@@ -744,14 +1320,14 @@ reencode_one_file() {
 scan_library() {
     config=$(load_config)
     library_path=$(echo "$config" | jq -r '.library_path')
-    
+
     if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
         read -rp "Enter the full path to your music library directory: " library_path
         save_config "$library_path"
     fi
 
     library_dir="$library_path"
-    
+
     # Validate the directory.
     if [ ! -d "$library_dir" ]; then
         echo "Error: The directory '$library_dir' does not exist."
@@ -762,7 +1338,7 @@ scan_library() {
     # Create scan data directory structure
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/reports" "${scan_data_dir}/logs"
-    
+
     # Generate CSV + summary-log filenames with a shared timestamp so a run's
     # report and summary pair up. The CSV is the machine-readable manifest fed
     # to "Reencode problematic FLAC files (from latest scan)"; it is only
@@ -946,6 +1522,9 @@ reencode_library() {
     # Tracking database for successfully reencoded files.
     db_path=$(get_reencoded_db_path "$library_dir")
 
+    # Worker count for this run (see get_jobs / the Parallel Reencodes notes).
+    jobs="$(get_jobs)"
+
     # Generate a log file for the reencoding process.
     log_file="${scan_data_dir}/logs/reencode_log_$(date +%F_%H-%M-%S).txt"
     {
@@ -953,14 +1532,29 @@ reencode_library() {
         echo "Library: $library_dir"
         echo "Backups: $backup_root"
         echo "CSV: $latest_csv"
+        echo "Workers: $jobs"
         echo ""
     } > "$log_file"
+
+    # ------------------------------------------------------------------
+    # Discovery pass: build the filtered, DEDUPLICATED work list.
+    # Option 2 keeps the CSV's own order (the scan that produced it wrote
+    # problematic files in find order) and can still contain duplicates if a
+    # report was hand-edited or merged, so a repeated path is reported and
+    # dropped: two workers must never race the same file.
+    # ------------------------------------------------------------------
+    local filter_log="${log_file}.filter.log"
+    local flac_file
+    seed_dir="${scan_data_dir}/seed"
+    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    mkdir -p "$seed_dir"
+    : > "$seed_list"
 
     total_files=0
     success_count=0
     fail_count=0
-
-    # Process each problematic file listed in the CSV.
+    duplicate_count=0
+    declare -A SEEN_LIST=()
     while IFS=, read -r flac_file; do
         # Remove any surrounding quotes.
         flac_file=${flac_file//\"/}
@@ -974,7 +1568,7 @@ reencode_library() {
         # Skip any rows that point into the script's own internal area (backup
         # copies or .flac_scan_data/) — these should never be re-encoded.
         if is_internal_flac_path "$flac_file"; then
-            echo "Skipping internal/backup path: $flac_file"
+            printf '%s\n' "Skipping internal/backup path: $flac_file" >> "$filter_log"
             continue
         fi
 
@@ -982,19 +1576,72 @@ reencode_library() {
         # it cannot be backed up. Skip it loudly instead of re-encoding it
         # unprotected (this is also how the internal-path filter above behaves).
         if ! get_backup_target "$library_dir" "$backup_root" "$flac_file" >/dev/null; then
-            echo "Skipping path outside the library: $flac_file"
+            printf '%s\n' "Skipping path outside the library: $flac_file" >> "$filter_log"
             continue
         fi
 
-        total_files=$((total_files + 1))
-        echo "Processing file: $flac_file"
-
-        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
-            success_count=$((success_count + 1))
-        else
-            fail_count=$((fail_count + 1))
+        if [[ -n "${SEEN_LIST[$flac_file]+x}" ]]; then
+            duplicate_count=$((duplicate_count + 1))
+            continue
         fi
+        SEEN_LIST["$flac_file"]=1
+
+        total_files=$((total_files + 1))
+        printf '%s\0' "$flac_file" >> "$seed_list"
     done < "$latest_csv"
+
+    unset SEEN_LIST
+    [ -s "$filter_log" ] && cat "$filter_log"
+    rm -f "$filter_log"
+    if [ "$duplicate_count" -gt 0 ]; then
+        echo "Ignored $duplicate_count duplicate row(s) in the CSV."
+        printf '%s\n' "Ignored $duplicate_count duplicate row(s) in the CSV." >> "$log_file"
+    fi
+
+    if [ "$total_files" -eq 0 ]; then
+        echo "No files to process - nothing to do."
+        echo "No files to process - nothing to do." >> "$log_file"
+        rm -f "$seed_list"
+        rmdir "$seed_dir" 2>/dev/null || true
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+
+    # A live terminal cannot host per-file status text AND a single-line
+    # animated bar at once, so how per-file statuses are reported depends on
+    # both the destination and the worker count:
+    #   mode 1 - jobs=1: historical behavior, statuses echoed to the terminal as
+    #            each file is processed (the bar is a plain re-rendered line).
+    #   mode 0 - pooled on a real terminal: statuses stay in the log shards and
+    #            are folded into the run log afterwards, so nothing glues onto
+    #            the animated single-line bar; only the bar moves.
+    #   mode 2 - pooled on a pipe/redirect: no animated bar to protect, so the
+    #            per-file lines are replayed in FILE ORDER when the pool drains.
+    local pool_mode
+    if [ "$jobs" -le 1 ]; then
+        pool_mode=1
+    elif stdout_is_tty; then
+        pool_mode=0
+    else
+        pool_mode=2
+    fi
+
+    # Process the problematic files. The work list is fully materialised before
+    # the pool starts, so nothing a worker creates (a temp in one of the
+    # library's own directories) can be picked up mid-run.
+    echo ""
+    echo "Processing $total_files file(s) with $jobs worker(s)..."
+    echo ""
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list" "$pool_mode" "Failed"
+    success_count=$POOL_SUCCESS
+    fail_count=$POOL_FAIL
+
+    # Fold each worker's log + DB shards into the run log and the real tracking
+    # DB, then discard the work list.
+    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    rm -f "$seed_list"
+    rmdir "$seed_dir" 2>/dev/null || true
 
     echo "Reencoding complete at $(date)" | tee -a "$log_file"
     echo "Total files processed: $total_files" | tee -a "$log_file"
@@ -1096,12 +1743,16 @@ reencode_all_files() {
     # Tracking database for successfully reencoded files.
     db_path=$(get_reencoded_db_path "$library_dir")
 
+    # Worker count for this run (see get_jobs / the Parallel Reencodes notes).
+    jobs="$(get_jobs)"
+
     log_file="${scan_data_dir}/logs/reencode_all_log_$(date +%F_%H-%M-%S).txt"
     {
         echo "Full library reencode started at $(date)"
         echo "Library: $library_dir"
         echo "Backups: $backup_root"
         echo "Total files to process: $total_files"
+        echo "Workers: $jobs"
         echo ""
     } > "$log_file"
 
@@ -1109,44 +1760,52 @@ reencode_all_files() {
     echo "Starting reencode of all $total_files FLAC files..."
     echo ""
 
-    success_count=0
-    fail_count=0
-    processed_count=0
     start_time=$(date +%s)
-    last_update=0
 
     # Render mode: on a real terminal we keep one single-line animated bar that
     # never moves (see show_progress) and keep per-file status text off the
     # screen (STATUS_TO_CONSOLE=0) so nothing glues onto it; on a pipe / redirect
-    # all per-file SUCCESS/FAILURE lines are printed as normal text and the bar
-    # degrades to plain progress lines. Either way the run log gets every status
-    # line. We resolve stdout's tty state once up front rather than in the loop.
-    # STATUS_TO_CONSOLE is restored on exit.
+    # all per-file SUCCESS/FAILURE lines are printed as normal text. Either way
+    # the run log gets every status line. We resolve stdout's tty state once up
+    # front rather than in the loop. STATUS_TO_CONSOLE is restored on exit.
     local live_tty
     if stdout_is_tty; then live_tty=1; else live_tty=0; fi
-    # It only makes sense to echo per-file SUCCESS/FAILURE lines to the terminal
-    # when no animated single-line bar is on the screen to protect, i.e. on a
-    # pipe/redirect request (live_tty==0). On a real terminal the statuses stay
-    # in the log so the bar keeps redrawing cleanly in place.
-    STATUS_TO_CONSOLE=$(( 1 - live_tty ))
 
-    # Recursively find .flac files (using -print0 to handle spaces).
-    while IFS= read -r -d '' flac_file; do
-        processed_count=$((processed_count + 1))
-        if [ "$live_tty" = "1" ]; then
-            # Redraw the animated bar in place on every file so it stays put.
-            show_progress "$processed_count" "$total_files" "$fail_count" "Failed"
-        elif (( processed_count % 50 == 0 || processed_count * 100 / total_files > last_update )); then
-            show_progress "$processed_count" "$total_files" "$fail_count" "Failed"
-            last_update=$((processed_count * 100 / total_files))
-        fi
+    # Materialise the work list FIRST. find_real_flac_files excludes the
+    # script's own paths, but a temp file it writes inside a library directory
+    # during a run is not covered by that filter, and a live "find | pool" pipe
+    # could hand such a temp to a worker. Building the list up front closes that
+    # window: the pool only ever sees paths that existed before it started.
+    seed_dir="${scan_data_dir}/seed"
+    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    mkdir -p "$seed_dir"
+    find_real_flac_files "$library_dir" -print0 > "$seed_list"
 
-        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
-            success_count=$((success_count + 1))
-        else
-            fail_count=$((fail_count + 1))
-        fi
-    done < <(find_real_flac_files "$library_dir" -print0)
+    if [ "$jobs" -le 1 ]; then
+        pool_mode=1
+    else
+        # A live terminal cannot host per-file status text and a single-line bar
+        # at the same time, so pooled tty runs keep the statuses in the log
+        # (mode 0) and rely on the bar, while pooled captured runs replay them in
+        # file order (mode 2). See run_reencode_pool.
+        if [ "$live_tty" = "1" ]; then pool_mode=0; else pool_mode=2; fi
+    fi
+    if [ "$pool_mode" -eq 1 ]; then
+        STATUS_TO_CONSOLE=$(( 1 - live_tty ))
+    fi
+
+    echo "Processing $total_files file(s) with $jobs worker(s)..."
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list" "$pool_mode" "Failed"
+    processed_count=$POOL_PROCESSED
+    success_count=$POOL_SUCCESS
+    fail_count=$POOL_FAIL
+
+    # Fold each worker's log + DB shards into the run log and the real tracking
+    # DB, then discard the work list.
+    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    rm -f "$seed_list"
+    rmdir "$seed_dir" 2>/dev/null || true
 
     # Clear progress line and restore console status output for later echoes.
     clear_progress
@@ -1206,6 +1865,9 @@ reencode_new_files() {
     # global REENCODED_SET is populated in THIS shell, not a discarded subshell.
     load_reencoded_set "$db_path"
     db_entries=${#REENCODED_SET[@]}
+
+    # Worker count for this run (see get_jobs / the Parallel Reencodes notes).
+    jobs="$(get_jobs)"
 
     # Count real FLAC files (find_real_flac_files skips the script's own internal
     # paths and the .flac_scan_data tracking dir so incremental reencodes stay accurate).
@@ -1295,6 +1957,7 @@ reencode_new_files() {
         echo "Total FLAC files found: $total_files"
         echo "Already reencoded (skipped): $skipped_count"
         echo "New files to process: $new_count"
+        echo "Workers: $jobs"
         echo ""
     } > "$log_file"
 
@@ -1302,38 +1965,45 @@ reencode_new_files() {
     echo "Starting reencode of $new_count new FLAC files..."
     echo ""
 
-    success_count=0
-    fail_count=0
-    processed_count=0
     start_time=$(date +%s)
-    last_update=0
 
-    # Process the discovered new files (two-phase: find already completed above,
-    # so live temp files created here can never be picked up mid-run).
-    # Render mode mirrors reencode_all_files(): single moving-proof animated bar
-    # on a real terminal, plain status lines + interval progress otherwise.
+    # The work list was built in the discovery pass above (two-phase: find and
+    # classify FIRST, so a temp file any worker creates can never be picked up
+    # as a "new" file mid-run). Serialise it NUL-separated for the pool.
+    seed_dir="${scan_data_dir}/seed"
+    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    mkdir -p "$seed_dir"
+    : > "$seed_list"
+    for flac_file in "${new_files[@]}"; do
+        printf '%s\0' "$flac_file" >> "$seed_list"
+    done
+
+    # Render mode mirrors reencode_all_files(): single animated bar on a real
+    # terminal (statuses stay in the log), plain status lines replayed in file
+    # order otherwise.
     local live_tty
     if stdout_is_tty; then live_tty=1; else live_tty=0; fi
-    # Same echo logic as reencode_all_files: echo per-file status lines to the
-    # terminal only when there is no animated bar row to protect (non-tty run).
-    STATUS_TO_CONSOLE=$(( 1 - live_tty ))
+    if [ "$jobs" -le 1 ]; then
+        pool_mode=1
+        STATUS_TO_CONSOLE=$(( 1 - live_tty ))
+    elif [ "$live_tty" = "1" ]; then
+        pool_mode=0
+    else
+        pool_mode=2
+    fi
 
-    for flac_file in "${new_files[@]}"; do
-        processed_count=$((processed_count + 1))
-        if [ "$live_tty" = "1" ]; then
-            # Redraw the animated bar in place on every file so it stays put.
-            show_progress "$processed_count" "$new_count" "$fail_count" "Failed"
-        elif (( processed_count % 50 == 0 || processed_count * 100 / new_count > last_update )); then
-            show_progress "$processed_count" "$new_count" "$fail_count" "Failed"
-            last_update=$((processed_count * 100 / new_count))
-        fi
+    echo "Processing $new_count file(s) with $jobs worker(s)..."
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list" "$pool_mode" "Failed"
+    processed_count=$POOL_PROCESSED
+    success_count=$POOL_SUCCESS
+    fail_count=$POOL_FAIL
 
-        if reencode_one_file "$flac_file" "$db_path" "$log_file" "$library_dir" "$backup_root"; then
-            success_count=$((success_count + 1))
-        else
-            fail_count=$((fail_count + 1))
-        fi
-    done
+    # Fold each worker's log + DB shards into the run log and the real tracking
+    # DB, then discard the work list.
+    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    rm -f "$seed_list"
+    rmdir "$seed_dir" 2>/dev/null || true
 
     # Clear progress line and restore console status output for later echoes.
     clear_progress
@@ -1381,6 +2051,7 @@ set_paths() {
     else
         echo "No backup directory is currently configured (will be derived as '<library>_backup')."
     fi
+    echo "Current reencode workers: $(get_jobs) (0 uses the default)"
 
     read -rp "Enter new library path (leave blank to keep current): " new_path
     if [ -z "$new_path" ]; then
@@ -1401,7 +2072,22 @@ set_paths() {
             new_backup="$current_backup"
         fi
     fi
-    new_backup="${new_backup%/}"
+    new_backup="$(printf '%s' "$new_backup" | sed 's:/$::')"
+
+    # Worker count. Blank (or 0) clears the key so get_jobs() falls back to its
+    # default; a non-numeric answer is refused rather than written, because a
+    # junk value in the config would otherwise be silently ignored at run time
+    # and the user would never learn their setting had no effect.
+    read -rp "Enter reencode workers (leave blank or 0 for default): " new_jobs
+    new_jobs="${new_jobs// /}"
+    case "$new_jobs" in
+        ''|0) new_jobs='default' ;;
+        *[!0-9]*)
+            echo "Error: '$new_jobs' is not a positive number of workers."
+            read -rp "Press Enter to return to main menu..."
+            return 1
+            ;;
+    esac
 
     if [ -z "$new_path" ] || [ "$new_path" == "null" ]; then
         echo "Error: A library path is required."
@@ -1423,12 +2109,17 @@ set_paths() {
         return 1
     fi
 
-    save_config "$new_path" "$new_backup"
+    save_config "$new_path" "$new_backup" "$new_jobs"
     echo "Library path updated to: $new_path"
     if [ -n "$new_backup" ]; then
         echo "Backup directory updated to: $new_backup"
     else
         echo "Backup directory will be derived on the next re-encode: $(derive_backup_path "${new_path%/}")"
+    fi
+    if [ -n "$new_jobs" ] && [ "$new_jobs" != 'default' ]; then
+        echo "Reencode workers updated to: $new_jobs"
+    else
+        echo "Reencode workers reset to the default ($(get_jobs))."
     fi
     read -rp "Press Enter to return to main menu..."
 }
@@ -1471,6 +2162,17 @@ main_menu() {
         fi
     else
         echo "   Backups: $backup_path"
+    fi
+
+    # Show how many files will be reencoded at once. Options 2/4/5 all use this
+    # value, and it is the one knob that decides how hard the run hits the
+    # storage holding the library, so it is worth surfacing before the user
+    # starts a multi-hour operation. FLAC_HEALTH_JOBS is shown when it is what
+    # decided the value, since an env override is easy to forget about.
+    if [ -n "${FLAC_HEALTH_JOBS:-}" ]; then
+        echo "   Workers: $(get_jobs) (from FLAC_HEALTH_JOBS)"
+    else
+        echo "   Workers: $(get_jobs)"
     fi
     echo "$menu_bar"
 

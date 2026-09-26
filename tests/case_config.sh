@@ -65,7 +65,7 @@ NEWLIB="$SBX2/new-lib"
 mkdir -p "$NEWLIB"
 NEWBAK="$SBX2/new-backup"
 
-run_script "$SBX2" '3' "$NEWLIB" "$NEWBAK" 'q'
+run_script "$SBX2" '3' "$NEWLIB" "$NEWBAK" '' 'q'
 
 occur_re "Current library path: $SBX2/lib"
 occur_re "Current backup directory: $SBX2/lib_backup"
@@ -90,7 +90,7 @@ SBX3=''
 make_sandbox SBX3
 register_sandbox "$SBX3"
 
-run_script "$SBX3" '3' '' '' 'q'
+run_script "$SBX3" '3' '' '' '' 'q'
 
 occur_re 'Library path remains unchanged\.'
 [ "$(cfg_field "$SBX3" '.library_path')" = "$SBX3/lib" ] \
@@ -111,7 +111,7 @@ rm -f "$SBX4/flac_health_config.json"
 FIRSTLIB="$SBX4/first-lib"
 mkdir -p "$FIRSTLIB"
 
-run_script "$SBX4" '3' "$FIRSTLIB" '' 'q'
+run_script "$SBX4" '3' "$FIRSTLIB" '' '' 'q'
 
 occur_re 'No library path is currently configured\.'
 occur_re "Library path updated to: $FIRSTLIB"
@@ -130,7 +130,7 @@ SBX6=''
 make_sandbox SBX6
 register_sandbox "$SBX6"
 
-run_script "$SBX6" '3' '' "$SBX6" 'q'
+run_script "$SBX6" '3' '' "$SBX6" '' 'q'
 
 occur_re 'Error: The library cannot be inside the backup directory'
 occur_re 'Backup directory not changed\.'
@@ -138,6 +138,40 @@ occur_re 'Backup directory not changed\.'
     || _fail "an unsafe backup dir was written to the config"
 
 echo "ok: case_config (option 3 rejects an unsafe backup dir)"
+
+# ===========================================================================
+# H. Option 3 also owns the worker count: a number persists it to the config's
+#    'jobs' key, a blank/0 answer clears the key back to the default, and a
+#    non-numeric answer is refused without touching the config. This key drives
+#    parallel reencodes, so an interactive path that silently dropped it would
+#    leave the feature unreachable from the menu.
+# ===========================================================================
+SBX7=''
+make_sandbox SBX7
+register_sandbox "$SBX7"
+
+# A number is written through and reported.
+run_script "$SBX7" '3' '' '' '7' 'q'
+occur_re 'Reencode workers updated to: 7'
+[ "$(cfg_field "$SBX7" '.jobs')" = '7' ] \
+    || _fail "option 3 did not persist the worker count"
+# The menu banner shows the configured worker count on the next launch.
+run_script "$SBX7" 'q'
+occur_re 'Workers: 7'
+
+# Blank clears the key, so the auto-detected default takes over again.
+run_script "$SBX7" '3' '' '' '' 'q'
+occur_re 'Reencode workers reset to the default'
+[ "$(cfg_field "$SBX7" '.jobs')" = 'null' ] \
+    || _fail "blank worker answer should clear the jobs key"
+
+# A non-numeric answer is refused and the config is left alone.
+run_script "$SBX7" '3' '' '' 'lots' 'q'
+occur_re 'is not a positive number of workers'
+[ "$(cfg_field "$SBX7" '.jobs')" = 'null' ] \
+    || _fail "a rejected worker answer was written to the config anyway"
+
+echo "ok: case_config (option 3 owns the worker count)"
 
 # ===========================================================================
 # E. Quit: both 'q' and '6' announce the exit and return status 0.

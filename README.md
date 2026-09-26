@@ -11,6 +11,9 @@ backup of every original it replaces.
   - the files listed in the latest scan report
   - every FLAC file in the library (with a confirmation prompt)
   - only files that have not been re-encoded before
+- **Parallel by file**: several files are re-encoded at once, which is what makes
+  a large library bearable. The worker count is configurable (see
+  [Parallel re-encodes](#parallel-re-encodes)); the default is `min(4, nproc)`
 - **Backups outside the library**: each original is mirrored into a backup
   directory that copies the library's layout, so no media scanner ever indexes a
   backup as a duplicate track
@@ -38,8 +41,8 @@ directory.
 ## Usage
 
 Running the script draws a numbered menu; the table below is what each option
-does. The menu also prints the active library and backup directory, and accepts
-`q` as a shortcut for quitting.
+does. The menu also prints the active library, backup directory and worker count, and
+accepts `q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
@@ -77,6 +80,54 @@ Set both paths from the menu, or edit the file directly:
 | `version` | — | Written when the script creates the file; the script never reads it back, so leave it alone. |
 
 Both paths must be absolute, and trailing slashes are accepted on either.
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `jobs` | no | How many files to re-encode at once. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`. `1` means strictly sequential. See [Parallel re-encodes](#parallel-re-encodes). |
+
+## Parallel re-encodes
+
+Re-encoding is CPU- and I/O-heavy but `flac` itself is single-threaded per file,
+so the script parallelises **across files**: options 2, 4 and 5 keep several
+files in flight at once. The worker count is resolved per run, in this order:
+
+1. `FLAC_HEALTH_JOBS` — a per-run environment override, handy for one-off runs:
+   ```bash
+   FLAC_HEALTH_JOBS=8 ./flac_health_reencode.sh
+   ```
+2. `jobs` in `flac_health_config.json`
+3. `min(4, nproc)` — a deliberately modest default
+
+`jobs: 1` runs strictly sequentially, one file at a time.
+
+### What is safe about it
+
+- **One file, one worker.** A file is only ever handed to a single worker, so two
+  workers cannot race the same path.
+- **Per-file scratch space.** Each worker re-encodes to its own temp file and
+  moves it into place atomically, so a partially written file is never visible as
+  library content.
+- **Backups are decided per file.** A backup is copied before the original is
+  replaced, and an existing backup is never overwritten, so the pristine original
+  survives repeated runs regardless of ordering.
+- **Interleaved writing is serialised.** Worker progress is buffered and written
+  through a single path rather than having every worker append concurrently.
+- **A failure is contained.** One file failing (including a `--decode-through-errors`
+  file with a long tail) does not stop or corrupt the others.
+
+Each worker writes to its own shard file and the parent folds the shards back
+together when the run ends, so the run log and the tracking database end up
+exactly as they would in a sequential run — same lines, same rows, one entry per
+file. Shards are cleaned up as part of the merge.
+
+### Choosing a worker count
+
+Every file moves roughly three times its size through the filesystem (source
+read, temp write, backup copy), so the pool saturates your **storage** long
+before it saturates the CPU. The default of 4 is a compromise that helps on
+spinning disks and NVMe alike without starving the media server that is usually
+reading the same library. Raise it on fast local storage; set `jobs: 1` if the
+library is on a slow network share where concurrent access makes things worse.
 
 ## Backups
 
@@ -143,6 +194,11 @@ To find every file a run touched, check the run log written to
     └── reencoded.db             # fingerprints of re-encoded files
 ```
 
+While a parallel run is in progress the script also uses a transient `seed/` and
+`shards/` directory here for its work list and per-worker buffers. Both are
+removed when the run finishes; nothing in `.flac_scan_data/` is ever scanned,
+re-encoded or backed up.
+
 Re-encoded originals are **not** written here; they go to the backup directory
 described in [Backups](#backups).
 
@@ -163,7 +219,7 @@ described in [Backups](#backups).
 
 ## Development
 
-Requires Bash 4.0+, `jq`, and `shellcheck` for linting.
+Requires Bash 4.3+, `jq`, and `shellcheck` for linting.
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -176,9 +232,25 @@ sandbox. It runs in CI on every push and pull request. If you change the
 `flac`/`metaflac` flags the script passes, update `tests/stub_flac` and
 `tests/stub_metaflac` to match.
 
+Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
+`tests/case_parallel.sh` covers the parallel path instead. It uses the
+`STUB_FLAC_SLEEP` knob in `tests/stub_flac` to hold stub re-encodes open, which
+lets it assert that work actually overlaps, that a parallel run is faster than
+the sequential one, and that the merged log and tracking database are identical
+either way.
+
+The same case measures peak concurrency directly rather than inferring it from
+wall-clock time: with `STUB_FLAC_SLOT_DIR` set, each stub re-encode claims the
+lowest numbered free slot directory (an atomic `mkdir`) and holds it until it
+exits, so the highest rank claimed *is* the peak number of simultaneous
+re-encodes. That is what makes the case able to fail a pool silently degraded to
+2 or 3 workers, which a timing comparison cannot distinguish from a healthy one.
+The wall-clock check is kept as a smoke test for a pool providing no concurrency
+at all.
+
 ## Requirements
 
-- Bash 4.0+ (the script uses associative arrays)
+- Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
 - `flac` (which also provides `metaflac`) and `jq`
 
 ```bash

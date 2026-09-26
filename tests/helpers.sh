@@ -63,7 +63,12 @@ make_sandbox() {
     cp "$TESTS_ROOT/stub_metaflac"    "$sbx/bin/metaflac"
     chmod +x "$sbx/bin/flac" "$sbx/bin/metaflac"
     cp "$PROD_SCRIPT" "$sbx/flac_health_reencode.sh"
-    printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
+    # 'jobs' is pinned to 1 in every sandbox on purpose: the pre-existing cases
+    # were written against strictly-sequential behavior (status lines in file
+    # order, tallies identical to the file count) and stay the regression anchor
+    # for it. Parallel behaviour has its own case (case_parallel.sh), which sets
+    # FLAC_HEALTH_JOBS / edits this key itself.
+    printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1", "jobs": 1}\n' \
         "$sbx/lib" "$sbx/lib_backup" > "$sbx/flac_health_config.json"
     printf -v "$_vn" '%s' "$sbx"
 }
@@ -102,6 +107,30 @@ run_script() {
             > "$CURRENT_OUT" 2>&1; then
         LAST_STATUS=0
     else
+        LAST_STATUS=$?
+    fi
+    return 0
+}
+
+# run_script_env <sbx> <ENV=VAL...> -- <stdin lines...>
+#   Same as run_script, but runs the script with extra environment variables in
+#   scope (e.g. FLAC_HEALTH_JOBS, STUB_FLAC_SLEEP). Keeping the env assignment in
+#   the command prefix rather than export'ing it means a case cannot leak an
+#   override into a later run. Outputs are set exactly as run_script's.
+run_script_env() {
+    local sbx="$1"; shift
+    local envs=()
+    while [ "$#" -gt 0 ] && [ "$1" != '--' ]; do
+        envs+=("$1"); shift
+    done
+    [ "${1:-}" = '--' ] && shift
+    CURRENT_OUT="$sbx/output.log"
+    if printf '%s\n' "$@" | env "${envs[@]}" PATH="$sbx/bin:$PATH_PRE" \
+            bash "$sbx/flac_health_reencode.sh" > "$CURRENT_OUT" 2>&1; then
+        # shellcheck disable=SC2034  # read by case_*.sh after sourcing this file
+        LAST_STATUS=0
+    else
+        # shellcheck disable=SC2034  # read by case_*.sh after sourcing this file
         LAST_STATUS=$?
     fi
     return 0

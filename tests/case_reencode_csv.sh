@@ -60,8 +60,9 @@ MANUAL="$RPT/flac_scan_manual.csv"
 run_script "$SBX" '2' 'Y' ''
 
 occur_re 'Latest scan CSV file found:.*flac_scan_manual\.csv'
-occur_re "Processing file: $REAL"
-occur_re 'SUCCESS:.*worst\.flac reencoded successfully'
+# Captured runs get the pool's per-file result lines replayed in file order; the
+# pre-pool "Processing file: <path>" dispatch line no longer exists.
+occur_re "SUCCESS: $REAL reencoded successfully"
 
 # Count lines (tee'd + printed to stdout): exactly 1 processed.
 [ "$(captured_count 'Total files processed: ([0-9]+)')"  -eq 1 ] || _fail "option2 total != 1"
