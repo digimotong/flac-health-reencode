@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-###############################################################################
 # run_tests.sh - black-box + source-guard test runner for flac_health_reencode.sh
 #
 #   Usage:  bash tests/run_tests.sh [--verbose]
 #
 # Stages:
 #   1. Syntax gate: `bash -n` the production script.
-#   2. Tool check: flac/metaflac are STUBS (tests/), but the production script
-#      needs real `jq` to read/write its config, so require it here.
-#   3. Each tests/case_*.sh runs in its OWN subprocess + sandbox. A case prints
-#      nothing on success and "FAIL: ..." on failure, and exits non-zero on any
-#      failed assertion. Captured logs are replayed on failure for debugging.
+#   2. Tool check: flac/metaflac are STUBS (tests/), but the script needs real
+#      `jq` to read/write its config, so require it here.
+#   3. Each tests/case_*.sh runs in its OWN subprocess + sandbox; it prints
+#      nothing on success, "FAIL: ..." on failure, and exits non-zero then.
+#      Captured logs are replayed on failure for debugging.
 #   4. Overall PASS/FAIL summary; exit 0 iff every case passes.
-###############################################################################
 
 set -o errexit
 set -o nounset
@@ -29,10 +27,8 @@ case "${1:-}" in
     --help|-h|"") : ;;
     *) echo "run_tests.sh: unrecognized option: $1" >&2; exit 2 ;;
 esac
-# VERBOSE is accepted for interface stability (and to keep a future per-case
-# output dump opt-in), but the runner always replays a failing case's captured
-# log, so there is nothing extra to print on success yet. Export it so the
-# value is available to any case that wants to honour it.
+# VERBOSE is accepted for interface stability (a future per-case output dump could
+# be opt-in), but the runner always replays a failing case's captured log.
 export VERBOSE
 
 # 1. Syntax gate ----------------------------------------------------------------
@@ -43,11 +39,9 @@ fi
 echo "ok: syntax gate       ($PROD_SCRIPT)"
 
 # 2. Required tooling -----------------------------------------------------------
-# NOTE:
-#   * md5sum ships with coreutils and is preinstalled on ubuntu-latest.
-#   * Under CI (on: pull_request / push, .github/workflows/tests.yml), a missing
-#     tool must FAIL loudly -- a silent SKIP would let a broken install step pass.
-#   * Running locally, a missing md5sum is unexpected too; skip gracefully anyway.
+# md5sum ships with coreutils and is preinstalled on ubuntu-latest. In CI a
+# missing tool must FAIL loudly (a silent SKIP would let a broken install step
+# pass); locally it is skipped gracefully.
 for tool in jq md5sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         if [ "${CI:-}" = "true" ]; then
@@ -71,12 +65,10 @@ skipped=0
 failed_names=()
 skipped_names=()
 
-# Per-case wall-clock ceiling. The cases are black-box and complete in well
-# under a second; anything approaching this bound means a case is stuck in an
-# unbounded read or wait (e.g. the script blocked on a prompt that no longer
-# reads, or a PTY never closing). The CI job also wraps the whole run in
-# `timeout 300`, but a per-case bound fails the RESPONSIBLE case and still lets
-# the remaining cases run, which is far more useful when triaging.
+# Per-case wall-clock ceiling. The cases are black-box and finish well under a
+# second; anything near this bound means a case is stuck in an unbounded read or
+# wait. CI also wraps the whole run in `timeout 300`, but a per-case bound fails
+# the RESPONSIBLE case and still lets the rest run, which is more useful triaging.
 CASE_TIMEOUT="${CASE_TIMEOUT:-60}"
 
 echo ""
@@ -88,9 +80,9 @@ for case in "$THIS_DIR"/case_*.sh; do
 
     log="$(mktemp "${TMPDIR:-/tmp}/${name}.XXXXXX")"
     if timeout "$CASE_TIMEOUT" bash "$case" >"$log" 2>&1; then
-        # A case may self-declare a SKIP for a missing environment feature
-        # (e.g. no PTY available for case_tty). That is neither pass nor fail,
-        # but it must never be a silent pass: surface it as SKIP.
+        # A case may self-declare a SKIP for a missing environment feature (e.g.
+        # no PTY for case_tty). That is neither pass nor fail, but must never be a
+        # silent pass: surface it as SKIP.
         if grep -q '^SKIP:' "$log"; then
             skipped=$((skipped + 1))
             skipped_names+=("$name")

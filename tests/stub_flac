@@ -1,59 +1,34 @@
 #!/usr/bin/env bash
-###############################################################################
-# Test stub for the 'flac' binary.
+# Test stub for the 'flac' binary - the real one is NOT required to run the suite.
+# It fakes the two behaviors the script relies on:
 #
-# The real 'flac' is NOT required to run the test suite. This stub fakes the two
-# behaviours the script relies on, and is kept deliberately thin:
+#   flac -t <file>          exit 0 normally; exit 1 when <file> contains CORRUPT
+#                           (simulates a corrupt file, so scans flag it).
+#   flac --verify ... -o <out> <in>
+#                           write the marker to <out> and exit 0; the script's
+#                           cp/mv then moves it over the original.
 #
-#   Test mode      : flac -t <file>
-#                    -> exit 0 normally; exit 1 when <file> content contains
-#                       the marker token CORRUPT (simulates a corrupt/errant
-#                       file so scans flag it but backups of it stay excluded).
-#   Re-encode mode : flac --verify --compression-level-0 ... -o <out> <in>
-#                    -> writes a fresh marker string to <out> and exit 0, then
-#                       the script's cp/mv moves it over the original.
+# If the real script changes the flac flags it passes, update this stub to match.
 #
-# If the real script ever changes the flac flags it passes, update this stub to
-# keep matching (see Tests in README).
+# Env knobs (all optional):
+#   STUB_FLAC_SLEEP       seconds to sleep on the re-encode path
+#   STUB_FLAC_TEST_SLEEP  seconds to sleep on the verify path ('flac -t')
+#   STUB_FLAC_SLOT_DIR    directory that turns the stub into a concurrency probe
 #
-# STUB_FLAC_SLEEP (optional, seconds) makes the re-encode path sleep before it
-# writes its output. Default 0 keeps every existing case instant. It exists so
-# case_parallel.sh can hold N reencodes open at the same time and therefore
-# observe real overlap: without a delay a stub reencode finishes in under a
-# millisecond and even a serial implementation can look parallel.
+# The sleeps exist so case_parallel.sh can hold N operations open at once and
+# observe real overlap: an instant stub finishes before the parent can fork the
+# next worker, so even a serial implementation can look parallel. They are kept
+# separate so a case can slow one operation without touching the other.
 #
-# STUB_FLAC_TEST_SLEEP (optional, seconds) does the same for the VERIFY path
-# ('flac -t'), which is what a scan drives. A scan case needs it for the same
-# reason: an instantaneous stub verify finishes before the parent can even fork
-# the next worker, so even a perfectly parallel scan would never show more than
-# one worker in flight. Kept separate from STUB_FLAC_SLEEP so a case can slow
-# down one operation without touching the other.
-#
-# STUB_FLAC_SLOT_DIR (optional, directory) turns the stub into a CONCURRENCY
-# PROBE, and is what makes the parallel cases' overlap assertion exact rather
-# than a proxy. When set, each invocation claims the lowest-numbered free slot
-# directory under it and holds it until exit:
-#
-#   * the claim is `mkdir`, which is atomic, so a process that wins slot N has
-#     PROVEN that N-1 siblings were in flight at that same instant;
-#   * therefore the highest rank anyone claims IS the peak concurrency, with no
-#     clock, no timestamp ordering, and no float comparison involved;
-#   * one record file per process (`<pid>.rank`) rather than a shared append, so
-#     concurrent writers can never interleave a partial line.
-#
-# The probe covers BOTH modes (verify and re-encode): it is claimed before the
-# '-t' branch so a parallel SCAN can be measured too. A case that mixes modes in
-# one run would therefore count them together, which is why the existing
-# reencode cases - whose fixtures contain no CORRUPT marker for the verify path
-# to be driven by the pool anyway - are unaffected.
-#
-# A leaked slot would inflate the next run's ranking, so the slot is released
-# from an EXIT trap: that fires on every exit path, including the failure return
-# for an unreadable input, where a plain trailing rmdir would be skipped.
-#
-# It is deliberately gated on the env var because the probe is only meaningful
-# for the parallel cases; unset, it costs this stub a single `[ -n ]` test.
-###############################################################################
+# STUB_FLAC_SLOT_DIR makes the overlap assertion exact: each invocation claims the
+# lowest-numbered free slot via `mkdir` (atomic), so a process winning slot N has
+# proven that N-1 siblings were in flight at that instant, and the highest rank
+# claimed IS the peak concurrency (no clocks or floats involved). One record file
+# per process avoids interleaved shared appends. The probe covers both modes, so a
+# parallel scan is measurable too; it is released from an EXIT trap, which fires
+# on every exit path (including the failure return for an unreadable input, where a
+# trailing rmdir would be skipped). Ungated, it would cost a leaked slot that
+# inflates the next run's ranking, hence the env-var gate.
 
 out=''
 infile=''
@@ -65,15 +40,13 @@ for arg in "$@"; do
     prev="$arg"
 done
 
-# Last positional argument is the input file for both -t and re-encode modes.
-# Use the array's final element directly rather than an array-to-string slice:
-# ${@: -1} would be an array assignment, which shellcheck flags (SC2124) and
-# which silently joins multiple trailing words.
+# Last positional argument is the input file for both -t and re-encode modes. Use
+# the array's final element directly rather than an array-to-string slice: ${@: -1}
+# would be an array assignment (SC2124) and silently joins trailing words.
 infile="${*: -1}"
 
-# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Claimed BEFORE the mode
-# branches so a scan's verifies are measurable, and held for the whole duration
-# of this invocation.
+# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Claimed BEFORE the mode branches
+# so a scan's verifies are measurable, and held for this whole invocation.
 slot=''
 if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
     mkdir -p "$STUB_FLAC_SLOT_DIR"
@@ -81,8 +54,8 @@ if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
     while :; do
         n=$((n + 1))
         mkdir "$STUB_FLAC_SLOT_DIR/$n" 2>/dev/null && break
-        # 64 is far above any worker count a test uses; the guard exists only so
-        # a leaked slot cannot spin here forever.
+        # 64 is far above any worker count a test uses; the guard exists only so a
+        # leaked slot cannot spin here forever.
         if [ "$n" -ge 64 ]; then
             n=0
             break
@@ -105,14 +78,14 @@ if [[ " $* " == *' -t '* ]]; then
 fi
 
 # Hold this reencode open when asked, so a concurrent run has a window in which
-# several workers are genuinely in flight at once (see STUB_FLAC_SLEEP above).
+# several workers are genuinely in flight (see STUB_FLAC_SLEEP above).
 if [ -n "${STUB_FLAC_SLEEP:-}" ]; then
     sleep "$STUB_FLAC_SLEEP"
 fi
 
-# Re-encode mode: overwrite the temp target with a single, file-INDEPENDENT
-# marker line. Tests then assert "original replaced by the marker" with no
-# dependence on the file name, and "backups never carry the marker".
+# Re-encode mode: overwrite the temp target with a single file-INDEPENDENT marker
+# line, so tests can assert "original replaced by the marker" and "no backup ever
+# carries the marker" without depending on the file name.
 if [ -n "$out" ]; then
     printf 'REENCODE_OK\n' > "$out"
 fi

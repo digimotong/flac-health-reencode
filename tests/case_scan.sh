@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_scan.sh - integration: option 1 (Full scan music library)
+# case_scan.sh - integration: option 1 (Full scan music library).
 #
 # A. Library WITH a corrupt REAL file + a corrupt BACKUP + a corrupt .flac_scan_data
-#    file. Asserts only real files are counted/catalogued (2 real of 4 total),
-#    a CSV is produced with the '# Scan Report...' comment + 'filepath' header,
-#    the report's single data row = the real corrupt file (backup/internal are
-#    NOT reported even when corrupt), AND a scan summary log is written.
-# B. Library that is CLEAN: reports "No errors found.", writes a scan summary
-#    log, but leaves NO CSV.
-###############################################################################
+#    file. Asserts only real files are counted/catalogued (2 real of 4 total), a CSV
+#    is produced with the '# Scan Report...' comment + 'filepath' header, the single
+#    data row is the real corrupt file (backup/internal are NOT reported even when
+#    corrupt), and a scan summary log is written.
+# B. A CLEAN library: reports "No errors found.", writes a scan summary log, but
+#    leaves NO CSV.
 
 set -o errexit
 set -o nounset

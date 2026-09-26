@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_config.sh - integration: configuration + menu-navigation paths.
-#
-# These are the paths a first-time user hits before any audio is touched, and
-# they were the least covered part of the script:
+# case_config.sh - integration: configuration and menu-navigation paths, i.e. the
+# paths a first-time user hits before any audio is touched.
 #
 #   A. load_config creates a default config when none exists (version 1.1, empty
-#      library_path AND empty backup_path), and the main menu then says the
-#      library is not set (option 3 is the documented fix).
-#   B. Option 3 with a NEW path persists it to flac_health_config.json and
-#      reports the update; the next launch reports it as the current path.
-#   C. Option 3 with BLANK answers keeps both existing values (no rewrite).
-#   D. Option 3 with no config at all reports "No library path is currently
-#      configured." and then stores the first path.
-#   E. 'q' / '6' quit cleanly with "Exiting..." and exit status 0.
-#   F. An invalid selection re-prompts instead of exiting, and the menu is
-#      redrawn (the documented behaviour in the script header).
-###############################################################################
+#      library_path AND backup_path); the menu then says the library is not set.
+#   B. Option 3 with a NEW path persists it and reports the update.
+#   C. Option 3 with BLANK answers keeps both existing values.
+#   D. Option 3 with no config reports "No library path is currently configured."
+#      and then stores the first path.
+#   E. 'q' / '6' quit cleanly with "Exiting..." and status 0.
+#   F. An invalid selection re-prompts and redraws the menu.
 
 set -o errexit
 set -o nounset
@@ -101,7 +94,7 @@ occur_re 'Library path remains unchanged\.'
 echo "ok: case_config (option 3 blank keeps current path)"
 
 # ===========================================================================
-# D. Option 3 with NO config reports it is unset, then stores the first path.
+# D. Option 3 with no config reports it is unset, then stores the first path.
 #    The blank backup answer is filled with the derived sibling suggestion.
 # ===========================================================================
 SBX4=''
@@ -123,7 +116,7 @@ occur_re "Backup directory updated to: $FIRSTLIB""_backup"
 
 # ===========================================================================
 # G. Option 3 refuses an overlap between the two paths at the keyboard: the
-#    library's own parent (which would erase the library on backup cleanup) must
+#    library's own parent would erase the library on backup cleanup, so it must
 #    not reach the config, and the old backup dir must survive.
 # ===========================================================================
 SBX6=''
@@ -141,10 +134,9 @@ echo "ok: case_config (option 3 rejects an unsafe backup dir)"
 
 # ===========================================================================
 # H. Option 3 also owns the worker count: a number persists it to the config's
-#    'jobs' key, a blank/0 answer clears the key back to the default, and a
-#    non-numeric answer is refused without touching the config. This key drives
-#    parallel reencodes, so an interactive path that silently dropped it would
-#    leave the feature unreachable from the menu.
+#    'jobs' key, blank/0 clears the key, and a non-numeric answer is refused
+#    without touching the config. This key drives parallel reencodes, so silently
+#    dropping it would leave the feature unreachable from the menu.
 # ===========================================================================
 SBX7=''
 make_sandbox SBX7
@@ -199,8 +191,8 @@ SBX5=''
 make_sandbox SBX5
 register_sandbox "$SBX5"
 
-# 'zzz' is invalid -> the menu re-prompts; the second run proves control
-# returned to the menu loop rather than exiting the script.
+# 'zzz' is invalid -> the menu re-prompts; 'q' then proves control returned to
+# the menu loop rather than exiting the script.
 run_script "$SBX5" 'zzz' 'q'
 
 occur_re 'Invalid selection\. Please choose a number from 1-6 \(or q to quit\)\.'

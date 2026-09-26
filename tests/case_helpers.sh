@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-###############################################################################
 # case_helpers.sh - SOURCE-GUARD UNIT TEST DRIVER.
 #
-# Builds an isolated sandbox, then delegates the real assertions to
+# Builds an isolated sandbox, then delegates the assertions to
 # source_guard_units.sh running as a CHILD interpreter: the child sources the
-# production script (testing the source-guard: no menu auto-run), whose top-
-# level `command -v flac/metaflac` presence check is satisfied by the stubs we
-# prepend to PATH. Global prod state therefore never bleeds into this case or
-# out toward the repo.
-###############################################################################
+# production script (testing the source-guard, i.e. no menu auto-run), whose
+# top-level `command -v flac/metaflac` check is satisfied by the stubs prepended
+# to PATH. No global prod state bleeds into this case or toward the repo.
 
 set -o errexit
 set -o nounset
@@ -37,7 +34,7 @@ write_file "$LIB/.flac_scan_data/tmp/metrics.flac"          'internal-nested'
 write_file "$LIB/With Space dir/.flac_scan_data/think.flac" 'internal-space'
 write_file "$LIB/Real/backup_FLAC_originals_old/song.flac"  'real-near-miss'
 
-# Preseed a tracking DB exactly in the format the production mark() writes:
+# Preseed a tracking DB in the format the production writer uses:
 #   "<md532> <size> <mtime> <path-as-last-field>"
 DB="$LIB/.flac_scan_data/reencoded.db"
 printf '# header comment\n\n' > "$DB"

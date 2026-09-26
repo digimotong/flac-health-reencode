@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-###############################################################################
 # case_backup_location.sh - integration: backups live OUTSIDE the library, in a
 # mirrored backup root; no menu option can delete anything in the library.
 #
-#   A. A CSV-driven run (option 2) mirrors the original into
-#      "<backup>/<relative path>" and leaves no 'backup_FLAC_originals' folder in
-#      the library. A row pointing OUTSIDE the library is skipped with a warning
-#      instead of being re-encoded without a backup.
-#   B. A full-library run (option 4) of a library that still holds LEGACY
-#      in-library backups (the version 1.0 layout) must not treat them as
-#      content: the count excludes them, they are neither re-encoded nor copied
-#      into the backup root, and the .flac_scan_data dir stays untouched.
-#   C. Every unsafe backup_path is refused BEFORE any file is touched: equal to
-#      the library, inside it, or a parent of it. The library and every original
-#      must survive byte-for-byte, with no reencode marker and no backup tree.
-###############################################################################
+#   A. Option 2 mirrors each original into "<backup>/<relative path>" and leaves
+#      no backup_FLAC_originals folder; a row outside the library is skipped
+#      rather than re-encoded unprotected.
+#   B. Option 4 over a library holding LEGACY in-library backups must not treat
+#      them as content (not counted, re-encoded or copied).
+#   C. Every unsafe backup_path (equal to, inside or a parent of the library) is
+#      refused before any file is touched.
 
 set -o errexit
 set -o nounset
@@ -34,8 +28,8 @@ LIB="$SBX/lib"
 BAK="$SBX/lib_backup"
 
 REAL="$LIB/Album Big/worst.flac"
-# A row for a file that is NOT under the library root. It has no home in the
-# mirrored tree, so the run must refuse to re-encode it unprotected.
+# Not under the library root: no home in the mirrored tree, so the run must
+# refuse to re-encode it unprotected.
 OUTSIDE="$SBX/elsewhere/stray.flac"
 mkdir -p "$LIB/Album Big" "$LIB/.flac_scan_data/reports" "$SBX/elsewhere"
 
@@ -52,12 +46,9 @@ MANUAL="$LIB/.flac_scan_data/reports/flac_scan_manual.csv"
 
 run_script "$SBX" '2' 'Y' ''
 
-# Per-file feedback: option 2 goes through the shared worker pool. In a captured
-# (non-tty) run — which is what the harness does — the pool replays each file's
-# SUCCESS/FAILURE line in FILE ORDER, so the file is still named on the terminal
-# exactly once. The pre-pool "Processing file: <path>" dispatch line is gone;
-# the same information now lives in the "Processing N file(s) with M worker(s)"
-# header plus the per-file result lines.
+# Option 2 goes through the shared worker pool. A captured (non-tty) run, which
+# is what the harness does, replays each file's SUCCESS/FAILURE line in FILE
+# ORDER, so the file is still named on the terminal exactly once.
 occur_re "Processing 1 file\\(s\\) with [0-9]+ worker\\(s\\)"
 occur_re "SUCCESS: $REAL reencoded successfully"
 # The out-of-library row is skipped, so only the real in-library file counts.
@@ -66,8 +57,8 @@ occur_re "Skipping path outside the library: $OUTSIDE"
 [ "$(captured_count 'Successful reencodes: ([0-9]+)')"   -eq 1 ] || _fail "option2 success != 1"
 occur_re "Backups stored in: $BAK"
 
-# The original bytes now live in the MIRRORED path, with the album-relative
-# layout preserved (Album Big/worst.flac -> <backup>/Album Big/worst.flac).
+# The original bytes now live in the MIRRORED path (Album Big/worst.flac ->
+# <backup>/Album Big/worst.flac).
 file_eq "$BAK/Album Big/worst.flac" 'orig-worst-bytes' \
     || _fail "mirrored backup does not hold the original bytes"
 file_eq "$REAL" "$RE_MARKER" || _fail "real file was not re-encoded"
@@ -82,8 +73,8 @@ echo "ok: backup_location (option 2 mirrors originals outside the library)"
 
 # ===========================================================================
 # B. Legacy in-library backups are content to nobody: option 4 ignores them.
-#    The config is deliberately the OLD shape (no backup_path) plus an explicit
-#    one, to prove the legacy exclusion still holds in the new layout.
+#    The config deliberately has an explicit backup_path to prove the legacy
+#    exclusion still holds in the new layout.
 # ===========================================================================
 SBX2=''
 make_sandbox SBX2
@@ -127,14 +118,14 @@ echo "ok: backup_location (legacy in-library backups ignored by option 4)"
 
 # ===========================================================================
 # C. Unsafe backup_path values are refused before any file is touched.
-#    Each variant goes through option 4 (the run that resolves the backup dir)
+#    Each variant goes through option 4, the run that resolves the backup dir,
 #    and must leave the library and every original byte-identical.
 # ===========================================================================
 check_unsafe() {
     local label="$1" variant="$2" want_re="$3"
     local sbx lib bad_backup
-    # NOTE: make_sandbox writes its result through the NAME given as $1, so the
-    # variable must not be a local of make_sandbox's own frame here.
+    # make_sandbox writes its result through the NAME given as $1, so it must not
+    # be a local of make_sandbox's own frame.
     make_sandbox CHECK_SBX
     register_sandbox "$CHECK_SBX"
     sbx="$CHECK_SBX"
@@ -142,8 +133,8 @@ check_unsafe() {
     mkdir -p "$lib/Album" "$lib/inner"
     write_file "$lib/Album/keep.flac" 'PRISTINE'
 
-    # Each variant is expressed relative to THIS sandbox, so the check always
-    # compares the sandbox's own library against the unsafe candidate.
+    # Expressed relative to THIS sandbox, so the check compares the sandbox's own
+    # library against the unsafe candidate.
     case "$variant" in
         equal)    bad_backup="$lib" ;;
         inside)   bad_backup="$lib/inner" ;;
@@ -179,9 +170,9 @@ check_unsafe 'relative backup path'  relative \
     'Error: The backup directory must be an absolute path'
 
 # ===========================================================================
-# D. A config with NO backup_path at all falls back to the derived sibling
-#    '<library>_backup'; an accepted prompt answer is persisted there.
-#    Option 5 (NEW) is used because it is the path that ASKS.
+# D. A config with no backup_path falls back to the derived sibling
+#    '<library>_backup'; an accepted prompt answer is persisted.
+#    Option 5 is used because it is the path that ASKS.
 # ===========================================================================
 SBX3=''
 make_sandbox SBX3
@@ -211,10 +202,9 @@ echo "ok: backup_location (derived '<library>_backup' default)"
 
 # ===========================================================================
 # E. Resolution is PURE: a cancelling run creates no backup directory.
-#    resolve_backup_path only decides+validates; ensure_backup_root is what
-#    mkdirs, and it runs only after the user commits. Otherwise answering the
-#    option-4 warning with a typo would leave an empty stray directory behind
-#    (and, for a destination on a mounted share, a needless mount write).
+#    resolve_backup_path only decides and validates; ensure_backup_root mkdirs,
+#    and only after the user commits. Otherwise a typo at the option-4 warning
+#    would leave an empty stray directory behind (a needless mount write too).
 # ===========================================================================
 SBX4=''
 make_sandbox SBX4
@@ -223,14 +213,13 @@ LIB4="$SBX4/lib"
 mkdir -p "$LIB4/Album"
 write_file "$LIB4/Album/song.flac" 'CANCEL-ME'
 # A DEEP path in which NO parent exists yet: proves nothing short of a committed
-# run builds the chain (and that mkdir -p still handles a missing parent when it
-# finally does run).
+# run builds the chain (and that mkdir -p handles the missing parent when it does).
 DEEP="$SBX4/deep/nested/backup"
 printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
     "$LIB4" "$DEEP" > "$SBX4/flac_health_config.json"
 
 # The warning must still SHOW the destination it resolved (resolution happens
-# before the confirmation, so the user knows where originals will go) ...
+# before the confirmation) ...
 run_script "$SBX4" '4' 'nope' ''
 occur_re "Mirror each original into"
 occur_re "$DEEP"

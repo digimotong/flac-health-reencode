@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_all.sh - integration: option 4 (Reencode ALL FLAC files)
+# case_reencode_all.sh - integration: option 4 (Reencode ALL FLAC files).
 #
 # Verifies the full-library reencode:
-#   * the pre-warning reports the real-file count (3 real; the pre-existing
-#     backup copy + internal .flac_scan_data file are excluded and require
-#     'REENCODE ALL' confirmation),
-#   * the warning names the backup directory the originals will be mirrored
-#     into,
-#   * every REAL .flac is re-encoded (replaced by the stub marker) exactly
-#     once and recorded in reencoded.db,
+#   * the pre-warning reports the real-file count (3 real; the pre-existing backup
+#     copy + internal .flac_scan_data file are excluded) and requires 'REENCODE ALL',
+#   * the warning names the backup directory the originals will be mirrored into,
+#   * every REAL .flac is re-encoded (replaced by the stub marker) exactly once and
+#     recorded in reencoded.db,
 #   * each original is mirrored into the backup root OUTSIDE the library at its
 #     album-relative path,
 #   * pre-existing legacy in-library backup copies and internal .flac_scan_data
-#     files are never processed (they hold original bytes, and never the
-#     reencode marker) and never copied into the backup root.
-###############################################################################
+#     files are never processed (they keep their original bytes) nor copied.
 
 set -o errexit
 set -o nounset
@@ -56,10 +51,10 @@ occur_re "$SBX/lib_backup"
 [ "$(captured_count 'Failed reencodes: ([0-9]+)')" -eq 0 ]    || _fail "all: failures != 0"
 [ "$(message_count 'SUCCESS:')" -eq 3 ]                       || _fail "expected exactly 3 SUCCESS lines"
 
-# Regression (progress-bar/output collision): success/status text must never be
-# emitted on the same row as the \r-based progress bar, which glued output like
-# "Failed: 0SUCCESS:". Captured stdout (redirected) must therefore contain no
-# carriage-return byte, and every SUCCESS line must start cleanly on its own row.
+# Regression (progress-bar/output collision): status text must never be emitted on
+# the same row as the \r-based progress bar, which once glued output like
+# "Failed: 0SUCCESS:". Captured (redirected) stdout must therefore hold no
+# carriage-return byte, and every SUCCESS line must start on its own row.
 if LC_ALL=C grep -q $'\r' "$CURRENT_OUT"; then
     _fail "captured output contains carriage-return bytes (progress glue)"
 fi
@@ -77,8 +72,8 @@ BAK="$SBX/lib_backup"
 file_eq "$BAK/Album One/trackA.flac"     'orig-A'
 file_eq "$BAK/Album One/sub/trackB.flac" 'orig-B'
 file_eq "$BAK/Album Two/trackC.flac"     'orig-C'
-# ... while the LEGACY in-library backup was neither touched nor promoted into
-# the new backup tree, and the internal file was untouched.
+# ... while the LEGACY in-library backup was neither touched nor promoted into the
+# new backup tree, and the internal file was untouched.
 file_eq "$LIB/Album One/sub/backup_FLAC_originals/trackB.flac" 'orig-B'
 file_eq "$LIB/.flac_scan_data/metrics.flac" 'IGNORED'
 miss "$BAK/Album One/sub/backup_FLAC_originals"

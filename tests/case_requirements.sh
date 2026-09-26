@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-###############################################################################
 # case_requirements.sh - integration: the required-tool gate.
 #
-# At startup the script refuses to run unless BOTH 'flac' and 'metaflac' are on
-# PATH, and it must do so BEFORE any menu is drawn or any file is touched
-# (flac_health_reencode.sh, the `for cmd in flac metaflac` loop). Without this
-# gate a user with a partial install could reach the reencode paths, where a
-# missing 'flac' would fail per-file only after 'metaflac' had already been
-# trusted for fingerprints.
+# At startup the script refuses to run unless 'flac' and 'metaflac' are on PATH,
+# and it must do so BEFORE any menu is drawn or any file is touched (the
+# `for cmd in flac metaflac jq` loop). Without this gate a partial install could
+# reach the reencode paths, where a missing 'flac' would fail per-file only after
+# 'metaflac' had been trusted for fingerprints.
 #
 # Covered here:
-#   A. 'flac' absent  -> error names flac, exit status 1, no menu, no writes.
-#   B. 'metaflac' absent -> error names metaflac, exit status 1, no menu.
+#   A. 'flac' absent  -> error names flac, status 1, no menu, no writes.
+#   B. 'metaflac' absent -> error names metaflac, status 1, no menu.
 #   C. Both absent    -> still exits 1 with the first missing tool's message.
 #   D. Both present (control) -> the menu DOES render, proving A-C fail for the
 #      stated reason and not because the sandbox is broken.
-###############################################################################
 
 set -o errexit
 set -o nounset

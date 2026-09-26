@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_new.sh - integration: option 5 (NEW FLAC files only)
+# case_reencode_new.sh - integration: option 5 (NEW FLAC files only).
 #
-# Three sequential menu runs in ONE library demonstrate incremental behaviour:
-#   run 1  : empty tracking DB  -> both known real files are "new", re-encoded,
-#            each written to reencoded.db, internal .flac_scan_data excluded,
-#            and each original mirrored into the backup root outside the library.
-#   run 2  : no changes         -> "All N FLAC files have already been
-#            reencoded"; nothing is reprocessed, DB unchanged.
-#   run 3  : a brand-new real file (with a different payload, hence a different
-#            fingerprint) is added -> exactly it is discovered as new and
-#            re-encoded (DB grows by one, nothing else is touched). A legacy
-#            in-library backup copy added at the same time is ignored.
-###############################################################################
+# Three menu runs in ONE library demonstrate incremental behavior:
+#   run 1  empty tracking DB -> both known real files are "new": re-encoded, each
+#          written to reencoded.db, the internal .flac_scan_data file excluded, and
+#          each original mirrored into the backup root outside the library.
+#   run 2  no changes -> "All N FLAC files have already been reencoded"; nothing
+#          reprocessed, DB unchanged.
+#   run 3  a brand-new real file (different payload, hence different fingerprint)
+#          is added -> exactly it is discovered and re-encoded (DB grows by one,
+#          nothing else touched). A legacy in-library backup copy added at the same
+#          time is ignored.
 
 set -o errexit
 set -o nounset

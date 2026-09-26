@@ -1,29 +1,24 @@
 #!/usr/bin/env bash
-###############################################################################
-# helpers.sh - shared sandbox + loose-assertion harness for case_*.sh
+# helpers.sh - shared sandbox and loose-assertion harness for case_*.sh
 #
 # Conventions
-#   - Each test case runs the REAL flac_health_reencode.sh as a subprocess
-#     against its own throwaway sandbox (fresh library tree + stub bin + config)
-#     so the developer's real config/library are never touched.
-#   - run_script sets $CURRENT_OUT to that run's combined-output log. Every
-#     output assertion below reads CURRENT_OUT, keeping case call sites terse.
-#   - Assertions are deliberately LOOSE relative to exact-output matching:
-#       * occurrence of short, stable regex markers
-#       * file exists / not-exists / content                 (strong checks)
-#       * counts parsed out of a line by a regex helper
-#       * DB / backup side effects (the reliable consequence checks)
-#     Whole rendered sentences, progress bars, spacing, and timestamps are NOT
-#     matched, so cosmetic wording changes don't break the suite.
+#   - Each case runs the REAL flac_health_reencode.sh as a subprocess against its
+#     own throwaway sandbox (fresh library tree + stub bin + config), so the
+#     developer's real config/library are never touched.
+#   - run_script sets $CURRENT_OUT to that run's combined-output log; every
+#     assertion below reads CURRENT_OUT.
+#   - Assertions are deliberately LOOSE: occurrence of short stable regex markers,
+#     file exists/contents, counts parsed by a regex helper, and DB/backup side
+#     effects. Rendered sentences, progress bars, spacing and timestamps are NOT
+#     matched, so cosmetic rewording cannot break the suite.
 #   - A failed assertion prints a readable message and exits 1 from the case.
-###############################################################################
 
 : "${TESTS_ROOT:?helpers.sh: TESTS_ROOT must be set}"
 : "${PROD_SCRIPT:?helpers.sh: PROD_SCRIPT must be set}"
 
-# PATH as it was when this file was sourced. run_script() prepends the sandbox
-# stub bin to THIS value rather than to the ambient $PATH, so a case that
-# narrows PATH for one child cannot change how later runs resolve tools.
+# PATH as it was when this file was sourced. run_script() prepends the sandbox stub
+# bin to THIS value rather than to the ambient $PATH, so a case that narrows PATH
+# for one child cannot change how later runs resolve tools.
 # shellcheck disable=SC2034  # referenced by run_script below (same file scope)
 PATH_PRE="$PATH"
 
@@ -33,10 +28,9 @@ CURRENT_OUT=''
 # shellcheck disable=SC2034  # read by case_*.sh after sourcing this file
 LAST_STATUS=0
 
-# Strip color / progress escape sequences for the loose text grep. The script
-# emits some markers VIA a literal "\033[...m" string (backslash-0-3-3) rather
-# than a real ESC byte, so strip both that and real ESC (\x1b / \e) sequences,
-# leaving the plain words/numbers to match on.
+# Strips color/progress escapes for the loose text grep. The script emits some
+# markers via a literal "\033[...m" string (backslash-0-3-3) rather than a real
+# ESC byte, so strip both that and real ESC (\x1b / \e) sequences.
 clean_sandbox_output() {
     sed -E 's#(\x1b|\\033|\\e)\[[0-9;]*m##g' "$CURRENT_OUT"
 }
@@ -47,13 +41,12 @@ clean_sandbox_output() {
 
 # make_sandbox <var_name>
 #   Builds: sbx/bin/{flac,metaflac} stubs, sbx/lib (library root), sbx/lib_backup
-#   (the backup root the config points at), the config file the production script
-#   reads, and a copy of the script. Sets $<var_name> to the sbx root.
+#   (the configured backup root), the config file the script reads, and a copy of
+#   the script. Sets $<var_name> to the sbx root.
 #
-#   backup_path is seeded EXPLICITLY (as a sibling of the library) rather than
-#   left to the script's derived '<library>_backup' default, so cases never
-#   depend on the derivation prompt and the backup tree is always at a known
-#   path: "$sbx/lib_backup".
+#   backup_path is seeded EXPLICITLY (as a sibling of the library) rather than left
+#   to the derived '<library>_backup' default, so cases never depend on the
+#   derivation prompt and the tree is always at "$sbx/lib_backup".
 make_sandbox() {
     local _vn="$1"
     local sbx
@@ -65,9 +58,8 @@ make_sandbox() {
     cp "$PROD_SCRIPT" "$sbx/flac_health_reencode.sh"
     # 'jobs' is pinned to 1 in every sandbox on purpose: the pre-existing cases
     # were written against strictly-sequential behavior (status lines in file
-    # order, tallies identical to the file count) and stay the regression anchor
-    # for it. Parallel behaviour has its own case (case_parallel.sh), which sets
-    # FLAC_HEALTH_JOBS / edits this key itself.
+    # order, tallies equal to the file count) and stay the regression anchor for
+    # it. Parallel behavior has its own case (case_parallel.sh).
     printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1", "jobs": 1}\n' \
         "$sbx/lib" "$sbx/lib_backup" > "$sbx/flac_health_config.json"
     printf -v "$_vn" '%s' "$sbx"
@@ -87,22 +79,19 @@ register_sandbox() {
 
 # run_script <sbx> [stdin lines...]
 #   Runs the real script against the sandbox stubs. The script is expected to end
-#   (via errexit on the final menu read at EOF) with a non-zero status; that is
-#   NOT a failure of this helper, so the pipeline runs under an `if` to keep it
-#   from tripping the case's `set -e`. The child's exit code is recorded in
-#   LAST_STATUS for cases that want to inspect it.
+#   (via errexit on the final menu read at EOF) with a non-zero status; that is NOT
+#   a failure of this helper, so the pipeline runs under an `if` to keep it from
+#   tripping the case's `set -e`. The child's exit code lands in LAST_STATUS.
 #
-# LAST_STATUS / CURRENT_OUT are the helper's public outputs: the case scripts
-# that source this file read them after the call, so shellcheck's "appears
-# unused" (SC2034) does not apply within this file.
+# LAST_STATUS / CURRENT_OUT are the helper's public outputs: the case scripts that
+# source this file read them after the call, so shellcheck's "appears unused"
+# (SC2034) does not apply within this file.
 # shellcheck disable=SC2034
 run_script() {
     local sbx="$1"; shift
     CURRENT_OUT="$sbx/output.log"
-    # PATH_PRE is the environment PATH captured at source time. The inherited
-    # PATH cannot be used here: 'source' snapshotting aside, a test case that
-    # narrows PATH for its own child (case_requirements.sh) must not leak that
-    # narrowing into these unrelated runs.
+    # PATH_PRE is the PATH captured at source time: a case that narrows PATH for
+    # its own child (case_requirements.sh) must not leak that into these runs.
     if printf '%s\n' "$@" | PATH="$sbx/bin:$PATH_PRE" bash "$sbx/flac_health_reencode.sh" \
             > "$CURRENT_OUT" 2>&1; then
         LAST_STATUS=0
@@ -113,10 +102,10 @@ run_script() {
 }
 
 # run_script_env <sbx> <ENV=VAL...> -- <stdin lines...>
-#   Same as run_script, but runs the script with extra environment variables in
-#   scope (e.g. FLAC_HEALTH_JOBS, STUB_FLAC_SLEEP). Keeping the env assignment in
-#   the command prefix rather than export'ing it means a case cannot leak an
-#   override into a later run. Outputs are set exactly as run_script's.
+#   Same as run_script, but with extra environment variables in scope (e.g.
+#   FLAC_HEALTH_JOBS, STUB_FLAC_SLEEP). Keeping the assignment in the command
+#   prefix rather than export'ing it stops a case leaking an override into a later
+#   run. Outputs are set exactly as run_script's.
 run_script_env() {
     local sbx="$1"; shift
     local envs=()
@@ -139,9 +128,9 @@ run_script_env() {
 # Convenience alias for the active log path.
 out() { printf '%s\n' "$CURRENT_OUT"; }
 
-###############################################################################
+# ===========================================================================
 # Loose output assertions (all read CURRENT_OUT)
-###############################################################################
+# ===========================================================================
 
 _fail() {
     echo "  FAIL: $*" >&2
@@ -171,9 +160,9 @@ message_count() {
     clean_sandbox_output | grep -cE -- "$1"
 }
 
-###############################################################################
+# ===========================================================================
 # Filesystem / state assertions
-###############################################################################
+# ===========================================================================
 
 exist() { [ -e "$1" ] || _fail "expected to exist: $1"; return 0; }
 miss()  { [ ! -e "$1" ] || _fail "expected to NOT exist: $1"; return 0; }
@@ -187,15 +176,13 @@ file_eq() {
 }
 
 # db_has_path <sbx> <absolute-path>
-#   reencoded.db rows are "<md5> <size> <mtime> <path>" -- the path is the LAST
-#   field (so it may contain spaces). Passes iff any row ENDS with the path.
+#   Rows are "<md5> <size> <mtime> <path>", path LAST (so it may contain spaces).
+#   Passes iff a row ENDS with the path: drop the first three tokens and compare
+#   the rebuilt remainder exactly.
 db_has_path() {
     local sbx="$1" path="$2" db
     db="$sbx/lib/.flac_scan_data/reencoded.db"
     [ -f "$db" ] || _fail "expected db at $db"
-    # Parsing: each row is "<md5> <size> <mtime> <path>" where <path> is the LAST
-    # field (may contain spaces). Drop the first three space-delimited tokens and
-    # rebuild the remainder -- that remainder must equal $path exactly.
     local line tokens rest
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in \#*|'') continue ;; esac
@@ -206,18 +193,17 @@ db_has_path() {
     _fail "db lacks entry for: $path"
 }
 
-###############################################################################
+# ===========================================================================
 # Fixtures
-###############################################################################
+# ===========================================================================
 
 # write_file <path> <content>   : no trailing newline (control EXACT bytes).
 write_file() { printf '%s' "$2" > "$1"; }
 
-# Content-marker contract with the stubs (kept short here; see stub headers):
-#   * appending 'CORRUPT' to a file makes the stub's `flac -t` FAIL.
-#   * a successful stub reencode REPLACES the target file with content
-#     'REENCODE_OK' -- backups tracked by these tests never carry it, so
-#     "backup untouched by reencode" is checked via file_eq against the marker.
+# Content-marker contract with the stubs (see the stub headers):
+#   * appending 'CORRUPT' makes the stub's `flac -t` FAIL.
+#   * a successful stub reencode REPLACES the target with 'REENCODE_OK' -- no
+#     backup ever carries it, so "backup untouched" is a file_eq against this.
 # Read by case_*.sh (which source this file), not within helpers.sh itself.
 # shellcheck disable=SC2034
 RE_MARKER='REENCODE_OK'

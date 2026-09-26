@@ -1,31 +1,19 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_docs.sh - INTEGRATION: the README still describes the real script.
+# case_docs.sh - INTEGRATION: the README still describes the real script. Nothing
+# else checked README.md, so the docs could (and did) drift from the script.
 #
-# This repository had no check on README.md at all, so its documentation could
-# drift from the script with nothing to catch it -- and it did: commit 78dd960
-# ("Require jq in the startup gate and correct the docs") had to fix the README
-# by hand after the startup gate gained a tool. These guards make that class of
-# drift fail here instead of in the field.
+# Asserted, all derived from the SOURCE rather than hardcoded:
+#   A. Required tools: every name in the script's startup gate (`for cmd in ...`)
+#      appears in the README, and in its '## Requirements' section, so adding a
+#      required tool forces a doc update.
+#   B. Config keys: every key the script writes into flac_health_config.json is
+#      documented, so a new key cannot ship undocumented.
+#   C. The `version` claim: the README documents that key as write-only, so this
+#      fails if the script ever starts reading it (the signal to fix that row).
 #
-# What is asserted, and why it is derived from SOURCE rather than hardcoded:
-#
-#   A. Required tools. The names in the script's startup gate (`for cmd in ...`)
-#      must each appear in the README, so adding a required tool forces a doc
-#      mention in the same change.
-#   B. Config keys. The keys the script writes into flac_health_config.json must
-#      each appear in the README, so a new config key cannot ship undocumented.
-#   C. The `version` claim. The README once said that key was "read by the
-#      script"; the script only ever WRITES it (the only reader is
-#      tests/case_config.sh). This guard fails if the script ever starts reading
-#      it again, which is the signal to correct that row rather than let it go
-#      stale a second time.
-#
-# Deliberately NOT asserted: rendered sentences, menu wording, option counts, or
-# exact timing text. Per tests/helpers.sh, assertions in this suite stay loose so
-# cosmetic rewording cannot break it -- these guards are limited to facts that
-# are extracted from the production script itself.
-###############################################################################
+# Deliberately NOT asserted: rendered sentences, menu wording, option counts or
+# timing text -- per tests/helpers.sh, assertions stay loose so cosmetic rewording
+# cannot break the suite.
 
 set -o errexit
 set -o nounset
@@ -59,10 +47,10 @@ set -- $tools
 for tool in "$@"; do
     printf '%s\n' "$README_TEXT" | grep -qF -- "$tool" \
         || _fail "required tool '$tool' is in the startup gate but not in README.md"
-    # The README's own Requirements block must carry it too, not just a mention
-    # somewhere in prose: an install list that omits a hard requirement is the
-    # exact bug 78dd960 fixed. The section ends at the next '## ' heading, so a
-    # later mention (e.g. the '## Development' shellcheck note) cannot satisfy it.
+    # The README's own Requirements block must carry it too, not just a mention in
+    # prose: an install list that omits a hard requirement is the bug this guard
+    # exists for. The section ends at the next '## ' heading, so a later mention
+    # (e.g. the '## Development' shellcheck note) cannot satisfy it.
     awk '/^## Requirements$/{f=1;next} /^## /{f=0} f' "$README" | grep -qF -- "$tool" \
         || _fail "required tool '$tool' is missing from the README '## Requirements' section"
 done
@@ -72,8 +60,8 @@ echo "ok: case_docs (startup-gate tools documented: $*)"
 # ===========================================================================
 # B. Every key the script writes into the config is documented.
 # ===========================================================================
-# Parse the width-1 keys out of the script's `jq -n '{...}'` default-config
-# call: the ONLY place the config schema is defined.
+# Parse the width-1 keys out of the script's `jq -n '{...}'` default-config call:
+# the ONLY place the config schema is defined.
 jq_default="$(grep -E "jq -n '\{" "$PROD_SCRIPT" | head -n1)"
 [ -n "$jq_default" ] \
     || _fail "could not find the jq default-config call in $PROD_SCRIPT"
@@ -93,10 +81,9 @@ echo "ok: case_docs (config keys documented: $(printf '%s' "$keys" | tr '\n' ' '
 # ===========================================================================
 # C. The README's `version` row: the script must not read that key.
 # ===========================================================================
-# The README documents `version` as write-only. If a jq read of '.version' shows
-# up in the production script, that claim is false and the doc must be corrected
-# -- so fail here and point at the row. The script's own writer line is excluded
-# by matching reads only: it sets the key, it never queries it.
+# The README documents `version` as write-only. A jq read of '.version' in the
+# production script would make that claim false, so fail and point at the row.
+# Matching reads only, so the script's own writer line is not caught.
 version_reads="$(grep -nE '\.version\b|\[\"version\"\]|\[.version.\]' "$PROD_SCRIPT" || true)"
 if [ -n "$version_reads" ]; then
     _fail "the script now reads '.version' from the config, but the README key
@@ -105,11 +92,10 @@ if [ -n "$version_reads" ]; then
 $version_reads"
 fi
 
-# The row must still exist: guard B above owns the keys the script WRITES, and a
-# deleted row would otherwise quietly retire this guard's subject. Match the
-# backticked key cell specifically, so prose mentioning `version` is not enough.
-# (BT is the backtick, kept out of the quotes to avoid an SC2016 command-
-# substitution warning.)
+# The row must still exist: guard B owns the keys the script WRITES, and a deleted
+# row would quietly retire this guard's subject. Match the backticked key cell
+# specifically, so prose mentioning `version` is not enough. (BT is the backtick,
+# kept out of the quotes to avoid an SC2016 command-substitution warning.)
 BT='`'
 grep -qF -- "| ${BT}version${BT} |" "$README" \
     || _fail "README no longer documents the 'version' config key row"

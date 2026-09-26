@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
-###############################################################################
 # case_tty.sh - integration: the interactive (stdout-is-a-TTY) rendering branch.
 #
 # WHY THIS CASE NEEDS A PSEUDO-TERMINAL
-#   The other cases run the script through run_script(), which redirects stdout
-#   into a file. In that mode `[ -t 1 ]` is ALWAYS false, so every
-#   `if stdout_is_tty` branch in the script is dead as far as the rest of the
-#   suite is concerned -- the animated progress bar, the colourised scan
-#   summary, and the "Library: <path>" banner were all unexercised. This case
-#   uses `script -qec`, which attaches the child to a real PTY, and asserts the
-#   TTY-only output that the plain-text branch never produces:
+#   The other cases run the script through run_script(), which redirects stdout to a
+#   file. There `[ -t 1 ]` is ALWAYS false, so every `if stdout_is_tty` branch is
+#   dead as far as the rest of the suite is concerned: the animated progress bar,
+#   the colorised scan summary and the "Library: <path>" banner were unexercised.
+#   This case uses `script -qec`, which attaches the child to a real PTY, and
+#   asserts the TTY-only output the plain-text branch never produces:
 #
 #     * the single-line progress bar framed by \r ... \033[K (show_progress)
-#     * the colourised "Scan complete." summary (printf with $GREEN/$NC)
-#     * the colourised "Library: <path>" banner in the menu (option 3 output)
+#     * the colorised "Scan complete." summary (printf with $GREEN/$NC)
+#     * the colorised "Library: <path>" banner in the menu
 #
-#   A control run WITHOUT the PTY asserts the same markers are ABSENT, so the
-#   two cases together pin the branch both ways: taken on a tty, not taken
-#   otherwise. Without the negative control, "the marker appeared" would not
-#   prove the branch was chosen.
+#   A control run WITHOUT the PTY asserts the same markers are ABSENT, so the two
+#   together pin the branch both ways: taken on a tty, not taken otherwise. Without
+#   the negative control, "the marker appeared" would not prove the branch was chosen.
 #
-#   `script` is harmless when it is missing (or lacks PTY support): the case
-#   reports a SKIP rather than failing, so the suite stays portable.
-###############################################################################
+#   `script` missing (or lacking PTY support) is harmless: the case reports a SKIP
+#   rather than failing, so the suite stays portable.
 
 set -o errexit
 set -o nounset
@@ -38,16 +34,16 @@ if ! command -v script > /dev/null 2>&1; then
 fi
 
 # If `script` cannot give us a tty at all, skip instead of reporting a false
-# failure -- this is an environment limitation, not a product defect. (stdin via
-# a file, not a pipe: see run_under_pty below.)
+# failure: an environment limitation, not a product defect. (stdin via a file, not a
+# pipe: see run_under_pty below.)
 if ! timeout 10 script -qec 'test -t 1' /dev/null < /dev/null > /dev/null 2>&1; then
     echo "SKIP: case_tty ('script' cannot allocate a PTY here)"
     exit 0
 fi
 
-# The scan output logs emitted with a real ESC byte (0x1b) rather than the
-# literal "\033" text, because the tty branch is reached at runtime. Compute the
-# raw escape here so the assertions below are unambiguous.
+# The scan output logs emitted with a real ESC byte (0x1b) rather than the literal
+# "\033" text, because the tty branch is reached at runtime. Compute the raw escape
+# here so the assertions below are unambiguous.
 ESC="$(printf '\033')"
 
 # Build a library with one good and one CORRUPT file, and the stdin script that

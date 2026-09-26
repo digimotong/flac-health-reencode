@@ -14,20 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 # Both job ids below are required status checks on `main`, so their *names* are
-# load-bearing: the ruleset matches on `test` and `lint`, and renaming a job (or
-# matrixing it, which would rename it to `lint (3.12)`) leaves that required
-# context reporting nothing. An unreported required check does not fail - it
-# blocks every merge behind "Expected - waiting for status to be reported".
+# load-bearing: the ruleset matches on `test` and `lint`, and renaming (or
+# matrixing, which would rename to `lint (3.12)`) leaves that required context
+# reporting nothing. An unreported required check does not fail - it blocks every
+# merge behind "Expected - waiting for status to be reported".
 #
-# The bare `push:`/`pull_request:` triggers above are load-bearing in the same
-# way: a `paths:`/`branches:` filter would skip the whole run on matching PRs,
-# which is precisely when the required checks have to report.
+# The bare `push:`/`pull_request:` triggers are load-bearing the same way: a
+# `paths:`/`branches:` filter would skip the whole run on matching PRs, which is
+# precisely when the required checks have to report.
 #
-# tests/case_workflow_contract.sh pins all of this, including that the job set
-# stays mutable and that neither job grows a `strategy:`, a `name:`, an `if:` or
-# a `needs:`. The taggers require more contexts than this repo does (`parity`,
-# `dockerfile`, and a matrixed `test`), so the ruleset and the guard's
-# REQUIRED_JOBS list are per-repository and must be changed together.
+# tests/case_workflow_contract.sh pins all of this, including that the job set stays
+# mutable and that neither job grows a `strategy:`, `name:`, `if:` or `needs:`.
+# The tagger repos require more contexts than this repo does (`parity`, `dockerfile`
+# and a matrixed `test`), so the ruleset and the guard's REQUIRED_JOBS list are
+# per-repository and must be changed together.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -38,16 +38,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          # 'bash' and 'md5sum' (from coreutils) are already preinstalled on the
-          # ubuntu-latest runner; only jq needs installing.
+          # 'bash' and 'md5sum' (coreutils) are preinstalled on ubuntu-latest; only
+          # jq needs installing.
           sudo apt-get install -y --no-install-recommends jq
         shell: bash
 
       - name: Run FLAC health/re-encode test suite
-        # A hung case must fail rather than burn the job's full timeout. The
-        # suite runs each case in its own subprocess, so 300s is a generous
-        # ceiling for a healthy suite (it completes in a few seconds locally)
-        # that still catches an unbounded read/wait loop.
+        # A hung case must fail rather than burn the job's full timeout. The suite
+        # runs each case in its own subprocess, so 300s is a generous ceiling for a
+        # healthy suite (seconds locally) that still catches an unbounded read/wait.
         run: timeout 300 bash tests/run_tests.sh
         shell: bash
 
@@ -58,11 +57,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The repo's .gitignore denies everything by default and re-allows a short
-      # allowlist. A file the build needs can therefore be silently ignored by
-      # git (this actually happened to .shellcheckrc) and CI breaks on a clean
-      # clone while the developer's working tree looks fine. Assert the tracked
-      # set directly: `git ls-files` reads the INDEX, so a file that is present
-      # locally but ignored is simply absent from this list.
+      # allowlist, so a file the build needs can be silently ignored by git (this
+      # happened to .shellcheckrc) and CI breaks on a clean clone while the
+      # developer's working tree looks fine. Asserting the tracked set directly:
+      # `git ls-files` reads the INDEX, so a file that exists locally but is ignored
+      # is simply absent from this list.
       - name: Assert required files are tracked by git
         run: |
           missing=0
@@ -85,8 +84,8 @@ jobs:
               missing=1
             fi
           done
-          # Every test case must be tracked too, so a new tests/case_*.sh cannot
-          # be written, run locally, and then silently never run in CI.
+          # Every test case must be tracked too, so a new tests/case_*.sh cannot be
+          # written and run locally yet silently never run in CI.
           while IFS= read -r case_file; do
             if ! git ls-files --error-unmatch "$case_file" > /dev/null 2>&1; then
               echo "::error file=$case_file::$case_file is not tracked by git (check .gitignore allowlist)"
@@ -106,11 +105,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
         shell: bash
 
-      # The runner script is the single source of truth for how the repo is
-      # linted, so CI cannot invoke shellcheck differently from a developer.
-      # It prints the resolved version, which is also what the pin below is
-      # asserted against: if apt starts shipping a different shellcheck, this
-      # fails with a clear message instead of surfacing as mystery diagnostics.
+      # The runner script is the single source of truth for how the repo is linted,
+      # so CI cannot invoke shellcheck differently from a developer. It prints the
+      # resolved version, which the pin below is asserted against: if apt starts
+      # shipping a different shellcheck this fails with a clear message instead of
+      # surfacing as mystery diagnostics.
       - name: Pin the shellcheck major.minor version
         run: |
           want="0.9"

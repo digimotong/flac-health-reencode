@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_csv.sh - integration: option 2 (problematic list from a CSV)
+# case_reencode_csv.sh - integration: option 2 (problematic list from a CSV).
 #
-# Pre-seeds TWO scan CSVs -- one stale, one NEWEST manual list. The manual list
-# deliberately mixes valid rows with rows the script must IGNORE: the '# Scan
-# Report...' comment, the 'filepath' header, a backup copy, and an internal
-# .flac_scan_data file. Only the single real "problematic" file is reencoded:
+# Pre-seeds TWO scan CSVs: one stale, one NEWEST manual list. The manual list mixes
+# valid rows with rows the script must IGNORE (the '# Scan Report...' comment, the
+# 'filepath' header, a backup copy, an internal .flac_scan_data file). Only the
+# single real "problematic" file is reencoded:
 #   * the manual (newest) CSV is chosen, not the stale one
-#   * count line reflects the 1 real row
-#   * the real file's ORIGINAL BYTES are mirrored into the backup root (outside
-#     the library, at the album-relative path) and it is replaced with reencoded
-#     content
+#   * the count line reflects the 1 real row
+#   * its ORIGINAL BYTES are mirrored into the backup root (outside the library, at
+#     the album-relative path) and the file is replaced with reencoded content
 #   * backup + internal files stay untouched (never re-encoded, no db rows)
 #   * the reencoded real file is recorded in reencoded.db
-###############################################################################
 
 set -o errexit
 set -o nounset
@@ -32,7 +29,7 @@ REAL="$LIB/Album Big/worst.flac"                 # the one "problematic" real fi
 BADBAK="$LIB/Album Big/backup_FLAC_originals/w2.flac"
 INTFILE="$LIB/.flac_scan_data/reports/x.flac"
 # Base dirs; ".flac_scan_data/" is created by the nested mkdir (its parent is the
-# library root): we place real albums, one backup dir, and a pre-existing report
+# library root). We place real albums, one backup dir, and a pre-existing report
 # that doubles as the "internal file candidate" location.
 mkdir -p "$LIB/Album Big/backup_FLAC_originals" "$LIB/Album Big2" "$LIB/.flac_scan_data/reports"
 

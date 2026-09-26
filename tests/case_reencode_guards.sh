@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_guards.sh - integration: temp-file naming, backup preservation
-# and graceful menu return on error paths.
+# case_reencode_guards.sh - integration: temp-file naming, backup preservation and
+# graceful menu return on error paths.
 #
-# A. Temp-file guard (F1): a leftover reencode temp named 'tmp_<...>.part'
-#    (the post-fix temp extension) sitting in a real album dir is NOT library
-#    content -- a scan neither counts it nor flags it, even though its bytes
-#    contain the CORRUPT marker (a real *.flac with those bytes would be
-#    reported). This proves the temp naming keeps interrupted-run leftovers out
-#    of scans / reencode-NEW discovery.
-# B. Backup-preservation guard (F3): re-encoding the SAME file twice (as a
-#    re-run over the same CSV would) must NOT overwrite the original backup --
-#    the pristine first-reencode backup bytes survive the re-run. The backup now
-#    lives in the mirrored backup root outside the library.
-# C. Graceful-return guard (F4): choosing an option whose library path no
-#    longer exists returns to the main menu instead of hard-exiting the script.
-# D. Stale-residue guard (F1): a leftover 'tmp_*.part' from an interrupted run
-#    (which makes real flac's -o write refuse with "output file ... already
-#    exists") is cleared by the script before re-encoding, so a resumed full
-#    pass succeeds and leaves no residue to trip the run after it.
-###############################################################################
+# A. Temp-file guard: a leftover reencode temp named 'tmp_<...>.part' (the post-fix
+#    temp extension) in a real album dir is NOT library content - a scan neither
+#    counts nor flags it, even though its bytes contain the CORRUPT marker (a real
+#    *.flac with those bytes would be reported). This proves the temp naming keeps
+#    interrupted-run leftovers out of scans / reencode-NEW discovery.
+# B. Backup-preservation guard: re-encoding the SAME file twice (as a re-run over
+#    the same CSV would) must NOT overwrite the original backup - the pristine
+#    first-reencode bytes survive, in the mirrored backup root.
+# C. Graceful-return guard: choosing an option whose library path no longer exists
+#    returns to the main menu instead of hard-exiting the script.
+# D. Stale-residue guard: a leftover 'tmp_*.part' from an interrupted run (which
+#    makes real flac's -o write refuse) is cleared before re-encoding, so a resumed
+#    full pass succeeds and leaves no residue to trip the run after it.
 
 set -o errexit
 set -o nounset
