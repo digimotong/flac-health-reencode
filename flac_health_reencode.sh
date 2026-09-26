@@ -36,6 +36,16 @@ declare -g STATUS_TO_CONSOLE=1
 # sequential run. Declared here because 'set -u' callers read it after the call.
 declare -g POOL_WORKERS_USED=0
 
+# Interrupt cleanup state. POOL_TEMP_LIST is the run-local list of the in-library
+# temp files (tmp_<base>.part) the parent has dispatched, POOL_SEED_LIST is the
+# run's NUL-separated work list, and POOL_INTERRUPT_ARMED latches so the handler
+# runs its sweep once. All three are only meaningful while a pooled run is in
+# flight: a scan dispatches no reencode temps and simply leaves POOL_TEMP_LIST
+# empty.
+declare -g POOL_TEMP_LIST=''
+declare -g POOL_SEED_LIST=''
+declare -g POOL_INTERRUPT_ARMED=0
+
 # run_file_pool's completion tally, re-initialised per run.
 declare -g POOL_PROCESSED=0
 declare -g POOL_SUCCESS=0
@@ -701,7 +711,7 @@ run_file_pool() {
         return 0
     fi
 
-    _pool_setup_state "$jobs" "$log_file"
+    _pool_setup_state "$jobs" "$log_file" "$list_path"
     _pool_dispatch_loop "$list_path" "$jobs" "$log_file" "$result_channel" \
         "$library_dir" "$backup_root" "$label"
     _pool_drain "$label"
@@ -716,6 +726,9 @@ run_file_pool() {
     # created, and ids are allocated per FILE, not per worker slot.
     POOL_WORKERS_USED="$POOL_NEXT_ID"
     _pool_cleanup_state
+    # The run is over, so restore the default signal behavior before returning to
+    # the menu (a Ctrl-C there should end the script, not run the pool sweep).
+    _pool_disarm_interrupt_trap
     return 0
 }
 
@@ -742,7 +755,8 @@ _count_lines() {
 
 # Creates the shard directory and the parent's in-flight bookkeeping for one
 # pooled run: the dispatch index (file order, so the replay is deterministic) and
-# the pid -> worker-id map. $1 = worker count, $2 = run log path.
+# the pid -> worker-id map. $1 = worker count, $2 = run log path, $3 = the run's
+# NUL-separated work list (recorded so the interrupt handler can remove it).
 _pool_setup_state() {
     # shellcheck disable=SC2034  # pool-wide state read by _pool_dispatch_loop
     # and _pool_sweep_finished below, like POOL_PIDS.
@@ -750,11 +764,48 @@ _pool_setup_state() {
     POOL_LOG_FILE="$2"
     POOL_SHARD_DIR="$(shard_dir_for "$POOL_LOG_FILE")"
     POOL_INDEX="${POOL_SHARD_DIR}/$(basename "$POOL_LOG_FILE").index"
+    # Run-local temp manifest the interrupt handler reads. It lives in the shard
+    # dir, so it is namespaced by the run log like every other shard and cannot
+    # collide with another run.
+    POOL_TEMP_LIST="${POOL_SHARD_DIR}/$(basename "$POOL_LOG_FILE").temps"
+    # Kept for the handler's sweep: a transient work list left behind by an
+    # interrupted run is dead weight in the user's library.
+    # shellcheck disable=SC2034  # read by _pool_interrupt_cleanup
+    POOL_SEED_LIST="${3:-}"
     POOL_NEXT_ID=0
     POOL_PIDS=()
     mkdir -p "$POOL_SHARD_DIR"
     : > "$POOL_INDEX"
+    : > "$POOL_TEMP_LIST"
     declare -gA POOL_WORKER_EXIT=()
+    _pool_install_interrupt_trap
+    return 0
+}
+
+# Arms the INT/TERM/HUP trap for the duration of a pooled run. Each trap passes its
+# OWN signal number to the shared handler, so the reported signal - and the
+# 128+signo exit status derived from it - is always correct. A single shared global
+# would be overwritten by each `trap` registration and report whichever signal
+# happened to be registered last (HUP/1), which is exactly the bug this avoids.
+#
+# Installed here rather than at script scope so the interactive menu (where Ctrl-C
+# should simply end the script) is unaffected, and so the unit tests that SOURCE
+# this file never inherit a handler.
+_pool_install_interrupt_trap() {
+    trap '_pool_interrupt_cleanup 2' INT
+    trap '_pool_interrupt_cleanup 15' TERM
+    trap '_pool_interrupt_cleanup 1' HUP
+    return 0
+}
+
+# Restores the default INT/TERM/HUP behavior once the pooled run has completed.
+# Idempotent, so calling it on a path where no trap was armed is harmless.
+_pool_disarm_interrupt_trap() {
+    trap - INT TERM HUP
+    # shellcheck disable=SC2034  # latched for re-entrancy by the armed traps
+    POOL_INTERRUPT_ARMED=0
+    # shellcheck disable=SC2034  # read by _pool_interrupt_cleanup
+    POOL_SEED_LIST=''
     return 0
 }
 # Resolves the result channel on the SEQUENTIAL (jobs=1) path. A reencode caller
@@ -801,6 +852,17 @@ _pool_start_worker() {
     local library_dir="$4"
     local backup_root="$5"
     local pid
+
+    # Record the temp this file will use BEFORE forking, so the interrupt handler
+    # can sweep it even if the signal lands while the worker is mid-write. The
+    # name is the deterministic one reencode_one_file builds, and appending it to
+    # the run's manifest (not a bare find -delete) keeps a running sibling's live
+    # temp out of the sweep. A scan's worker writes no temp; an extra entry for it
+    # would be harmless (the file never exists) but is skipped anyway, since its
+    # channel kind is 'scan'.
+    if [ "${POOL_CHANNEL_KIND:-db}" = 'db' ] && [ -n "$POOL_TEMP_LIST" ]; then
+        printf '%s\n' "${flac_file%/*}/tmp_${flac_file##*/}.part" >> "$POOL_TEMP_LIST"
+    fi
 
     (
         # Shards are LOCAL to the child and passed explicitly, so no shared
@@ -981,10 +1043,100 @@ _pool_replay_status_lines() {
 # the caller there are no shards to merge.
 _pool_cleanup_state() {
     rm -f "$POOL_INDEX" 2>/dev/null || true
+    rm -f "$POOL_TEMP_LIST" 2>/dev/null || true
     POOL_PIDS=()
     POOL_RUNNING=0
     rmdir "$POOL_SHARD_DIR" 2>/dev/null || true
     return 0
+}
+
+# Signal handler for INT/TERM/HUP, installed only while a pooled run is in flight.
+#
+# WHY: a terminal Ctrl-C signals the whole foreground group, so the workers and
+# their 'flac' children usually die on their own - but a `kill -TERM`, `systemctl
+# stop` or `pkill` signals ONLY this shell, and then the forked workers keep
+# running while the parent dies. They hold shards that will never be merged, hold
+# temp files, and can rewrite audio after the user believes the run stopped. This
+# handler closes that window.
+#
+# WHAT it does NOT do: flush the workers' shards into the run log or the tracking
+# DB. A half-finished file may already have been replaced while its DB record is
+# still only in a shard, or vice versa, and the normal merge is deliberately
+# all-or-nothing (see run_file_pool). An interrupted parallel run can therefore
+# leave reencoded files and backups with no DB row; option 5 will re-reencode
+# those next time, which is safe because an existing backup is never overwritten.
+#
+# WHAT it does clean, all scoped to THIS run so a concurrent invocation is safe:
+# every worker and its 'flac' child, the in-library .part temp of each dispatched
+# file, this run's per-worker shards and dispatch index, its temp manifest and its
+# seed work list. The partial run log is kept on purpose - it is the only record of
+# what the interrupt cut short.
+#
+# A trap cannot take arguments, but the handler it invokes can: the trap commands
+# installed by _pool_install_interrupt_trap pass their own signal number as $1.
+_pool_interrupt_cleanup() {
+    local signo="${1:-0}"
+    # Disarm first: a second signal (or a TERM sent to a worker) must not re-enter.
+    # shellcheck disable=SC2034  # latched for re-entrancy by the armed traps
+    POOL_INTERRUPT_ARMED=1
+    trap '' INT TERM HUP
+
+    local p
+
+    printf '\nInterrupted (signal %s): stopping workers...\n' "$signo" >&2
+
+    # Kill each worker AND its 'flac' grandchild. Killing only the worker leaves a
+    # running 'flac' writing to the temp; pkill -P covers the depth. Both calls
+    # are best-effort: pkill may be absent (it is procps, not coreutils), and a
+    # worker may have exited between the sweep and the kill.
+    for p in "${POOL_PIDS[@]}"; do
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -TERM -P "$p" 2>/dev/null || true
+        fi
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+
+    # Remove the temps this run dispatched. The manifest is written by the parent at
+    # dispatch time, so it names exactly this run's temps - never a concurrent run's
+    # live file (unlike a blanket find -delete over the library).
+    if [ -n "${POOL_TEMP_LIST:-}" ] && [ -f "$POOL_TEMP_LIST" ]; then
+        while IFS= read -r p; do
+            if [ -n "$p" ]; then
+                rm -f "$p" 2>/dev/null || true
+            fi
+        done < "$POOL_TEMP_LIST"
+        rm -f "$POOL_TEMP_LIST" 2>/dev/null || true
+    fi
+    # Remove every OTHER artifact of this run. Shards are named
+    # '<log basename>_w<N>.<ext>' and live beside the run log, so the run log's
+    # basename is the namespace: a CONCURRENT run has its own log basename (it is
+    # timestamped) and is therefore untouched, while this run's log/result/DB/scan
+    # shards, its dispatch index and its temp manifest all go. The log itself is kept
+    # as the audit trail of what happened before the interrupt.
+    if [ -n "${POOL_LOG_FILE:-}" ]; then
+        local log_base log_dir
+        log_base="$(basename "$POOL_LOG_FILE")"
+        log_dir="$(dirname "$POOL_LOG_FILE")"
+        rm -f "${log_dir}/${log_base}"_w* \
+              "${log_dir}/${log_base}".index \
+              "${log_dir}/${log_base}".temps \
+              2>/dev/null || true
+    fi
+    # The seed directory holds this run's NUL-separated work list, named from the
+    # same log basename. It is transient, so a leftover serves no purpose.
+    if [ -n "${POOL_SEED_LIST:-}" ]; then
+        rm -f "$POOL_SEED_LIST" 2>/dev/null || true
+    fi
+    # A 'shards' sibling directory holds this run's shards when the run log lives
+    # outside the library; remove it if this run created it. rm -rf (not rmdir) so a
+    # killed worker's leftovers inside cannot strand it, and the name is derived from
+    # the per-run log path so no other run shares it.
+    if [ -n "${POOL_SHARD_DIR:-}" ] && [ -d "$POOL_SHARD_DIR" ]; then
+        rm -rf "$POOL_SHARD_DIR" 2>/dev/null || true
+    fi
+
+    exit "$((128 + signo))"
 }
 
 # The sequential scan's ORIGINAL cadence (every 50 files, or on a whole-percent
