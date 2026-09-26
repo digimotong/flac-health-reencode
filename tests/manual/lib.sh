@@ -117,10 +117,74 @@ mlib_set_config() {
         "$sbx/lib" "$sbx/backup" "$jobs" > "$sbx/flac_health_config.json"
 }
 
+# mlib_pcm_escapes <seed> [frames]
+#   Deterministic 16-bit signed samples in [-16000,16000), stereo interleaved, as
+#   ASCII-ONLY octal escapes ("\ddd" per octet, 1024 per line to stay readable).
+#   A consumer turns it back into raw bytes with `printf '%b'` (see mlib_make_pcm).
+#
+# WHY ESCAPES AND NOT `printf "%c", v` -- THE BUG THIS ENCODES AROUND
+#   The obvious byte emitter is `printf "%c%c", v % 256, int(v / 256) % 256`, and
+#   on a byte-oriented awk (mawk, i.e. Ubuntu's default) that is exactly one octet
+#   per conversion. But POSIX only requires %c to take the NUMERIC value of the
+#   argument as a character, and in a multibyte locale gawk reads that as a WIDE
+#   character, so it emits the whole UTF-8 sequence: for v % 256 = 233 that is two
+#   bytes (0xC3 0xA9) instead of one. Any octet >= 0x80 occurs constantly in this
+#   stream, so the PCM silently becomes longer than frames*4 bytes - not 4-aligned -
+#   and real flac rejects it with "ERROR: got partial sample", which is what made
+#   CI's manual-real-flac job fail while passing on containers whose awk is mawk.
+#   Escaping sidesteps the whole question: octal escapes and `printf '%b'` are
+#   byte-oriented by definition and cannot vary with the locale or the awk.
+mlib_pcm_escapes() {
+    local seed="$1" frames="${2:-30000}"
+    awk -v n="$frames" -v s="$seed" 'BEGIN {
+        x = s + 1
+        k = 0
+        for (i = 0; i < n; i++) {
+            for (c = 1; c <= 2; c++) {
+                x = (1103515245 * x + 12345) % 2147483648
+                v = int((x / 2147483648) * 32000) - 16000
+                if (v < 0) v += 65536
+                printf "\\%03o\\%03o", v % 256, int(v / 256) % 256
+                if (++k == 1024) { printf "\n"; k = 0 }
+            }
+        }
+        if (k) printf "\n"
+    }'
+}
+
+# mlib_make_pcm <path> <seed> [frames]
+#   Writes frames*4 raw bytes (stereo/16-bit little-endian signed) at <path>, then
+#   verifies the LENGTH ITSELF. That check is the point of this function: flac only
+#   reports a 4-alignment violation indirectly, as a bare "ERROR: got partial
+#   sample" naming the temp file, so a length bug reads like a flac problem. Here
+#   it fails with both byte counts and the reason.
+#
+#   The `while read` + `printf '%b'` consumer (rather than one big `printf '%b' "$var"`)
+#   keeps memory bounded and shellcheck's SC2059 quiet, and `|| [ -n "$line" ]`
+#   handles a final line with no trailing newline. Both printfs are bash builtins,
+#   so no locale conversion happens anywhere on the path.
+mlib_make_pcm() {
+    local path="$1" seed="$2" frames="${3:-30000}"
+    local want=$(( frames * 4 )) got line
+    mkdir -p "$(dirname "$path")"
+    if ! mlib_pcm_escapes "$seed" "$frames" \
+        | while IFS= read -r line || [ -n "$line" ]; do printf '%b' "$line"; done > "$path"; then
+        rm -f "$path"
+        mlib_fail "could not write PCM to $path"
+    fi
+    got=$(wc -c < "$path")
+    if [ "$got" -ne "$want" ]; then
+        rm -f "$path"
+        mlib_fail "$path is $got bytes, expected $want ($frames stereo 16-bit frames);
+        the PCM generator emitted a non-4-aligned stream, which real flac rejects"
+    fi
+    return 0
+}
+
 # mlib_make_flac <path> <seed> [frames]
 #   Writes a REAL, decodable FLAC file from deterministic PCM. --force-raw-format
-#   keeps this dependent only on flac itself (no sox/ffmpeg): the PCM is produced
-#   by a seeded awk so two sandboxes can be made byte-identical for the
+#   keeps this dependent only on flac itself (no sox/ffmpeg): the PCM comes from the
+#   seeded generator above, so two sandboxes can be made byte-identical for the
 #   equivalence check. Default length is ~0.7s of stereo/16-bit/44.1kHz - long
 #   enough that a truncation is genuinely undecodable, short enough that a suite of
 #   them stays well under a second.
@@ -128,18 +192,7 @@ mlib_make_flac() {
     local path="$1" seed="$2" frames="${3:-30000}"
     local pcm
     pcm="$(mktemp "${TMPDIR:-/tmp}/flac_pcm_XXXXXX")"
-    # Deterministic 16-bit signed samples in [-16000,16000) from the seed.
-    awk -v n="$frames" -v s="$seed" 'BEGIN {
-        x = s + 1
-        for (i = 0; i < n; i++) {
-            for (c = 1; c <= 2; c++) {
-                x = (1103515245 * x + 12345) % 2147483648
-                v = int((x / 2147483648) * 32000) - 16000
-                if (v < 0) v += 65536
-                printf "%c%c", v % 256, int(v / 256) % 256
-            }
-        }
-    }' > "$pcm"
+    mlib_make_pcm "$pcm" "$seed" "$frames"
     mkdir -p "$(dirname "$path")"
     flac --force-raw-format --endian=little --sign=signed --channels=2 --bps=16 \
         --sample-rate=44100 --silent --force -o "$path" "$pcm" \
