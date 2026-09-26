@@ -149,12 +149,19 @@ all_run() {
     RUN_SECS=$((SECONDS - start))
 }
 
-# assert_peak <expected> <label> : the run just executed used exactly <expected>
-# re-encodes at once. This is the assertion that can fail a degraded pool, so it
-# is checked together with the record count that proves the probe ran at all.
+# assert_peak <expected_peak> <label> <expected_records>
+# The run just executed used exactly <expected_peak> invocations at once, and the
+# probe saw <expected_records> invocations in total. This is the assertion that
+# can fail a degraded pool, so it is checked together with the record count that
+# proves the probe ran at all.
+#
+# <expected_records> is a parameter rather than the $FILE_COUNT global because
+# the same helper now serves two operations: a reencode run drives one stub
+# invocation per file, while a run that both scans and re-encodes would see two.
+# Making it explicit keeps each section's expectation readable at its call site.
 assert_peak() {
-    [ "$(probe_records)" -eq "$FILE_COUNT" ] \
-        || _fail "$2: probe saw $(probe_records) reencode(s), expected $FILE_COUNT"
+    [ "$(probe_records)" -eq "$3" ] \
+        || _fail "$2: probe saw $(probe_records) invocation(s), expected $3"
     [ "$(probe_peak)" -eq "$1" ] \
         || _fail "$2: peak concurrency was $(probe_peak), expected $1"
     [ "$(probe_slots_left)" -eq 0 ] \
@@ -202,7 +209,7 @@ SHARDS_AFTER_SEQ=$(count_find "$LIB/.flac_scan_data" -type f \
 # Peak concurrency of exactly 1 is the measured form of "runs fully inline": no
 # two reencodes were ever in flight together. The absence of shards above is a
 # proxy for that; this is the direct observation.
-assert_peak 1 'jobs=1'
+assert_peak 1 'jobs=1' "$FILE_COUNT"
 
 ###############################################################################
 # Run 2: the same work with 4 workers
@@ -270,7 +277,7 @@ done
 # would still be "faster than serial", would still reencode every file exactly
 # once, and would still produce a correct DB -- only the measured occupancy
 # distinguishes it from a working 4-worker pool.
-assert_peak 4 'jobs=4'
+assert_peak 4 'jobs=4' "$FILE_COUNT"
 
 
 
@@ -329,7 +336,7 @@ occur_re 'Workers: 3 \(from FLAC_HEALTH_JOBS\)'
 # ...and it reached the POOL, not just the banner: with 'jobs: 1' in the config
 # the measured occupancy must be 3. A regression that printed the env's value
 # while still honouring the config's would pass every other check in this block.
-assert_peak 3 'FLAC_HEALTH_JOBS=3'
+assert_peak 3 'FLAC_HEALTH_JOBS=3' "$FILE_COUNT"
 # A non-numeric override must not reach the pool as a worker count, which would
 # break the arithmetic that keeps the pool full; the run falls back and still
 # processes everything.
@@ -339,3 +346,134 @@ run_script_env "$SBX" 'FLAC_HEALTH_JOBS=not-a-number' -- '4' 'REENCODE ALL' ''
 occur_re "Processing $FILE_COUNT file\\(s\\) with [0-9]+ worker\\(s\\)"
 [ "$(captured_count 'Successful reencodes: ([0-9]+)')" -eq "$FILE_COUNT" ] \
     || _fail "bad FLAC_HEALTH_JOBS: not every file was reencoded"
+[ "$(captured_count 'Successful reencodes: ([0-9]+)')" -eq "$FILE_COUNT" ] \
+    || _fail "bad FLAC_HEALTH_JOBS: not every file was reencoded"
+
+###############################################################################
+# Run 4: the SCAN path (option 1) is pooled too -- same pool, different worker
+#
+# A scan reuses the reencode pool's scheduler, so it must inherit the same
+# guarantees. The two contract points that are specific to it:
+#
+#   * the scan is READ-ONLY, so there is nothing to complete or mirror; what
+#     matters is that every file is verified exactly once (probe record count),
+#     and that occupancy tracks 'jobs' just as it does for a reencode;
+#   * its OUTPUT must not depend on the pool's completion order. Errors are
+#     replayed in file (dispatch) order, so the CSV manifest - the machine-
+#     readable input to option 2 - is identical whatever the worker count.
+#     That is asserted by running the same library at jobs=1 and jobs=4 and
+#     requiring the two CSVs to match byte for byte.
+###############################################################################
+
+# Fixture: 6 clean files plus 2 corrupt ones, so the CSV has more than one row
+# and their ORDER is therefore observable. 'corrupt' is what the stub's verify
+# path keys on (see tests/stub_flac); the reencode path is never reached here,
+# so the trailing payload is irrelevant.
+SCAN_COUNT=8
+SCAN_BAD=(3 6)
+scan_fixture() {
+    local i
+    rm -rf "$LIB"
+    mkdir -p "$LIB/Album"
+    for i in $(seq 1 "$SCAN_COUNT"); do
+        if [[ " ${SCAN_BAD[*]} " == *" $i "* ]]; then
+            write_file "$LIB/Album/bad$i.flac" "payload-$i:CORRUPT"
+        else
+            write_file "$LIB/Album/ok$i.flac" "payload-$i"
+        fi
+    done
+}
+
+# scan_csv : the single scan report CSV from the most recent run ('' if none).
+scan_csv() {
+    find "$LIB/.flac_scan_data/reports" -type f -name 'flac_scan_*.csv' -print 2>/dev/null \
+        | head -n1
+}
+
+# scan_run <jobs> <out_var> : run option 1 with <jobs> workers and copy the
+# resulting CSV to the file named by <out_var>. Runs in the CURRENT shell (see
+# all_run) so run_script_env's output variables survive.
+scan_run() {
+    local jobs="$1"
+    local out_var="$2"
+    local csv
+    set_jobs "$jobs"
+    scan_fixture
+    probe_reset
+    run_script_env "$SBX" "STUB_FLAC_TEST_SLEEP=$STUB_SLEEP" \
+        "STUB_FLAC_SLOT_DIR=$PROBE" -- '1' '' ''
+    csv="$(scan_csv)"
+    [ -n "$csv" ] || _fail "scan at jobs=$jobs: expected a CSV report for a corrupt library"
+    cp "$csv" "$SBX/scan_$out_var.csv"
+    printf -v "$out_var" '%s' "$SBX/scan_$out_var.csv"
+}
+
+SCAN_SEQ_CSV=''
+SCAN_PAR_CSV=''
+
+echo "  .. jobs=1 scan run (${SCAN_COUNT} files)"
+scan_run 1 SCAN_SEQ_CSV
+[ "$(captured_count 'Scanned ([0-9]+) files')" -eq "$SCAN_COUNT" ] \
+    || _fail "jobs=1 scan: scanned count != $SCAN_COUNT"
+[ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \
+    || _fail "jobs=1 scan: expected exactly ${#SCAN_BAD[@]} error lines"
+# Sequential scan renders its historical plain-text bar line.
+occur_re 'Progress: \[#+-*\]'
+# A scan must not announce workers it is not using: the marker appears only
+# when jobs > 1, so its absence here is part of the jobs=1 contract.
+absent_re 'Scanning with [0-9]+ worker\(s\)'
+# Read-only: the scan creates no shard and no backup.
+[ "$(count_find "$LIB/.flac_scan_data" -type f \
+        \( -name '*_w*.scan' -o -name '*_w*.log' -o -name '*.result' \) )" -eq 0 ] \
+    || _fail "jobs=1 scan: scan left worker shards behind"
+assert_peak 1 'jobs=1 scan' "$SCAN_COUNT"
+
+echo "  .. jobs=4 scan run (${SCAN_COUNT} files)"
+scan_run 4 SCAN_PAR_CSV
+occur_re 'Scanning with 4 worker\(s\)'
+[ "$(captured_count 'Scanned ([0-9]+) files')" -eq "$SCAN_COUNT" ] \
+    || _fail "jobs=4 scan: scanned count != $SCAN_COUNT"
+[ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \
+    || _fail "jobs=4 scan: expected exactly ${#SCAN_BAD[@]} error lines"
+[ "$(captured_count 'Found ([0-9]+) errors')" -eq "${#SCAN_BAD[@]}" ] \
+    || _fail "jobs=4 scan: error tally != ${#SCAN_BAD[@]}"
+# The pool is really used: 4 verifies were in flight at once.
+assert_peak 4 'jobs=4 scan' "$SCAN_COUNT"
+
+# THE ORDERING CONTRACT: the CSV is identical whether the scan ran with 1 worker
+# or 4. This is what fails if the finished workers' shards are concatenated in
+# completion order instead of being replayed by dispatch id, and it is checked
+# on the file that option 2 actually consumes.
+#
+# Only the DATA rows are compared: the two runs happen at different wall-clock
+# times, so the '# Scan Report ... <timestamp>' comment legitimately differs.
+tail -n +2 "$SCAN_SEQ_CSV" > "$SBX/seq_rows.txt"
+tail -n +2 "$SCAN_PAR_CSV" > "$SBX/par_rows.txt"
+diff -u "$SBX/seq_rows.txt" "$SBX/par_rows.txt" > "$SBX/rows.diff" 2>&1 \
+    || _fail "jobs=4 scan CSV rows differ from the jobs=1 rows (order not preserved)"
+# ...and the rows really are the corrupt files, in the library's own order, so
+# the equality above is not two identically-wrong files.
+BAD_ROWS=$(grep -c '^"' "$SCAN_PAR_CSV")
+[ "$BAD_ROWS" -eq "${#SCAN_BAD[@]}" ] \
+    || _fail "jobs=4 scan CSV has $BAD_ROWS data row(s), expected ${#SCAN_BAD[@]}"
+for n in "${SCAN_BAD[@]}"; do
+    grep -Fq "\"$LIB/Album/bad$n.flac\"" "$SCAN_PAR_CSV" \
+        || _fail "jobs=4 scan CSV is missing bad$n.flac"
+done
+
+# A clean library must still leave no CSV and no shards when scanned in
+# parallel: the report-removal path has to run on the pooled branch too.
+set_jobs 4
+rm -rf "$LIB"
+mkdir -p "$LIB/Album"
+write_file "$LIB/Album/clean.flac" 'PRISTINE'
+probe_reset
+run_script_env "$SBX" -- '1' '' ''
+occur_re 'No errors found'
+[ -z "$(scan_csv)" ] || _fail "jobs=4 clean scan left a CSV behind"
+[ "$(count_find "$LIB/.flac_scan_data" -type f \
+        \( -name '*_w*.scan' -o -name '*_w*.log' -o -name '*.result' \) )" -eq 0 ] \
+    || _fail "jobs=4 clean scan left worker shards behind"
+
+echo "ok: case_parallel (scan path pooled, order preserved)"
+

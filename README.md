@@ -11,9 +11,9 @@ backup of every original it replaces.
   - the files listed in the latest scan report
   - every FLAC file in the library (with a confirmation prompt)
   - only files that have not been re-encoded before
-- **Parallel by file**: several files are re-encoded at once, which is what makes
-  a large library bearable. The worker count is configurable (see
-  [Parallel re-encodes](#parallel-re-encodes)); the default is `min(4, nproc)`
+- **Parallel by file**: the scan and every re-encode run several files at once,
+  which is what makes a large library bearable. The worker count is configurable
+  (see [Parallel runs](#parallel-runs)); the default is `min(4, nproc)`
 - **Backups outside the library**: each original is mirrored into a backup
   directory that copies the library's layout, so no media scanner ever indexes a
   backup as a duplicate track
@@ -83,12 +83,12 @@ Both paths must be absolute, and trailing slashes are accepted on either.
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `jobs` | no | How many files to re-encode at once. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`. `1` means strictly sequential. See [Parallel re-encodes](#parallel-re-encodes). |
+| `jobs` | no | How many files to handle at once, for **both** re-encoding and scanning. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`. `1` means strictly sequential. See [Parallel runs](#parallel-runs). |
 
-## Parallel re-encodes
+## Parallel runs
 
 Re-encoding is CPU- and I/O-heavy but `flac` itself is single-threaded per file,
-so the script parallelises **across files**: options 2, 4 and 5 keep several
+so the script parallelises **across files**: options 1, 2, 4 and 5 keep several
 files in flight at once. The worker count is resolved per run, in this order:
 
 1. `FLAC_HEALTH_JOBS` — a per-run environment override, handy for one-off runs:
@@ -99,6 +99,11 @@ files in flight at once. The worker count is resolved per run, in this order:
 3. `min(4, nproc)` — a deliberately modest default
 
 `jobs: 1` runs strictly sequentially, one file at a time.
+
+Both operations share one knob and one worker pool. A **scan** is read-only and
+needs no temp files, backups or database writes, so it is the most parallel-
+friendly thing the script does, and it gets the same scheduler as a re-encode.
+What differs is only the per-file work: `flac -t` instead of a re-encode.
 
 ### What is safe about it
 
@@ -114,6 +119,9 @@ files in flight at once. The worker count is resolved per run, in this order:
   through a single path rather than having every worker append concurrently.
 - **A failure is contained.** One file failing (including a `--decode-through-errors`
   file with a long tail) does not stop or corrupt the others.
+- **Output order does not depend on the pool.** A parallel run's per-file lines
+  are replayed in file order once the workers are done, so a captured run reads
+  the same however many workers it used.
 
 Each worker writes to its own shard file and the parent folds the shards back
 together when the run ends, so the run log and the tracking database end up
@@ -196,8 +204,9 @@ To find every file a run touched, check the run log written to
 
 While a parallel run is in progress the script also uses a transient `seed/` and
 `shards/` directory here for its work list and per-worker buffers. Both are
-removed when the run finishes; nothing in `.flac_scan_data/` is ever scanned,
-re-encoded or backed up.
+removed when the run finishes — a scan uses the work list and the per-worker
+failure lists but never the `seed/` — and nothing in `.flac_scan_data/` is ever
+scanned, re-encoded or backed up.
 
 Re-encoded originals are **not** written here; they go to the backup directory
 described in [Backups](#backups).
@@ -234,16 +243,18 @@ sandbox. It runs in CI on every push and pull request. If you change the
 
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the parallel path instead. It uses the
-`STUB_FLAC_SLEEP` knob in `tests/stub_flac` to hold stub re-encodes open, which
-lets it assert that work actually overlaps, that a parallel run is faster than
-the sequential one, and that the merged log and tracking database are identical
-either way.
+`STUB_FLAC_SLEEP` knob in `tests/stub_flac` to hold stub re-encodes open — and
+`STUB_FLAC_TEST_SLEEP` to do the same for the stub's `flac -t` — which lets it
+assert that work actually overlaps, that a parallel run is faster than the
+sequential one, and that the merged log and tracking database are identical
+either way. It covers the pooled **scan** as well as the pooled re-encode,
+including that a scan's CSV report is byte-identical at `jobs=1` and `jobs=4`.
 
 The same case measures peak concurrency directly rather than inferring it from
-wall-clock time: with `STUB_FLAC_SLOT_DIR` set, each stub re-encode claims the
+wall-clock time: with `STUB_FLAC_SLOT_DIR` set, each stub invocation claims the
 lowest numbered free slot directory (an atomic `mkdir`) and holds it until it
 exits, so the highest rank claimed *is* the peak number of simultaneous
-re-encodes. That is what makes the case able to fail a pool silently degraded to
+operations. That is what makes the case able to fail a pool silently degraded to
 2 or 3 workers, which a timing comparison cannot distinguish from a healthy one.
 The wall-clock check is kept as a smoke test for a pool providing no concurrency
 at all.

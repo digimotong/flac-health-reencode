@@ -22,24 +22,37 @@
 # observe real overlap: without a delay a stub reencode finishes in under a
 # millisecond and even a serial implementation can look parallel.
 #
+# STUB_FLAC_TEST_SLEEP (optional, seconds) does the same for the VERIFY path
+# ('flac -t'), which is what a scan drives. A scan case needs it for the same
+# reason: an instantaneous stub verify finishes before the parent can even fork
+# the next worker, so even a perfectly parallel scan would never show more than
+# one worker in flight. Kept separate from STUB_FLAC_SLEEP so a case can slow
+# down one operation without touching the other.
+#
 # STUB_FLAC_SLOT_DIR (optional, directory) turns the stub into a CONCURRENCY
-# PROBE, and is what makes the parallel case's overlap assertion exact rather
-# than a proxy. When set, each re-encode claims the lowest-numbered free slot
+# PROBE, and is what makes the parallel cases' overlap assertion exact rather
+# than a proxy. When set, each invocation claims the lowest-numbered free slot
 # directory under it and holds it until exit:
 #
 #   * the claim is `mkdir`, which is atomic, so a process that wins slot N has
-#     PROVEN that N-1 sibling re-encodes were in flight at that same instant;
+#     PROVEN that N-1 siblings were in flight at that same instant;
 #   * therefore the highest rank anyone claims IS the peak concurrency, with no
 #     clock, no timestamp ordering, and no float comparison involved;
 #   * one record file per process (`<pid>.rank`) rather than a shared append, so
 #     concurrent writers can never interleave a partial line.
+#
+# The probe covers BOTH modes (verify and re-encode): it is claimed before the
+# '-t' branch so a parallel SCAN can be measured too. A case that mixes modes in
+# one run would therefore count them together, which is why the existing
+# reencode cases - whose fixtures contain no CORRUPT marker for the verify path
+# to be driven by the pool anyway - are unaffected.
 #
 # A leaked slot would inflate the next run's ranking, so the slot is released
 # from an EXIT trap: that fires on every exit path, including the failure return
 # for an unreadable input, where a plain trailing rmdir would be skipped.
 #
 # It is deliberately gated on the env var because the probe is only meaningful
-# for the parallel case; unset, it costs this stub a single `[ -n ]` test.
+# for the parallel cases; unset, it costs this stub a single `[ -n ]` test.
 ###############################################################################
 
 out=''
@@ -58,17 +71,9 @@ done
 # which silently joins multiple trailing words.
 infile="${*: -1}"
 
-if [[ " $* " == *' -t '* ]]; then
-    # Test mode.
-    if [ -f "$infile" ] && grep -q CORRUPT "$infile" 2>/dev/null; then
-        exit 1
-    fi
-    exit 0
-fi
-
-# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Placed after the -t early
-# return so verification passes are not counted as re-encode occupancy, and
-# before the sleep so the slot is held for the whole duration of this re-encode.
+# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Claimed BEFORE the mode
+# branches so a scan's verifies are measurable, and held for the whole duration
+# of this invocation.
 slot=''
 if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
     mkdir -p "$STUB_FLAC_SLOT_DIR"
@@ -86,6 +91,17 @@ if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
     slot="$STUB_FLAC_SLOT_DIR/$n"
     printf '%s\n' "$n" > "$STUB_FLAC_SLOT_DIR/$$.rank"
     trap 'rmdir "$slot" 2>/dev/null || true' EXIT
+fi
+
+if [[ " $* " == *' -t '* ]]; then
+    # Test mode (what a scan drives).
+    if [ -n "${STUB_FLAC_TEST_SLEEP:-}" ]; then
+        sleep "$STUB_FLAC_TEST_SLEEP"
+    fi
+    if [ -f "$infile" ] && grep -q CORRUPT "$infile" 2>/dev/null; then
+        exit 1
+    fi
+    exit 0
 fi
 
 # Hold this reencode open when asked, so a concurrent run has a window in which
