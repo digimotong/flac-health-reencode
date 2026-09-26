@@ -78,7 +78,10 @@ jobs:
               tests/helpers.sh \
               tests/stub_flac \
               tests/stub_metaflac \
-              tests/source_guard_units.sh; do
+              tests/source_guard_units.sh \
+              tests/manual/lib.sh \
+              tests/manual/run_manual.sh \
+              tests/manual/README.md; do
             if ! git ls-files --error-unmatch "$f" > /dev/null 2>&1; then
               echo "::error file=$f::$f is not tracked by git (check .gitignore allowlist)"
               missing=1
@@ -92,6 +95,16 @@ jobs:
               missing=1
             fi
           done < <(find tests -maxdepth 1 -name 'case_*.sh' | sort)
+          # Same guard for the real-flac manual harness. `!tests/*` in .gitignore
+          # does NOT descend into tests/manual/, so these need their own allowlist
+          # entries; without this loop a new harness script could be committed
+          # nowhere and the manual CI job would quietly run nothing.
+          while IFS= read -r manual_file; do
+            if ! git ls-files --error-unmatch "$manual_file" > /dev/null 2>&1; then
+              echo "::error file=$manual_file::$manual_file is not tracked by git (check .gitignore allowlist)"
+              missing=1
+            fi
+          done < <(find tests/manual -maxdepth 1 -type f | sort)
           if [ "$missing" -ne 0 ]; then
             echo "FAIL: required files are ignored by git; CI cannot see them."
             exit 1
@@ -126,4 +139,38 @@ jobs:
         # A hung or wildly slow lint must fail rather than burn the job's full
         # timeout; the suite lints in about a second locally.
         run: timeout 120 bash tests/lint.sh
+        shell: bash
+
+  # Real-flac verification: the one thing tests/run_tests.sh structurally cannot
+  # do, because it stubs flac/metaflac. This job installs the real package and
+  # drives the actual encoder over damaged audio.
+  #
+  # DELIBERATELY NOT A REQUIRED CHECK, and not added to REQUIRED_JOBS in
+  # tests/case_workflow_contract.sh: it depends on a third-party binary, real file
+  # permissions and real CPU time, so it is the kind of job that goes red for
+  # reasons that have nothing to do with this repository (an upstream flac
+  # regression, a runner without the package). Keeping `test` and `lint` hermetic
+  # means a required check can never be blocked by that. This job is a signal that
+  # a human or a release gate reads, and it must not gain the keys the contract
+  # test forbids on required jobs (`strategy:`, `name:`, `if:`, `needs:`).
+  manual-real-flac:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # jq/md5sum inspect the script's output; flac/metaflac are the real
+          # binaries under test (the harness SKIPs without them).
+          sudo apt-get install -y --no-install-recommends jq flac
+        shell: bash
+
+      - name: Run the real-flac manual harness
+        # Generous ceiling: scenarios are dominated by deliberate sleeps and real
+        # encoding, but an unbounded read/wait must still fail the job. The harness
+        # exits 0 when the real tools are absent, so a skip is visible in the log
+        # rather than a red build.
+        run: timeout 600 bash tests/manual/run_manual.sh
         shell: bash

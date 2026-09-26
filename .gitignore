@@ -14,3 +14,9 @@
 !.github/*
 !.github/workflows/
 !.github/workflows/*
+# tests/manual/ holds the real-flac harness. `!tests/*` does NOT descend into a
+# subdirectory, so the dir needs its own allowlist entries or it is silently
+# ignored by git - the same failure mode the workflow's tracked-files step exists
+# to catch. See tests/manual/README.md.
+!tests/manual/
+!tests/manual/*

@@ -50,6 +50,12 @@ run_lint "production script" flac_health_reencode.sh
 # since tests/source_guard_units.sh sources ../flac_health_reencode.sh.
 run_lint "test suite and stubs" tests/*.sh tests/stub_flac tests/stub_metaflac
 
+# The real-flac manual harness, linted under the same threshold as everything
+# else. It is not run by tests/run_tests.sh (it needs the flac package), but it
+# still has to stay clean, and a glob here means a new script is covered the
+# moment it is added.
+run_lint "manual harness" tests/manual/*.sh
+
 if [ "$rc" -ne 0 ]; then
     echo "FAIL: shellcheck reported diagnostics (see above)." >&2
     exit 1

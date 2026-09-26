@@ -134,6 +134,24 @@ Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 overlaps and that the merged log, CSV report and tracking database are identical
 at any worker count.
 
+### Manual verification (real `flac`)
+
+The suite above stubs `flac`/`metaflac`, so it proves the scheduler but never the
+audio. `tests/manual/` covers that gap with real binaries: it generates real FLACs,
+damages them, and checks that the repaired files verify, decode to identical
+samples, and that backups are byte-identical copies of the originals. It also
+interrupts a concurrent run mid-flight to prove no worker (or its `flac` child) is
+left running and no temp file survives.
+
+```bash
+bash tests/manual/run_manual.sh        # needs the real flac package
+```
+
+Without `flac`/`metaflac` installed every script reports `SKIP` and the runner
+exits 0, so this is optional locally. CI runs it in a separate, non-required job
+that installs the package. See `tests/manual/README.md` for what each script
+proves.
+
 ## Requirements
 
 - Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
