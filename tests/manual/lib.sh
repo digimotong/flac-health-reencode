@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 # lib.sh - shared helpers for the REAL-flac manual harness (tests/manual/).
 #
-# WHY THIS EXISTS, SEPARATE FROM tests/helpers.sh
-#   The main suite (tests/case_*.sh) stubs flac/metaflac, so it proves the
-#   scheduler/sharding logic but can never prove that a REAL flac round-trip
-#   preserves audio, that backups are byte-identical, or that a real concurrent
-#   run survives storage faults. This harness complements it by operating on real
-#   binaries and real files, but ONLY inside throwaway sandboxes under TMPDIR.
+# The main suite (tests/case_*.sh) stubs flac/metaflac, so it proves the scheduler and
+# sharding logic but can never prove that a REAL flac round-trip preserves audio, that
+# backups are byte-identical, or that a real concurrent run survives storage faults.
+# This harness complements it by operating on real binaries and real files, but ONLY
+# inside throwaway sandboxes under TMPDIR.
 #
-# CONTRACT WITH THE RUNNER (tests/manual/run_manual.sh)
-#   Each script sources this file, calls mlib_require_real_tools OR
-#   mlib_require_basic_tools, then does its work. A missing tool must print a
-#   single line beginning "SKIP:" and exit 0 - that is how the harness stays green
-#   in a container without flac while still being a real gate on a server. Any
-#   other non-zero exit is a FAIL.
+# CONTRACT WITH THE RUNNER (tests/manual/run_manual.sh): each script sources this file,
+# calls mlib_require_real_tools OR mlib_require_basic_tools, then does its work. A
+# missing tool must print a single line beginning "SKIP:" and exit 0 - that is how the
+# harness stays green in a container without flac while still being a real gate on a
+# server. Any other non-zero exit is a FAIL.
 #
-# NOT part of tests/run_tests.sh: the runner globs only tests/case_*.sh, so these
-# scripts never run in the stubbed CI suite. They are exercised by
-# tests/manual/run_manual.sh, which CI runs only in the (non-required) job that
-# installs the flac package - see .github/workflows/tests.yml.
+# NOT part of tests/run_tests.sh: the runner globs only tests/case_*.sh, so these scripts
+# never run in the stubbed CI suite. They are exercised by tests/manual/run_manual.sh,
+# which CI runs only in the (non-required) job that installs the flac package - see
+# .github/workflows/tests.yml.
 
 set -o errexit
 set -o nounset
@@ -26,14 +24,13 @@ set -o pipefail
 
 : "${PROD_SCRIPT:?lib.sh: PROD_SCRIPT must point at flac_health_reencode.sh}"
 
-# Every sandbox this harness creates, removed on EXIT. A failure anywhere must not
-# leave a synthetic library (and its backups) behind.
+# Every sandbox this harness creates, removed on EXIT. A failure anywhere must not leave
+# a synthetic library (and its backups) behind.
 #
-# The explicit `return 0` is load-bearing, not stylistic: this runs as an EXIT trap,
-# so its status BECOMES the script's exit status. When the list is empty (the SKIP
-# paths, which never create a sandbox) the `[ -n "$d" ] && rm -rf "$d"` line is
-# never reached by the loop, and without the `return 0` the trailing `done` leaves
-# the function at status 1 - turning every clean SKIP into a spurious FAIL.
+# The explicit `return 0` is load-bearing, not stylistic: this runs as an EXIT trap, so
+# its status BECOMES the script's exit status. When the list is empty (the SKIP paths,
+# which never create a sandbox) the loop body never runs, and without the `return 0` the
+# trailing `done` leaves the function at status 1 - turning every clean SKIP into a FAIL.
 MLIB_SANDBOXES=()
 mlib_cleanup() {
     local d
@@ -82,15 +79,13 @@ mlib_require_real_tools() {
 #       $sbx/backup/         (the configured backup root, an explicit sibling path)
 #       $sbx/flac_health_reencode.sh   (a COPY of the production script)
 #       $sbx/flac_health_config.json   (jobs: 1 by default; callers override)
-#   A copy of the script is used so CONFIG_FILE resolves INSIDE the sandbox
-#   (the script derives it from dirname $0), never the developer's real config.
+#   A copy of the script is used so CONFIG_FILE resolves INSIDE the sandbox (the script
+#   derives it from dirname $0), never the developer's real config.
 #
-#   The caller's variable is assigned through a NAME REFERENCE (`declare -n`). The
-#   CALLER MUST HAVE ASSIGNED IT FIRST (e.g. `local sbx=''`): under `set -u`, which
-#   lib.sh enables, a nameref to a declared-but-UNSET variable cannot be assigned,
-#   and neither can `printf -v`, so `local sbx` alone fails with a confusing
-#   "unbound variable". Every call site therefore starts the variable empty, and the
-#   harness fails loudly and early if one forgets.
+#   The caller's variable is assigned through a NAME REFERENCE (`declare -n`). The CALLER
+#   MUST HAVE ASSIGNED IT FIRST (e.g. `local sbx=''`): under `set -u`, which lib.sh
+#   enables, a nameref to a declared-but-UNSET variable cannot be assigned by `declare -n`
+#   or `printf -v`, so `local sbx` alone fails with a confusing "unbound variable".
 mlib_make_sandbox() {
     local -n _mlib_sandbox_target="$1"
     local -n _mlib_check="$1"
@@ -122,18 +117,14 @@ mlib_set_config() {
 #   ASCII-ONLY octal escapes ("\ddd" per octet, 1024 per line to stay readable).
 #   A consumer turns it back into raw bytes with `printf '%b'` (see mlib_make_pcm).
 #
-# WHY ESCAPES AND NOT `printf "%c", v` -- THE BUG THIS ENCODES AROUND
-#   The obvious byte emitter is `printf "%c%c", v % 256, int(v / 256) % 256`, and
-#   on a byte-oriented awk (mawk, i.e. Ubuntu's default) that is exactly one octet
-#   per conversion. But POSIX only requires %c to take the NUMERIC value of the
-#   argument as a character, and in a multibyte locale gawk reads that as a WIDE
-#   character, so it emits the whole UTF-8 sequence: for v % 256 = 233 that is two
-#   bytes (0xC3 0xA9) instead of one. Any octet >= 0x80 occurs constantly in this
-#   stream, so the PCM silently becomes longer than frames*4 bytes - not 4-aligned -
-#   and real flac rejects it with "ERROR: got partial sample", which is what made
-#   CI's manual-real-flac job fail while passing on containers whose awk is mawk.
-#   Escaping sidesteps the whole question: octal escapes and `printf '%b'` are
-#   byte-oriented by definition and cannot vary with the locale or the awk.
+# Escapes, not `printf "%c", v`: POSIX only requires %c to take the NUMERIC value of the
+# argument as a character, and in a multibyte locale gawk reads that as a WIDE character,
+# emitting the whole UTF-8 sequence - for v % 256 = 233 that is two bytes (0xC3 0xA9)
+# instead of one. Any octet >= 0x80 occurs constantly here, so the PCM silently becomes
+# longer than frames*4 bytes, i.e. not 4-aligned, and real flac rejects it with "ERROR:
+# got partial sample". mawk (Ubuntu's default) is byte-oriented and hides the bug, which
+# is why CI's manual-real-flac job failed while local containers passed. Octal escapes
+# and `printf '%b'` are byte-oriented by definition and cannot vary with the locale.
 mlib_pcm_escapes() {
     local seed="$1" frames="${2:-30000}"
     awk -v n="$frames" -v s="$seed" 'BEGIN {
@@ -155,14 +146,14 @@ mlib_pcm_escapes() {
 # mlib_make_pcm <path> <seed> [frames]
 #   Writes frames*4 raw bytes (stereo/16-bit little-endian signed) at <path>, then
 #   verifies the LENGTH ITSELF. That check is the point of this function: flac only
-#   reports a 4-alignment violation indirectly, as a bare "ERROR: got partial
-#   sample" naming the temp file, so a length bug reads like a flac problem. Here
-#   it fails with both byte counts and the reason.
+#   reports a 4-alignment violation indirectly, as a bare "ERROR: got partial sample"
+#   naming the temp file, so a length bug reads like a flac problem. Here it fails with
+#   both byte counts and the reason.
 #
 #   The `while read` + `printf '%b'` consumer (rather than one big `printf '%b' "$var"`)
-#   keeps memory bounded and shellcheck's SC2059 quiet, and `|| [ -n "$line" ]`
-#   handles a final line with no trailing newline. Both printfs are bash builtins,
-#   so no locale conversion happens anywhere on the path.
+#   keeps memory bounded and shellcheck's SC2059 quiet, and `|| [ -n "$line" ]` handles a
+#   final line with no trailing newline. Both printfs are bash builtins, so no locale
+#   conversion happens anywhere on the path.
 mlib_make_pcm() {
     local path="$1" seed="$2" frames="${3:-30000}"
     local want=$(( frames * 4 )) got line
@@ -182,12 +173,12 @@ mlib_make_pcm() {
 }
 
 # mlib_make_flac <path> <seed> [frames]
-#   Writes a REAL, decodable FLAC file from deterministic PCM. --force-raw-format
-#   keeps this dependent only on flac itself (no sox/ffmpeg): the PCM comes from the
-#   seeded generator above, so two sandboxes can be made byte-identical for the
-#   equivalence check. Default length is ~0.7s of stereo/16-bit/44.1kHz - long
-#   enough that a truncation is genuinely undecodable, short enough that a suite of
-#   them stays well under a second.
+#   Writes a REAL, decodable FLAC file from deterministic PCM. --force-raw-format keeps
+#   this dependent only on flac itself (no sox/ffmpeg): the PCM comes from the seeded
+#   generator above, so two sandboxes can be made byte-identical for the equivalence
+#   check. Default length is ~0.7s of stereo/16-bit/44.1kHz - long enough that a
+#   truncation is genuinely undecodable, short enough that a suite of them stays well
+#   under a second.
 mlib_make_flac() {
     local path="$1" seed="$2" frames="${3:-30000}"
     local pcm
@@ -201,8 +192,8 @@ mlib_make_flac() {
     return 0
 }
 
-# mlib_corrupt_truncate <flac_file> : drop the last ~6KB, destroying the frames
-# (and usually the trailing metadata), so 'flac -t' must fail.
+# mlib_corrupt_truncate <flac_file> : drop the last ~6KB, destroying the frames (and
+# usually the trailing metadata), so 'flac -t' must fail.
 mlib_corrupt_truncate() {
     local f="$1" size
     size=$(wc -c < "$f")
@@ -210,20 +201,19 @@ mlib_corrupt_truncate() {
     truncate -s "$(( size - 6000 ))" "$f"
 }
 
-# mlib_corrupt_bytes <flac_file> <offset> : overwrite 800 bytes starting at
-# <offset> with 0xFF, damaging frame data while leaving the file length intact.
-# Used alongside a truncation so one file fails by size and one by content.
+# mlib_corrupt_bytes <flac_file> <offset> : overwrite 800 bytes starting at <offset> with
+# 0xFF, damaging frame data while leaving the file length intact. Used alongside a
+# truncation so one file fails by size and one by content.
 mlib_corrupt_bytes() {
     local f="$1" off="$2"
     head -c 800 /dev/zero | tr '\0' '\377' \
         | dd of="$f" bs=1 seek="$off" count=800 conv=notrunc status=none
 }
 
-# mlib_corrupt_tail <flac_file> : flip the LAST 512 bytes to 0xFF, which damages
-# the trailing metadata/frame data a real decoder needs. Paired with the
-# truncation above it gives two independent damage modes, and unlike a fixed
-# offset it works on files of any length (a mid-file flip can land entirely in
-# padding and leave a short file decodable).
+# mlib_corrupt_tail <flac_file> : flip the LAST 512 bytes to 0xFF, which damages the
+# trailing metadata/frame data a real decoder needs. Paired with the truncation above it
+# gives two independent damage modes, and unlike a fixed offset it works on files of any
+# length (a mid-file flip can land entirely in padding and leave a short file decodable).
 mlib_corrupt_tail() {
     local f="$1" size
     size=$(wc -c < "$f")
@@ -233,13 +223,12 @@ mlib_corrupt_tail() {
 }
 
 # mlib_run_menu <sbx> <menu-line> [more lines...]
-#   Runs the sandbox script with the given menu answers, capturing combined output
-#   to $sbx/run.out. Always returns 0 so a caller can inspect output and status
-#   separately (status lands in mlib_last_status).
+#   Runs the sandbox script with the given menu answers, capturing combined output to
+#   $sbx/run.out. Always returns 0 so a caller can inspect output and status separately
+#   (status lands in mlib_last_status).
 #
-# mlib_last_status / the following function are the helper's public outputs (a
-# caller reads mlib_last_status after the call), so shellcheck's "appears unused"
-# (SC2034) does not apply within this file - the same note tests/helpers.sh makes
+# mlib_last_status is this helper's public output (a caller reads it after the call), so
+# an "appears unused" SC2034 finding does not apply - the same note tests/helpers.sh makes
 # about LAST_STATUS.
 # shellcheck disable=SC2034
 mlib_last_status=0
@@ -258,8 +247,8 @@ mlib_run_menu() {
 }
 
 # mlib_run_menu_bg <sbx> <out_file> [menu lines...]
-#   Like mlib_run_menu but in the background, echoing the PID. Used by the
-#   resilience script to interrupt a run mid-flight.
+#   Like mlib_run_menu but in the background, echoing the PID. Used by the resilience
+#   script to interrupt a run mid-flight.
 mlib_run_menu_bg() {
     local sbx="$1" out="$2"; shift 2
     printf '%s\n' "$@" | bash "$sbx/flac_health_reencode.sh" > "$out" 2>&1 &
@@ -288,8 +277,7 @@ mlib_assert_real_flac() {
 
 # mlib_assert_backup_matches <backup_file> <pristine_original>
 #   The backup must be a byte-for-byte copy of the ORIGINAL, not of the reencoded
-#   replacement. This is the whole point of the backup tree, and only a real run
-#   can check it.
+#   replacement - the whole point of the backup tree, and only a real run can check it.
 mlib_assert_backup_matches() {
     cmp -s "$1" "$2" \
         || mlib_fail "backup $1 is not byte-identical to the pristine original $2"
@@ -302,8 +290,8 @@ mlib_assert_no_residue() {
     n=$(mlib_count "$lib" -type f -name 'tmp_*.part')
     [ "$n" -eq 0 ] || mlib_fail "$n tmp_*.part file(s) left inside the library:
 $(find "$lib" -type f -name 'tmp_*.part' | sed 's/^/        /')"
-    # Names the pool's own artifacts. A failure lists them, because "13 files left
-    # behind" is not actionable without knowing WHICH kind survived.
+    # Names the pool's own artifacts. A failure lists them, because "13 files left behind"
+    # is not actionable without knowing WHICH kind survived.
     list=$(find "$lib/.flac_scan_data" -type f \
             \( -name '*_w*.log' -o -name '*_w*.db' -o -name '*_w*.result' \
                -o -name '*.index' -o -name '*.temps' -o -name '*.paths' \) \

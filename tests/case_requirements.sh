@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # case_requirements.sh - integration: the required-tool gate.
 #
-# At startup the script refuses to run unless 'flac' and 'metaflac' are on PATH,
-# and it must do so BEFORE any menu is drawn or any file is touched (the
-# `for cmd in flac metaflac jq` loop). Without this gate a partial install could
-# reach the reencode paths, where a missing 'flac' would fail per-file only after
-# 'metaflac' had been trusted for fingerprints.
+# At startup the script refuses to run unless 'flac' and 'metaflac' are on PATH, and it must
+# do so BEFORE any menu is drawn or any file is touched (the `for cmd in flac metaflac jq`
+# loop). Without this gate a partial install could reach the reencode paths, where a missing
+# 'flac' would fail per-file only after 'metaflac' had been trusted for fingerprints.
 #
 # Covered here:
 #   A. 'flac' absent  -> error names flac, status 1, no menu, no writes.
 #   B. 'metaflac' absent -> error names metaflac, status 1, no menu.
 #   C. Both absent    -> still exits 1 with the first missing tool's message.
-#   D. Both present (control) -> the menu DOES render, proving A-C fail for the
-#      stated reason and not because the sandbox is broken.
+#   D. Both present (control) -> the menu DOES render, proving A-C fail for the stated reason
+#      and not because the sandbox is broken.
+#   E-G. 'jq' absent is gated too, with a hint naming jq's own package.
 
 set -o errexit
 set -o nounset
@@ -25,8 +25,8 @@ set -o pipefail
 MENU_TITLE='FLAC Health Check & Reencode Script'
 
 # run_script_missing <sbx> <tool-to-hide> [stdin lines...]
-#   Like run_script, but the named stub is hidden from the child's PATH so the
-#   script's `command -v` probe fails for exactly that tool.
+#   Like run_script, but the named stub is hidden from the child's PATH so the script's
+#   `command -v` probe fails for exactly that tool.
 run_script_missing() {
     local sbx="$1" hidden="$2"; shift 2
     local bindir="$sbx/bin_nowrap"
@@ -47,19 +47,18 @@ run_script_missing() {
 }
 
 # run_script_missing_hermetic <sbx> <tool-to-hide> [stdin lines...]
-#   Sibling of run_script_missing for the tools that are NOT stubbed in $sbx/bin
-#   (jq): the child's PATH holds ONLY $sbx/bin_hermetic, so the tool under test
-#   is unreachable no matter where the host keeps it.
+#   Sibling of run_script_missing for the tools that are NOT stubbed in $sbx/bin (jq): the
+#   child's PATH holds ONLY $sbx/bin_hermetic, so the tool under test is unreachable no matter
+#   where the host keeps it.
 #
-#   Two deliberate details keep this hermetic without breaking the script under
-#   test:
-#     - The script is launched as /bin/bash, not as bare 'bash'. With PATH set to
-#       just $bindir, a bare 'bash' would not resolve, and the failure would be a
-#       shell error rather than the tool gate this case exists to exercise.
-#     - $bindir is seeded with the stubs plus the handful of REAL utilities the
-#       script legitimately touches on its way to the gate (dirname/realpath for
-#       CONFIG_FILE, cat/tr/grep for config probing). Everything else genuine
-#       stays out of reach, which is the point: jq must be absent here.
+#   Two deliberate details keep this hermetic without breaking the script under test:
+#     - The script is launched as /bin/bash, not as bare 'bash'. With PATH set to just
+#       $bindir, a bare 'bash' would not resolve, and the failure would be a shell error
+#       rather than the tool gate this case exists to exercise.
+#     - $bindir is seeded with the stubs plus the handful of REAL utilities the script
+#       legitimately touches on its way to the gate (dirname/realpath for CONFIG_FILE,
+#       cat/tr/grep for config probing). Everything else genuine stays out of reach, which is
+#       the point: jq must be absent here.
 run_script_missing_hermetic() {
     local sbx="$1" hidden="$2"; shift 2
     local bindir="$sbx/bin_hermetic"
@@ -124,9 +123,9 @@ SBX_NONE=''
 make_sandbox SBX_NONE
 register_sandbox "$SBX_NONE"
 
-# The script probes 'flac' first, so hiding both yields the flac message; the
-# check is repeated for metaflac so a future reorder of the probe loop cannot
-# silently change which tool is reported.
+# The script probes 'flac' first, so hiding both yields the flac message; the check is
+# repeated for metaflac so a future reorder of the probe loop cannot silently change which
+# tool is reported.
 run_script_missing "$SBX_NONE" flac 'q'
 occur_re "The 'flac' command is not installed"
 [ "$LAST_STATUS" -eq 1 ] || _fail "no tools exited $LAST_STATUS, expected 1"
@@ -153,11 +152,11 @@ occur_re "$MENU_TITLE"
 echo "ok: case_requirements (control: both tools present)"
 
 # ===========================================================================
-# E. 'jq' absent: the gate must catch it. jq is not stubbed in $sbx/bin and
-#    lives on the host, so the case runs the script against a hermetic PATH that
-#    holds the stubs plus the few real utilities the script needs pre-gate. The
-#    config is deliberately removed first: the interesting property is that the
-#    gate fires BEFORE anything creates one, so no zero-byte config is left.
+# E. 'jq' absent: the gate must catch it. jq is not stubbed in $sbx/bin and lives on the
+#    host, so the case runs the script against a hermetic PATH that holds the stubs plus the
+#    few real utilities the script needs pre-gate. The config is deliberately removed first:
+#    the interesting property is that the gate fires BEFORE anything creates one, so no
+#    zero-byte config is left.
 # ===========================================================================
 SBX_NOJQ=''
 make_sandbox SBX_NOJQ
@@ -171,16 +170,15 @@ absent_re "$MENU_TITLE"
 [ ! -e "$SBX_NOJQ/flac_health_config.json" ] \
     || _fail "no jq still created a config file"
 
-# F. The hint must name the tool's own package. A single hardcoded
-#    "apt-get install flac" (the pre-fix behaviour) would misdirect a user whose
-#    jq is missing, so the no-jq run must suggest jq. The flac hint itself is
-#    checked in case A, where flac is the reported tool: asserting it HERE would
-#    be wrong, since the jq message legitimately never mentions flac.
+# F. The hint must name the tool's own package. A single hardcoded "apt-get install flac"
+#    (the pre-fix behaviour) would misdirect a user whose jq is missing, so the no-jq run must
+#    suggest jq. The flac hint itself is checked in case A, where flac is the reported tool:
+#    asserting it HERE would be wrong, since the jq message legitimately never mentions flac.
 occur_re 'apt-get install jq'
 absent_re 'apt-get install flac'
 
-# G. Control for F: with every tool installed the hint itself never appears,
-#    so the F assertions above are about the failure path only.
+# G. Control for F: with every tool installed the hint itself never appears, so the F
+#    assertions above are about the failure path only.
 run_script "$SBX_OK" 'q'
 absent_re "apt-get install"
 [ "$LAST_STATUS" -eq 0 ] || _fail "jq-present control exited $LAST_STATUS, expected 0"

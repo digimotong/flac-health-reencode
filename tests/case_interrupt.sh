@@ -1,42 +1,21 @@
 #!/usr/bin/env bash
 # case_interrupt.sh - integration: a pooled run interrupted by a signal cleans up.
 #
-# WHY THIS CASE EXISTS (and why the stub suite could not skip it):
-#   _pool_interrupt_cleanup exists for the signal a terminal Ctrl-C does NOT cover.
-#   Ctrl-C signals the whole foreground process group, so the workers and their
-#   'flac' children die on their own and the handler is never really needed. A
-#   `kill -TERM <pid>`, a `systemctl stop` or a `pkill` signals ONLY the parent
-#   shell; without the handler the workers keep running, keep holding shards, and
-#   keep rewriting audio after the user believes the run stopped.
+# Signals the PARENT alone, which is the case _pool_interrupt_cleanup exists for: a
+# terminal Ctrl-C signals the whole foreground group, but a `kill -TERM`, `systemctl
+# stop` or `pkill` reaches only the shell, so without the handler the workers keep
+# running and keep rewriting audio. Covered otherwise only by the non-required
+# tests/manual/real_flac_resilience.sh scenario A.
 #
-#   Until now that behaviour was covered ONLY by tests/manual/real_flac_resilience.sh
-#   scenario A, which is NOT a required check (it needs real flac/metaflac and apt).
-#   So the strongest user-visible guarantee in this branch was protected by a job
-#   that can be ignored. This case moves the same contract into the REQUIRED suite.
+# Asserts: 1) the handler's diagnostic appears; 2) the parent exits 143 (128+TERM);
+# 3) the workers are killed promptly, not left to finish (checked against a sampled
+# process count); 4) this run's .part temps, shards, index, temp manifest and seed
+# list are gone; 5) the partial run log is KEPT; 6) a fresh run over the same library
+# completes with no failures. The DB may legitimately be short: an interrupted file
+# can be replaced while its DB row is still only in a shard.
 #
-# WHAT IS ASSERTED (the parent is signalled, never its process group):
-#   1. the handler runs: 'Interrupted (signal N)' reaches the output;
-#   2. the parent exits 128+signo (143 for TERM), not a stale 0;
-#   3. the workers are KILLED promptly, not merely left to finish: the parent is
-#      signalled in its own session (setsid), so the signal cannot reach a worker by
-#      process-group membership, and the live-process count is sampled from the
-#      handler's diagnostic onwards - a handler that stops killing them shows up as
-#      ~12 busy samples instead of 1-2;
-#   4. this run's artifacts are gone: in-library .part temps, the shard directory,
-#      the dispatch index, the temp manifest and the seed work list;
-#   5. the partial run log is KEPT - it is the audit trail of what the interrupt
-#      cut short, and the handler documents that on purpose;
-#   6. recovery: a fresh run over the same library completes with no failures,
-#      which is the property that actually matters afterwards. The interrupted run
-#      may have replaced audio whose DB row only ever reached a shard, so the DB is
-#      allowed to be short here - the script documents that an interrupted parallel
-#      run can leave files with no DB row, and option 5 then re-reencodes them
-#      (safe: an existing backup is never overwritten).
-#
-# Signal choice: TERM (15). INT is the terminal's job-control signal and is the one
-# a Ctrl-C delivers to the whole group anyway, so TERM is the case that proves the
-# handler is not merely leaning on group delivery. A HUP/INT regression would still
-# be caught, since all three share one registration.
+# TERM (15) is the signal under test because INT is what Ctrl-C delivers to the whole
+# group anyway; all three share one registration, so an INT/HUP regression is caught too.
 
 set -o errexit
 set -o nounset
@@ -52,33 +31,19 @@ set -o pipefail
 FILE_COUNT=8
 JOBS=4
 STUB_SLEEP=4
-# Sampling cadence for the survivor check. The stub reencode is held for STUB_SLEEP, so a
-# handler that fails to kill the workers leaves them running for the rest of that sleep
-# (~2.5s after the signal). The sampler below samples this often and stops at the first
-# quiet instant, so a healthy run records 1-2 samples and a leak records ~12: the gap is
-# what the assertion in section 3 turns into a pass/fail decision.
+# Sampling cadence for the survivor check (see section 3).
 SAMPLE_INTERVAL=0.2
-# Time to let the pool fork its workers and get them into the stub sleep. Kept
-# short so this case stays well inside the suite's per-case ceiling.
+# Time to let the pool fork its workers and get them into the stub sleep.
 PRE_SIGNAL_WAIT=1.5
 
-# The bound that turns the survivor series into a pass/fail decision, derived from the leak
-# it must separate so the two cannot drift apart when STUB_SLEEP changes. It is defined here,
-# after all three of its inputs, because `set -u` (nounset) applies to this file.
+# Upper bound on the busy samples a healthy run may record. Derived from the leak it
+# must separate, so the two cannot drift apart when STUB_SLEEP changes: the leak is the
+# rest of the stub's hold after the signal, (STUB_SLEEP - PRE_SIGNAL_WAIT) = 2.5s, and
+# the bound is 2/5 of it (~1.0s). Healthy runs record 1-2.
 #
-# The leak is the rest of the stub's hold AFTER the signal lands, i.e.
-# (STUB_SLEEP - PRE_SIGNAL_WAIT) = 2.5s here, which the mutation test measured as 13 samples
-# at a 0.2s cadence. The bound is 2/5 of that leak -> 5 samples (~1.0s of busy time), so a
-# healthy run (1-2 samples) has ~3 samples of headroom while a leak overshoots by ~2.6x.
-# The measured series is echoed on success at the end of section 3, so the margin is a
-# number in the log rather than a claim in a comment.
-#
-# Integer-only arithmetic (bash has no floats): both sides are scaled to milliseconds
-# (leak window *1000; interval split at the dot into whole seconds *1000 + a 3-digit
-# fraction), so 2500ms and a 200ms cadence divide to 12 samples, times 2/5 -> 4, rounded
-# up to the 5 above. A non-numeric interval, or a leak window of zero or less, would divide
-# by zero inside $(( )) under `set -e` and abort the case before its sampler ever ran, so
-# those fall back to the default explicitly.
+# Integer-only arithmetic (bash has no floats): the leak window and the cadence are both
+# scaled to milliseconds, and a non-numeric input or a non-positive leak falls back to the
+# default rather than dividing by zero inside $(( )) under `set -e`.
 MAX_BUSY_SAMPLES=5
 if [[ "$STUB_SLEEP" =~ ^[0-9]+$ && "$PRE_SIGNAL_WAIT" =~ ^[0-9]+(\.[0-9]+)?$ && "$SAMPLE_INTERVAL" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     # Leak window in milliseconds.
@@ -123,9 +88,8 @@ for i in $(seq 1 "$FILE_COUNT"); do
 done
 
 # set_jobs <n> : repoint the sandbox config at a different worker count. helpers.sh
-# pins 'jobs' to 1 for the sequential-anchor cases (see make_sandbox), and each
-# parallelism case owns its degree, so the override lives here as it does in
-# case_parallel.sh.
+# pins 'jobs' to 1 for the sequential-anchor cases, so each parallelism case owns its
+# degree.
 set_jobs() {
     printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1", "jobs": %s}\n' \
         "$LIB" "$BAKROOT" "$1" > "$SBX/flac_health_config.json"
@@ -135,20 +99,13 @@ set_jobs "$JOBS"
 # start_pooled <sbx> <out> : begin a jobs=4 option-4 run in the background with the
 #   stub reencode held open, and set RUN_PID to the script's PID.
 #
-# WHY setsid AND WHY IT IS THE WHOLE POINT OF THIS CASE:
-#   A plain `cmd &` in a non-interactive shell does NOT get its own process group -
-#   the workers inherit THIS shell's PGID. Signalling the script would then take the
-#   workers down as a side effect of group delivery, and the case would pass even
-#   with _pool_interrupt_cleanup's kills deleted, i.e. it would measure bash's job
-#   control instead of the product. (Measured: script+4 workers in one session ->
-#   killing the parent leaves 9 survivors; worker deaths come from the handler.)
-#   setsid puts the script in a NEW session, so the ONLY way a worker can receive
-#   the signal is from the handler that exists to send it. `--wait` makes the
-#   background job stay alive until the script exits, so `wait` below still works.
-#
-# setsid is util-linux, not coreutils, so its absence is reported as SKIP (the
-# established convention in run_tests.sh and the manual harness) rather than as a
-# failure of the product.
+# It runs under setsid, and that is the whole point of this case: a plain `cmd &` in a
+# non-interactive shell does NOT get its own process group, so the workers would
+# inherit THIS shell's PGID and signalling the script would take them down as a side
+# effect of group delivery - the case would pass even with the handler's kills deleted.
+# setsid puts the script in a new session, so the handler is the ONLY way a worker can
+# receive the signal. `--wait` keeps the background job alive until the script exits,
+# so `wait` below still works. setsid is util-linux, so its absence is a SKIP.
 RUN_PID=''
 start_pooled() {
     local sbx="$1" out="$2"
@@ -160,8 +117,7 @@ start_pooled() {
 
 # no_procs <sbx> : count processes whose command line mentions the sandbox.
 #   pgrep exits 1 when it matches nothing - which is the PASS condition - so it is
-#   guarded here rather than being left to trip this case's errexit (the same trap
-#   the residue checks below avoid).
+#   guarded here rather than being left to trip this case's errexit.
 no_procs() {
     local n=0
     while IFS= read -r _line; do n=$((n + 1)); done \
@@ -170,10 +126,8 @@ no_procs() {
 }
 
 # count_find <dir> [find args...] : number of matches, 0 when the dir is absent.
-#   Defined here as in case_parallel.sh (helpers.sh has no equivalent): a missing
-#   directory means the run cleaned up MORE than expected - a pass - so it reports 0
-#   instead of aborting, because under errexit + pipefail a bare `find <missing dir>`
-#   exits 1 and pipefail would propagate that and end the case.
+#   A missing directory means the run cleaned up MORE than expected - a pass - and
+#   under errexit + pipefail a bare `find <missing dir>` would exit 1 and end the case.
 count_find() {
     local dir="$1"; shift
     [ -d "$dir" ] || { echo 0; return 0; }
@@ -181,8 +135,7 @@ count_find() {
 }
 
 # setsid is what makes this case able to tell a working handler from a missing one
-# (see start_pooled). Without it the signal reaches the workers via process-group
-# membership and the case would pass regardless, so SKIP rather than a false PASS.
+# (see start_pooled), so SKIP rather than a false PASS without it.
 command -v setsid >/dev/null 2>&1 \
     || { echo "SKIP: setsid (util-linux) not available; cannot signal the parent alone"
          exit 0; }
@@ -209,12 +162,11 @@ grep -q 'Processing' "$INTERRUPT_OUT" \
 $(cat "$INTERRUPT_OUT")"
 sleep "$PRE_SIGNAL_WAIT"
 
-# Sanity-check the construction this case depends on: the workers must NOT be in
-# our process group, or the signal below would reach them directly and the process
-# assertion would be vacuous. Assert the property rather than trusting setsid.
-# Every command here is guarded: `grep -c` exits 1 on a zero count and `grep -qv`
-# exits 1 when nothing matches - both are the answers we WANT, and under this case's
-# errexit an unguarded one would silently end the case with no diagnostic.
+# Sanity-check the construction this case depends on: the workers must NOT be in our
+# process group, or the signal below would reach them directly and the process
+# assertion would be vacuous. Every command here is guarded, because `grep -c` exits 1
+# on a zero count and `grep -qv` exits 1 when nothing matches - both are the answers we
+# WANT, and under errexit an unguarded one would end the case with no diagnostic.
 own_pgid="$(ps -o pgid= -p "$parent_pid" 2>/dev/null | tr -d ' ' || true)"
 [ -n "$own_pgid" ] \
     || _fail "could not read the script's process group; it may have exited already"
@@ -225,42 +177,26 @@ if printf '%s\n' "$worker_pgids" | grep -qx "$$"; then
     _fail "worker(s) share this case's process group ($$); the interrupt signal would reach them directly and the process assertion would prove nothing"
 fi
 # At least one worker must exist at signal time, otherwise the run either finished
-# early (nothing to clean up) or the pool never forked, and the assertions below
-# would be vacuous rather than failing.
+# early (nothing to clean up) or the pool never forked, and the assertions below would
+# be vacuous rather than failing.
 [ -n "$worker_pgids" ] \
     || _fail "no workers were running when the signal was about to be sent; the interrupt would prove nothing (output:
 $(tail -5 "$INTERRUPT_OUT"))"
 
-# Start the survivor sampler BEFORE the signal, so it observes the whole window in
-# which a non-killed worker would still be running. It writes the number of
-# sandbox processes it sees, once per SAMPLE_INTERVAL, and is read after the parent
-# has exited.
+# Start the survivor sampler BEFORE the signal, so it observes the whole window in which
+# a non-killed worker would still be running. It records the sandbox process count once
+# per SAMPLE_INTERVAL, beginning at the handler's diagnostic - samples taken before that
+# legitimately see the parent plus every worker the pool is meant to be running - and
+# stops at the first quiet instant, or when a generous bound expires.
 #
-# WHY SAMPLING INSTEAD OF ONE CHECK AFTER `wait`: the parent's interrupt path is a
-# graceful drain (the dispatch loop's poll gate makes TERM flag a shutdown, so the
-# parent does not exit until its in-flight workers report). Measured with the worker
-# kills removed: all 9 processes are STILL ALIVE at every sample while the parent is
-# alive, and only vanish once the parent exits - so a check placed after `wait` sees
-# zero even on the leak. Timing the sampler to overlap the drain is what makes this
-# assertion able to tell the two cases apart.
+# Sampling rather than one check after `wait` is necessary: the interrupt path is a
+# graceful drain, so orphaned workers die the moment the parent exits, and a post-`wait`
+# check therefore sees zero even on a leak. Stopping the sampler at `wait` is wrong for
+# the mirror-image reason - a healthy run could record one non-quiet sample and fail.
+# The series' length is thus how long the sandbox stayed busy after the handler
+# announced itself, which is exactly the interval a missing kill turns into a leak.
 SAMPLE_FILE="$SBX/survivors.samples"
 : > "$SAMPLE_FILE"
-# The sampler starts RECORDING at the handler's diagnostic ('Interrupted (signal N):
-# stopping workers...') because samples taken before it legitimately see the parent plus
-# every worker the pool is meant to be running - those are not leaks.
-#
-# It then records until it observes a quiet (zero-process) instant, or until a generous
-# bound expires, whichever comes first. Two earlier designs were wrong and are recorded
-# here because the reasoning is not obvious:
-#   * one check after `wait` sees zero even on a leak: the interrupt path is a graceful
-#     drain, and the orphaned workers die the moment the parent exits;
-#   * a sampler killed as soon as `wait` returned could record a single non-quiet sample
-#     on a HEALTHY run (the parent exits within the same tick as its diagnostic), which
-#     fails a correct script.
-# Self-terminating on the first quiet instant avoids both: the recorded series shows how
-# long the sandbox stayed busy AFTER the handler announced itself, which is exactly the
-# interval a missing kill turns into the stub's remaining sleep (~2.5s at 0.2s sampling
-# = ~12 samples, versus 0-1 for a working handler).
 (
     while ! grep -q 'Interrupted (signal' "$INTERRUPT_OUT" 2>/dev/null; do
         sleep "$SAMPLE_INTERVAL"
@@ -287,11 +223,10 @@ else
     status=$?
 fi
 
-# The sampler is deliberately NOT stopped here. It is self-terminating (it exits on its
-# first quiet sample) and its bound is small, so waiting for it is both short and the
-# only way to observe the moment the orphans of a broken handler disappear - which is
-# after the parent has exited. Killing it at this point instead would freeze the series
-# at a single non-quiet sample on a healthy run, failing a correct script.
+# The sampler is deliberately NOT stopped here: it is self-terminating and its bound is
+# small, so waiting for it is short - and it is the only way to observe the moment the
+# orphans of a broken handler disappear, which is after the parent has exited. Killing it
+# now would freeze the series at a single non-quiet sample on a healthy run.
 wait "$sampler_pid" 2>/dev/null || true
 
 # ---- 1. the handler ran and said what happened -----------------------------
@@ -305,28 +240,18 @@ $(tail -20 "$INTERRUPT_OUT")"
 $(tail -20 "$INTERRUPT_OUT")"
 
 # ---- 3. the workers were STOPPED, not merely left to finish ----------------
-# THE CORE ASSERTION. The sampler records the number of live sandbox processes once per
-# SAMPLE_INTERVAL, starting at the handler's diagnostic, and stops at the first quiet
-# instant. So the LENGTH of that series is how long the sandbox stayed busy after the
-# handler announced it was stopping the workers:
-#   * a working handler kills them within a sample or two;
-#   * a handler that does not kill them leaves them running for the rest of the stub's
-#     sleep: STUB_SLEEP=4 with the signal at PRE_SIGNAL_WAIT=1.5 leaves 2.5s, which the
-#     mutation test below measured as 13 samples.
-# The bound below is MAX_BUSY_SAMPLES, derived from that same 2.5s leak (see its definition
-# at the top), so it sits far from both - and the series is echoed at the end of this
-# section whether it passes or fails, so the margin is a measured number in the log rather
-# than a claim in a comment, and a near-miss is diagnosable either way.
+# The series' LENGTH is how long the sandbox stayed busy after the handler's diagnostic:
+# a working handler stops the workers within a sample or two, while a handler that never
+# kills them leaves the stub's remaining 2.5s of work running (measured as 13 samples at
+# this cadence). MAX_BUSY_SAMPLES is derived from that same leak, so the bound sits far
+# from both. The series is echoed on success as well as failure, so the margin is a
+# number in the log rather than a claim here.
 #
-# MUTATION-TESTED (each mutant applied to the production script, this case re-run):
-#   * both worker kills neutered  -> CAUGHT ("stayed busy for 13 samples"); the leak is
-#     visible precisely BECAUSE the handler's `trap '' INT TERM HUP` stops the workers
-#     from reacting to the propagated signal, so they must be killed explicitly;
-#   * the re-entrancy disarm removed on its own -> SURVIVES, and correctly so: it disables
-#     no kill, and with no second signal arriving it has no observable effect. Recorded
-#     here so a future reader does not mistake it for a hole in this case;
-#   * the earlier, single-post-`wait` check that this replaced did NOT catch the killed-kill
-#     mutant at all - hence the sampling.
+# Mutation-tested: neutering BOTH worker kills is caught ("stayed busy for 13 samples") -
+# the leak is visible precisely because the handler's `trap '' INT TERM HUP` stops the
+# workers reacting to the propagated signal, so they must be killed explicitly. Removing
+# the re-entrancy disarm alone survives, correctly: it disables no kill and has no
+# observable effect without a second signal.
 samples="$(cat "$SAMPLE_FILE" 2>/dev/null || true)"
 sample_count="$(printf '%s\n' "$samples" | grep -c '[0-9]' || true)"
 [ "${sample_count:-0}" -ge 1 ] \
@@ -344,9 +269,8 @@ tail_after_zero="$(printf '%s\n' "$samples" | grep '[0-9]' | tail -n +"$((first_
 # And nothing may survive once the parent has fully exited.
 [ "$(no_procs "$SBX")" -eq 0 ] \
     || _fail "$(no_procs "$SBX") process(es) survived the interrupt entirely"
-# The measured margin, on SUCCESS as well as failure: how long the sandbox stayed busy
-# after the handler's diagnostic, against the bound. A healthy run is 1-2 of 5; a numeric
-# value approaching the bound is the early warning a pass/fail bit cannot give.
+# Echo the measured series even on success: a value approaching the bound is the early
+# warning a pass/fail bit cannot give.
 echo "  .. workers stopped after $first_zero of ${MAX_BUSY_SAMPLES} allowed busy samples (series: $(printf '%s ' "$samples"))"
 
 # ---- 4. this run's artifacts are all gone ----------------------------------

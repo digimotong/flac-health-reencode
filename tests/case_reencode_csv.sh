@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # case_reencode_csv.sh - integration: option 2 (problematic list from a CSV).
 #
-# Pre-seeds TWO scan CSVs: one stale, one NEWEST manual list. The manual list mixes
-# valid rows with rows the script must IGNORE (the '# Scan Report...' comment, the
-# 'filepath' header, a backup copy, an internal .flac_scan_data file). Only the
-# single real "problematic" file is reencoded:
+# Pre-seeds TWO scan CSVs: one stale, one NEWEST manual list. The manual list mixes valid rows
+# with rows the script must IGNORE (the '# Scan Report...' comment, the 'filepath' header, a
+# backup copy, an internal .flac_scan_data file). Only the single real "problematic" file is
+# reencoded:
 #   * the manual (newest) CSV is chosen, not the stale one
 #   * the count line reflects the 1 real row
-#   * its ORIGINAL BYTES are mirrored into the backup root (outside the library, at
-#     the album-relative path) and the file is replaced with reencoded content
+#   * its ORIGINAL BYTES are mirrored into the backup root (outside the library, at the
+#     album-relative path) and the file is replaced with reencoded content
 #   * backup + internal files stay untouched (never re-encoded, no db rows)
 #   * the reencoded real file is recorded in reencoded.db
 
@@ -28,9 +28,9 @@ LIB="$SBX/lib"
 REAL="$LIB/Album Big/worst.flac"                 # the one "problematic" real file
 BADBAK="$LIB/Album Big/backup_FLAC_originals/w2.flac"
 INTFILE="$LIB/.flac_scan_data/reports/x.flac"
-# Base dirs; ".flac_scan_data/" is created by the nested mkdir (its parent is the
-# library root). We place real albums, one backup dir, and a pre-existing report
-# that doubles as the "internal file candidate" location.
+# Base dirs; ".flac_scan_data/" is created by the nested mkdir (its parent is the library
+# root). We place real albums, one backup dir, and a pre-existing report that doubles as the
+# "internal file candidate" location.
 mkdir -p "$LIB/Album Big/backup_FLAC_originals" "$LIB/Album Big2" "$LIB/.flac_scan_data/reports"
 
 write_file "$REAL"   'orig-worst-bytes'
@@ -40,8 +40,11 @@ write_file "$LIB/Album Big2/other.flac" 'original-other'
 
 # Stale CSV (older mtime).
 RPT="$LIB/.flac_scan_data/reports"
-sleep 0.01   # ensure a distinct mtime ordering is unnecessary: sort is by mtime, so order creation below
+sleep 0.01
 printf '# Scan Report: stale\nfilepath\n"%s"\n' "$LIB/Album Big2/other.flac" > "$RPT/flac_scan_2020-01-01_00-00-00.csv"
+
+# The manual CSV must be strictly newer: selection is by mtime, so the gap keeps the
+# ordering unambiguous regardless of timestamp granularity.
 sleep 0.02
 
 # Newest manually-authored scan list: comment + header + REAL + backup + internal.
@@ -57,8 +60,8 @@ MANUAL="$RPT/flac_scan_manual.csv"
 run_script "$SBX" '2' 'Y' ''
 
 occur_re 'Latest scan CSV file found:.*flac_scan_manual\.csv'
-# Captured runs get the pool's per-file result lines replayed in file order; the
-# pre-pool "Processing file: <path>" dispatch line no longer exists.
+# Captured runs get the pool's per-file result lines replayed in file order; the pre-pool
+# "Processing file: <path>" dispatch line no longer exists.
 occur_re "SUCCESS: $REAL reencoded successfully"
 
 # Count lines (tee'd + printed to stdout): exactly 1 processed.
@@ -73,8 +76,8 @@ file_eq "$REAL" 'REENCODE_OK' || {
     echo "   (content after run: '$(cat "$REAL" 2>/dev/null)')" >&2
     _fail "real file was not replaced by reencode marker"
 }
-# ...its ORIGINAL bytes were mirrored into the backup root (outside the library,
-# at the same album-relative path)...
+# ...its ORIGINAL bytes were mirrored into the backup root (outside the library, at the same
+# album-relative path)...
 BAK="$SBX/lib_backup"
 file_eq "$BAK/Album Big/worst.flac" 'orig-worst-bytes' \
   || _fail "mirrored backup does not preserve the original"
