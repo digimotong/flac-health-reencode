@@ -4,12 +4,13 @@ Scans a FLAC music library for corrupted files, re-encodes them, and keeps a
 backup of every original it replaces.
 
 It runs `flac -t` over the whole library and writes the failures to a timestamped
-CSV report, then re-encodes with `flac --verify --decode-through-errors
---preserve-modtime` — losslessly, so timestamps survive. Files are processed
-several at a time (see [Configuration](#configuration)), which is what makes a
-large library bearable. Re-encoding is safe by default: each original is mirrored
-into a backup directory outside the library before it is replaced, and the
-replacement only lands once the new copy has been verified.
+CSV report, then re-encodes them with `flac --verify --compression-level-0
+--decode-through-errors --preserve-modtime` — the fastest compression level, and
+lossless, so the original timestamps survive. Files are processed several at a
+time (see [Configuration](#configuration)), which is what makes a large library
+bearable. Re-encoding is safe by default: each original is mirrored into a backup
+directory outside the library before it is replaced, and the replacement only
+lands once the new copy has been verified.
 
 ## Install & Run
 
@@ -33,7 +34,7 @@ accepts `q` as a shortcut for quitting.
 |--------|--------|-------|
 | `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. |
 | `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
-| `3` | Set/Update library path & backup directory | First-run setup. Validates that the backup destination is safe. |
+| `3` | Set/Update library path & backup directory | First-run setup; also sets the worker count. Validates that the backup destination is safe. |
 | `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
 | `5` | Reencode NEW FLAC files only | Skips files already recorded in the tracking database. Use it after an option 4 run to pick up newly added albums. |
 | `6` | Quit | Same as `q`. |
@@ -61,8 +62,8 @@ which is what option 5 skips.
 
 ## Configuration
 
-On first run the script creates `flac_health_config.json` next to itself.
-Set both paths from the menu, or edit the file directly:
+On first run the script creates `flac_health_config.json` next to itself. Option 3
+sets the paths and worker count from the menu, or edit the file directly:
 
 ```json
 {
@@ -76,17 +77,13 @@ Set both paths from the menu, or edit the file directly:
 |-----|----------|-------------|
 | `library_path` | yes | Absolute path to the FLAC library to scan and re-encode. |
 | `backup_path` | no | Absolute path for the mirrored originals. Left empty or absent, the script derives `<library_path>_backup` (a sibling of the library) and offers it as the default the first time you re-encode. Setting it explicitly is recommended when backup storage lives elsewhere, e.g. `/mnt/backup/music`. |
+| `jobs` | no | How many files to handle at once, for **both** re-encoding and scanning. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`; `1` means strictly sequential. Option 3 writes it, and `0` there removes it again. |
 | `version` | — | Written when the script creates the file; the script never reads it back, so leave it alone. |
 
-Both paths must be absolute, and trailing slashes are accepted on either.
-
-| Key | Required | Description |
-|-----|----------|-------------|
-| `jobs` | no | How many files to handle at once, for **both** re-encoding and scanning. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`. `1` means strictly sequential. |
-
-The worker count is resolved per run, in this order: `FLAC_HEALTH_JOBS` (a
-per-run environment override, e.g. `FLAC_HEALTH_JOBS=8 ./flac_health_reencode.sh`),
-then `jobs` in the config, then `min(4, nproc)`.
+Both paths must be absolute, and trailing slashes are accepted on either. The
+worker count is resolved per run, in this order: `FLAC_HEALTH_JOBS` (a per-run
+environment override, e.g. `FLAC_HEALTH_JOBS=8 ./flac_health_reencode.sh`), then
+`jobs` in the config, then `min(4, nproc)`.
 
 Re-encoding is CPU- and I/O-heavy but `flac` itself is single-threaded per file,
 so the script parallelises **across files**: options 1, 2, 4 and 5 keep several
@@ -97,9 +94,12 @@ only differs in the per-file work (`flac -t` instead of a re-encode).
 That is safe because a file is only ever handed to one worker, each worker writes
 to its own temp file and moves it into place atomically, and a failure is
 contained: one bad file (including a `--decode-through-errors` file with a long
-tail) does not stop or corrupt the others. Per-file lines are replayed in file
-order once the workers finish, so logs and the tracking database end up as they
-would in a sequential run.
+tail) does not stop or corrupt the others. An interrupt that reaches only the
+script — `kill -TERM`, a `systemctl stop`, not a terminal Ctrl-C — kills the
+workers and their `flac` children and sweeps this run's temps and shards, keeping
+its log as the audit trail. Per-file lines are replayed in file order once the
+workers finish, so logs and the tracking database end up as they would in a
+sequential run.
 
 Every file moves roughly three times its size through the filesystem (source
 read, temp write, backup copy), so the pool saturates your **storage** long before
@@ -132,30 +132,21 @@ sandbox. It runs in CI on every push and pull request. If you change the
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
 overlaps and that the merged log, CSV report and tracking database are identical
-at any worker count.
+at any worker count, and `tests/case_interrupt.sh` covers interrupt cleanup.
 
-### Manual verification (real `flac`)
-
-The suite above stubs `flac`/`metaflac`, so it proves the scheduler but never the
-audio. `tests/manual/` covers that gap with real binaries: it generates real FLACs,
-damages them, and checks that the repaired files verify with the real `flac -t`,
-keep the original bit depth/sample rate/channels, and carry exactly the audio still
-salvageable from the damaged bytes - truncation removes trailing frames outright,
-so the check is calibrated against `flac --decode-through-errors` itself rather than
-against the pristine original. The strongest claim, byte-identical decoded samples,
-is made only for an **intact** file re-encoded through option 4, where equality is
-actually achievable; backups are required to be byte-identical copies of the
-*damaged* originals they replaced. It also interrupts a concurrent run mid-flight to
-prove no worker (or its `flac` child) is left running and no temp file survives.
+Nothing above proves the audio, since `flac`/`metaflac` are stubs there.
+`tests/manual/` closes that gap against real binaries in `TMPDIR` sandboxes: it
+damages real FLACs and checks the repairs verify with `flac -t`, keep their bit
+depth / sample rate / channels, and carry exactly the audio still salvageable from
+the damaged bytes.
 
 ```bash
 bash tests/manual/run_manual.sh        # needs the real flac package
 ```
 
-Without `flac`/`metaflac` installed every script reports `SKIP` and the runner
-exits 0, so this is optional locally. CI runs it in a separate, non-required job
-that installs the package. See `tests/manual/README.md` for what each script
-proves.
+Without the package every script prints `SKIP` and exits 0, so this is optional
+locally; CI runs it in a separate, non-required job. See `tests/manual/README.md`
+for what each script proves.
 
 ## Requirements
 
