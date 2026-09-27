@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_new.sh - integration: option 5 (NEW FLAC files only)
+# case_reencode_new.sh - integration: option 5 (NEW FLAC files only).
 #
-# Three sequential menu runs in ONE library demonstrate incremental behaviour:
-#   run 1  : empty tracking DB  -> both known real files are "new", re-encoded,
-#            each written to reencoded.db, internal .flac_scan_data excluded,
-#            and each original mirrored into the backup root outside the library.
-#   run 2  : no changes         -> "All N FLAC files have already been
-#            reencoded"; nothing is reprocessed, DB unchanged.
-#   run 3  : a brand-new real file (with a different payload, hence a different
-#            fingerprint) is added -> exactly it is discovered as new and
-#            re-encoded (DB grows by one, nothing else is touched). A legacy
-#            in-library backup copy added at the same time is ignored.
-###############################################################################
+# Three menu runs in ONE library demonstrate incremental behavior:
+#   run 1  empty tracking DB -> both known real files are "new": re-encoded, each written
+#          to reencoded.db, the internal .flac_scan_data file excluded, and each original
+#          mirrored into the backup root outside the library.
+#   run 2  no changes -> "All N FLAC files have already been reencoded"; nothing
+#          reprocessed, DB unchanged.
+#   run 3  a brand-new real file (different payload, hence different fingerprint) is added
+#          -> exactly it is discovered and re-encoded (DB grows by one, nothing else
+#          touched). A legacy in-library backup copy added at the same time is ignored.
 
 set -o errexit
 set -o nounset
@@ -74,14 +71,14 @@ run_script "$SBX" '5' 'y' ''
 occur_re 'Found 1 new FLAC file\(s\) out of 3 total'
 [ "$(captured_count 'New files found: ([0-9]+)')" -eq 1 ] || _fail "new run3 reported != 1"
 
-# Still the ORIGINAL 2 unchanged, and the fresh one is now re-encoded; the
-# backup copy added above was NOT consumed by option 5.
+# Still the ORIGINAL 2 unchanged, and the fresh one is now re-encoded; the backup copy
+# added above was NOT consumed by option 5.
 file_eq "$R1" 'REENCODE_OK'
 file_eq "$R2" 'REENCODE_OK'
 file_eq "$LIB/Album New/added later.flac" 'REENCODE_OK'
 file_eq "$LIB/Album/backup_FLAC_originals/junk.flac" 'note-a-backup-copy-usually-present'
-# The fresh file's original went to the mirrored backup root; no legacy or
-# duplicate entry was added there (3 mirrored originals, one per real file).
+# The fresh file's original went to the mirrored backup root; no legacy or duplicate entry
+# was added there (3 mirrored originals, one per real file).
 file_eq "$SBX/lib_backup/Album New/added later.flac" 'completely-fresh-track-xyz'
 miss "$SBX/lib_backup/Album/backup_FLAC_originals"
 [ "$(find "$SBX/lib_backup" -type f | wc -l)" -eq 3 ] || _fail "backup root should hold exactly 3 mirrored originals"

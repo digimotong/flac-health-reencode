@@ -3,25 +3,14 @@
 Scans a FLAC music library for corrupted files, re-encodes them, and keeps a
 backup of every original it replaces.
 
-## Features
-
-- **Health scanning**: runs `flac -t` over the whole library and writes the
-  failures to a timestamped CSV report
-- **Three re-encode modes**:
-  - the files listed in the latest scan report
-  - every FLAC file in the library (with a confirmation prompt)
-  - only files that have not been re-encoded before
-- **Backups outside the library**: each original is mirrored into a backup
-  directory that copies the library's layout, so no media scanner ever indexes a
-  backup as a duplicate track
-- **Safe by default**: a file is only replaced after the new copy has been
-  verified, and never without a backup first; unsafe backup destinations are
-  refused
-- **Lossless re-encode**: `flac --verify --decode-through-errors` with
-  `--preserve-modtime`, so timestamps survive
-- **Resumable tracking**: successful re-encodes are recorded by FLAC audio MD5,
-  size and mtime in `.flac_scan_data/reencoded.db`
-- **Reporting**: color-coded progress, per-run logs, and a small JSON config
+It runs `flac -t` over the whole library and writes the failures to a timestamped
+CSV report, then re-encodes them with `flac --verify --compression-level-0
+--decode-through-errors --preserve-modtime` — the fastest compression level, and
+lossless, so the original timestamps survive. Files are processed several at a
+time (see [Configuration](#configuration)), which is what makes a large library
+bearable. Re-encoding is safe by default: each original is mirrored into a backup
+directory outside the library before it is replaced, and the replacement only
+lands once the new copy has been verified.
 
 ## Install & Run
 
@@ -38,29 +27,43 @@ directory.
 ## Usage
 
 Running the script draws a numbered menu; the table below is what each option
-does. The menu also prints the active library and backup directory, and accepts
-`q` as a shortcut for quitting.
+does. The menu also prints the active library, backup directory and worker count, and
+accepts `q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
 | `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. |
 | `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
-| `3` | Set/Update library path & backup directory | First-run setup. Validates that the backup destination is safe. |
+| `3` | Set/Update library path & backup directory | First-run setup; also sets the worker count. Validates that the backup destination is safe. |
 | `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
 | `5` | Reencode NEW FLAC files only | Skips files already recorded in the tracking database. Use it after an option 4 run to pick up newly added albums. |
 | `6` | Quit | Same as `q`. |
 
 Options 2, 4 and 5 always mirror each original into the configured backup
-directory before replacing it with the re-encoded copy.
+directory before replacing it with the re-encoded copy — the backup mirrors the
+library's layout (`<library>/Artist/Album/song.flac` →
+`<backup>/Artist/Album/song.flac`) and an existing backup is never overwritten,
+so the pristine original survives re-runs. Without a backup, a file is not
+re-encoded. To restore one, copy it back out of the backup tree over the
+re-encoded file. Verify your re-encodes and you can delete the whole backup tree
+in one go.
+
+The backup destination must be absolute and may not be the library, inside it,
+or a parent of it; all three are refused with an explanation. If the config has
+no `backup_path`, the script suggests `<library>_backup` and asks before using
+it (options 2 and 5) or just prints it (option 4).
 
 Files inside the script's own `backup_FLAC_originals/` folders (in-library
 backups written by older versions) and its `.flac_scan_data/` directory are never
-scanned, re-encoded or backed up.
+scanned, re-encoded or backed up. Re-encoded originals are **not** written inside
+the library either: `.flac_scan_data/` holds the CSV scan reports, the per-run
+re-encode logs and `reencoded.db`, the fingerprints of files already re-encoded —
+which is what option 5 skips.
 
 ## Configuration
 
-On first run the script creates `flac_health_config.json` next to itself.
-Set both paths from the menu, or edit the file directly:
+On first run the script creates `flac_health_config.json` next to itself. Option 3
+sets the paths and worker count from the menu, or edit the file directly:
 
 ```json
 {
@@ -74,96 +77,46 @@ Set both paths from the menu, or edit the file directly:
 |-----|----------|-------------|
 | `library_path` | yes | Absolute path to the FLAC library to scan and re-encode. |
 | `backup_path` | no | Absolute path for the mirrored originals. Left empty or absent, the script derives `<library_path>_backup` (a sibling of the library) and offers it as the default the first time you re-encode. Setting it explicitly is recommended when backup storage lives elsewhere, e.g. `/mnt/backup/music`. |
+| `jobs` | no | How many files to handle at once, for **both** re-encoding and scanning. Absent, non-numeric or `< 1` falls back to the default `min(4, nproc)`; `1` means strictly sequential. Option 3 writes it, and `0` there removes it again. |
 | `version` | — | Written when the script creates the file; the script never reads it back, so leave it alone. |
 
-Both paths must be absolute, and trailing slashes are accepted on either.
+Both paths must be absolute, and trailing slashes are accepted on either. The
+worker count is resolved per run, in this order: `FLAC_HEALTH_JOBS` (a per-run
+environment override, e.g. `FLAC_HEALTH_JOBS=8 ./flac_health_reencode.sh`), then
+`jobs` in the config, then `min(4, nproc)`.
 
-## Backups
+Re-encoding is CPU- and I/O-heavy but `flac` itself is single-threaded per file,
+so the script parallelises **across files**: options 1, 2, 4 and 5 keep several
+files in flight at once. Both operations share one knob and one pool — a scan is
+read-only and needs no temp files or backups, so it gets the same scheduler and
+only differs in the per-file work (`flac -t` instead of a re-encode).
 
-**Backups live outside the library.** The backup directory mirrors the library's
-layout, so a file at `<library>/2Pac/All Eyez on Me (1996)/01 - Ambitionz.flac`
-is backed up to `<backup>/2Pac/All Eyez on Me (1996)/01 - Ambitionz.flac`.
+That is safe because a file is only ever handed to one worker, each worker writes
+to its own temp file and moves it into place atomically, and a failure is
+contained: one bad file (including a `--decode-through-errors` file with a long
+tail) does not stop or corrupt the others. An interrupt that reaches only the
+script — `kill -TERM`, a `systemctl stop`, not a terminal Ctrl-C — kills the
+workers and their `flac` children and sweeps this run's temps and shards, keeping
+its log as the audit trail. Per-file lines are replayed in file order once the
+workers finish, so logs and the tracking database end up as they would in a
+sequential run.
 
-```
-/music/                              /music_backup/
-├── 2Pac/                            ├── 2Pac/
-│   └── All Eyez on Me (1996)/       │   └── All Eyez on Me (1996)/
-│       └── 01 - Ambitionz.flac  ──► │       └── 01 - Ambitionz.flac
-└── .flac_scan_data/                 └── (backup tree only)
-```
-
-Keeping originals out of the library has two practical benefits:
-
-- **No duplicate tracks.** Plex, Roon, Navidrome and friends index anything that
-  looks like audio; backups stored outside the library are ignored entirely.
-- **One-place cleanup.** Verify your re-encodes, then delete the whole backup
-  tree (`rm -rf /music_backup`) when you no longer need it.
-
-Rules enforced by the script:
-
-| Rule | Behavior |
-|------|----------|
-| Absolute path required | A relative answer (e.g. a stray `y` typed into the prompt) is refused instead of being resolved against the working directory and scattering backups unpredictably. |
-| No overlap with the library | The backup directory may not be the library, inside it, or a parent of it — all three would destroy the originals or the library — so they are rejected with an explanation. |
-| Backups are never overwritten | If a backup already exists for a file, the existing one is kept so the pristine original survives re-runs; the re-encode still proceeds. |
-| No backup, no re-encode | If a file cannot be backed up it is not re-encoded — including files listed in a scan CSV that sit outside the library, which are skipped with a warning. |
-| Created only once you commit | The destination is created and write-probed *before* the first file is touched, and only after you confirm the run, so cancelling leaves no stray directory. A read-only or full destination aborts with nothing changed. Missing parent directories are created as needed. |
-
-### When the backup directory is not set yet
-
-If the config has no `backup_path`, the script suggests `<library>_backup` (a
-sibling of the library). Options 2 and 5 **ask** before using it and store the
-answer you accept, showing the suggestion as the prompt's default; option 4 does
-**not** interrupt, and only prints the destination in its warning panel. In every
-case nothing is written to the config here, so the menu keeps showing the path as
-derived until you set one explicitly with option 3.
-
-### Restoring an original
-
-Copy the file back out of the backup tree, overwriting the re-encoded version:
-
-```bash
-cp -p /music_backup/2Pac/All\ Eyez\ on\ Me\ \(1996\)/01\ -\ Ambitionz.flac \
-      "/music/2Pac/All Eyez on Me (1996)/01 - Ambitionz.flac"
-```
-
-To find every file a run touched, check the run log written to
-`<library>/.flac_scan_data/logs/`: it records `Backup created for: <original> ->
-<backup copy>` for each file.
-
-## What the Script Writes in Your Library
-
-```
-<library>/
-├── Artist/Album/
-│   └── song.flac
-└── .flac_scan_data/
-    ├── reports/                 # CSV scan reports
-    ├── logs/                    # per-run re-encode logs
-    └── reencoded.db             # fingerprints of re-encoded files
-```
-
-Re-encoded originals are **not** written here; they go to the backup directory
-described in [Backups](#backups).
+Every file moves roughly three times its size through the filesystem (source
+read, temp write, backup copy), so the pool saturates your **storage** long before
+it saturates the CPU. The default of 4 is a compromise that helps on spinning
+disks and NVMe alike without starving a media server reading the same library.
+Raise it on fast local storage; set `jobs: 1` if the library is on a slow network
+share where concurrent access makes things worse.
 
 ## Troubleshooting
 
 - `flac`, `metaflac` and `jq` are checked before the menu appears. A missing
   tool exits with status `1` and a message naming the command, so install it and
   run the script again.
-- A file that fails to re-encode is logged as `FAILURE` and left untouched: the
-  original is only replaced after the new copy is verified, and it can be
-  restored from the backup tree (see [Backups](#backups)).
-- `Error: The backup directory cannot be inside the library (...)` or `Error: The
-  backup directory must be an absolute path (...)` means the destination is
-  relative or overlaps the library. See [Backups](#backups) for the rules and
-  pick a path that is neither inside, equal to, nor a parent of the library.
-- Scan reports and per-run logs live in `.flac_scan_data/` inside your library,
-  so a failed run can be reviewed after the fact.
 
 ## Development
 
-Requires Bash 4.0+, `jq`, and `shellcheck` for linting.
+Requires Bash 4.3+, `jq`, and `shellcheck` for linting.
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -176,9 +129,28 @@ sandbox. It runs in CI on every push and pull request. If you change the
 `flac`/`metaflac` flags the script passes, update `tests/stub_flac` and
 `tests/stub_metaflac` to match.
 
+Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
+`tests/case_parallel.sh` covers the pooled one instead, asserting that work
+overlaps and that the merged log, CSV report and tracking database are identical
+at any worker count, and `tests/case_interrupt.sh` covers interrupt cleanup.
+
+Nothing above proves the audio, since `flac`/`metaflac` are stubs there.
+`tests/manual/` closes that gap against real binaries in `TMPDIR` sandboxes: it
+damages real FLACs and checks the repairs verify with `flac -t`, keep their bit
+depth / sample rate / channels, and carry exactly the audio still salvageable from
+the damaged bytes.
+
+```bash
+bash tests/manual/run_manual.sh        # needs the real flac package
+```
+
+Without the package every script prints `SKIP` and exits 0, so this is optional
+locally; CI runs it in a separate, non-required job. See `tests/manual/README.md`
+for what each script proves.
+
 ## Requirements
 
-- Bash 4.0+ (the script uses associative arrays)
+- Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
 - `flac` (which also provides `metaflac`) and `jq`
 
 ```bash

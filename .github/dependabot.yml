@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Keep the pinned actions current. Without this the SHA pins become stale
+  # Keep the pinned actions current: without this the SHA pins become stale
   # security liabilities rather than hardening.
   - package-ecosystem: github-actions
     directory: /
@@ -12,10 +12,9 @@ updates:
       actions:
         patterns:
           - "*"
-        # Majors are deliberately excluded: they are the updates most likely to
-        # need a workflow change (input removals, runner or Node bumps), so they
-        # stay as their own PR instead of riding along inside a bundle of
-        # routine bumps that looks safe to merge.
+        # Majors are excluded deliberately: they are the updates most likely to need
+        # a workflow change (input removals, runner or Node bumps), so they stay as
+        # their own PR instead of riding along inside a bundle of routine bumps.
         update-types:
           - "minor"
           - "patch"

@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-###############################################################################
-# case_reencode_guards.sh - integration: temp-file naming, backup preservation
-# and graceful menu return on error paths.
+# case_reencode_guards.sh - integration: temp-file naming, backup preservation and
+# graceful menu return on error paths.
 #
-# A. Temp-file guard (F1): a leftover reencode temp named 'tmp_<...>.part'
-#    (the post-fix temp extension) sitting in a real album dir is NOT library
-#    content -- a scan neither counts it nor flags it, even though its bytes
-#    contain the CORRUPT marker (a real *.flac with those bytes would be
-#    reported). This proves the temp naming keeps interrupted-run leftovers out
+# A. Temp-file guard: a leftover reencode temp named 'tmp_<...>.part' (the post-fix temp
+#    extension) in a real album dir is NOT library content - a scan neither counts nor
+#    flags it, even though its bytes contain the CORRUPT marker (a real *.flac with those
+#    bytes would be reported). Proves the temp naming keeps interrupted-run leftovers out
 #    of scans / reencode-NEW discovery.
-# B. Backup-preservation guard (F3): re-encoding the SAME file twice (as a
-#    re-run over the same CSV would) must NOT overwrite the original backup --
-#    the pristine first-reencode backup bytes survive the re-run. The backup now
-#    lives in the mirrored backup root outside the library.
-# C. Graceful-return guard (F4): choosing an option whose library path no
-#    longer exists returns to the main menu instead of hard-exiting the script.
-# D. Stale-residue guard (F1): a leftover 'tmp_*.part' from an interrupted run
-#    (which makes real flac's -o write refuse with "output file ... already
-#    exists") is cleared by the script before re-encoding, so a resumed full
-#    pass succeeds and leaves no residue to trip the run after it.
-###############################################################################
+# B. Backup-preservation guard: re-encoding the SAME file twice (as a re-run over the same
+#    CSV would) must NOT overwrite the original backup - the pristine first-reencode bytes
+#    survive, in the mirrored backup root.
+# C. Graceful-return guard: choosing an option whose library path no longer exists returns
+#    to the main menu instead of hard-exiting the script.
+# D. Stale-residue guard: a leftover 'tmp_*.part' from an interrupted run (which makes real
+#    flac's -o write refuse) is cleared before re-encoding, so a resumed full pass succeeds
+#    and leaves no residue to trip the run after it.
 
 set -o errexit
 set -o nounset
@@ -43,9 +38,9 @@ LIB="$SBX/lib"
 mkdir -p "$LIB/Album"
 
 write_file "$LIB/Album/good.flac"              'clean-audio'
-# A leftover reencode temp from a hypothetical interrupted run. Post-fix it is
-# named '*.part' (NOT '*.flac'), so even though it is corrupt-looking it must
-# never be discovered as library content.
+# A leftover reencode temp from a hypothetical interrupted run. Post-fix it is named
+# '*.part' (NOT '*.flac'), so even though it is corrupt-looking it must never be
+# discovered as library content.
 write_file "$LIB/Album/tmp_song.flac.part"     'partial:CORRUPT'
 
 run_script "$SBX" '1' ''
@@ -70,8 +65,8 @@ LIB2="$SBX2/lib"
 mkdir -p "$LIB2/Albums"
 write_file "$LIB2/Albums/song.flac" 'PRIMAL-ORIGINAL'
 
-# song.flac was reencoded -> now holds the stub marker; a backup now exists in
-# the MIRRORED backup root, outside the library (option 5 = NEW files).
+# song.flac was reencoded -> now holds the stub marker; a backup now exists in the
+# MIRRORED backup root, outside the library (option 5 = NEW files).
 run_script "$SBX2" '5' 'y' ''
 BACKUP2="$SBX2/lib_backup/Albums/song.flac"
 exist "$BACKUP2"
@@ -80,9 +75,9 @@ file_eq "$LIB2/Albums/song.flac" "$RE_MARKER"
 # No legacy in-library backup folder was created for the new backup.
 miss "$LIB2/Albums/backup_FLAC_originals"
 
-# Second reencode of the very same file (simulates a re-run: the file is no
-# longer 'new' only because option 4 reencodes everything, so use the full
-# pass). The re-run must NOT clobber the FIRST backup with the reencoded bytes.
+# Second reencode of the very same file (simulates a re-run: the file is no longer 'new',
+# so use the full option-4 pass). The re-run must NOT clobber the FIRST backup with the
+# reencoded bytes.
 run_script "$SBX2" '4' 'REENCODE ALL' ''
 file_eq "$BACKUP2" 'PRIMAL-ORIGINAL'   # STILL the pristine original
 file_eq "$LIB2/Albums/song.flac" "$RE_MARKER"
@@ -103,13 +98,13 @@ printf '{"library_path": "%s", "backup_path": "%s"}\n' \
 
 run_script "$SBX3" '2' '' ''
 
-# Option 2 printed the error, consumed "Press Enter to return to main menu",
-# and control came back to the main-menu loop (the banner is drawn AGAIN)
-# instead of hard-exiting the whole script on the missing directory.
+# Option 2 printed the error, consumed "Press Enter to return to main menu", and control
+# came back to the main-menu loop (the banner is drawn AGAIN) instead of hard-exiting the
+# whole script on the missing directory.
 occur_re "The directory '$LIB3/no-such-dir' does not exist"
 occur_re "$MENU_TITLE"
-# The banner appears at least twice: once at launch and once after the option
-# returned to the menu loop. A hard exit would have shown it only once.
+# The banner appears at least twice: once at launch and once after the option returned to
+# the menu loop. A hard exit would have shown it only once.
 [ "$(message_count "$MENU_TITLE")" -ge 2 ] \
     || _fail "main menu was not redrawn after the error return (script hard-exited?)"
 
@@ -120,12 +115,12 @@ echo "ok: reencode_guards (missing path returns to menu)"
 #    blocks a re-encode unless the script clears it first.
 #
 #    REAL flac (invoked without -f) refuses to write when its -o target already
-#    exists. On a full option-4 pass over 27k files the user hit exactly that:
-#    a stale 'tmp_...part' after a previous interrupted run made flac error
-#    "output file ... already exists". This guard plants a sandbox-local flac
-#    stub that reproduces that refusal, pre-seeds the same stale residue, and
-#    verifies the script's pre-delete lets the re-encode proceed -- and that no
-#    residue remains afterward to trip the NEXT run.
+#    exists. On a full option-4 pass the user hit exactly that: a stale
+#    'tmp_...part' after a previous interrupted run made flac error "output file
+#    ... already exists". This guard plants a sandbox-local flac stub that
+#    reproduces the refusal, pre-seeds the same stale residue, and verifies the
+#    script's pre-delete lets the re-encode proceed - and that no residue remains
+#    afterward to trip the NEXT run.
 # ===========================================================================
 SBX4=''
 make_sandbox SBX4
@@ -149,15 +144,15 @@ FLAC
 chmod +x "$SBX4/bin/flac"
 
 write_file "$LIB4/Album/track.flac"         'PRIMAL-ORIGINAL'
-# The exact residue from the user's interrupted full re-encode: a pre-existing
-# temp the script itself created on a prior (aborted) pass.
+# The exact residue from the user's interrupted full re-encode: a pre-existing temp the
+# script itself created on a prior (aborted) pass.
 write_file "$LIB4/Album/tmp_track.flac.part" 'pristine-debris-CORRUPT'
 
 # Option 4 = full re-encode of every *.flac in the library.
 run_script "$SBX4" '4' 'REENCODE ALL' ''
 
-# The stale .part must have been cleared BEFORE flac (no "already exists" error)
-# and the re-encode must have replaced the track with the stub marker.
+# The stale .part must have been cleared BEFORE flac (no "already exists" error) and the
+# re-encode must have replaced the track with the stub marker.
 absent_re 'already exists'
 file_eq "$LIB4/Album/track.flac" "$RE_MARKER"
 # The temp was consumed by the successful mv -- nothing left to trip a future run.

@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-###############################################################################
-# source_guard_units.sh - executions driver used by case_helpers.sh
+# source_guard_units.sh - assertions driver used by case_helpers.sh
 #
-# Run as a child interpreter whose shell-level globals (REENCODED_SET etc.) are
-# let go on exit; sourced-prod-script state never pollutes the caller or the
-# repo. Requires on PATH (before sourcing): stub flac + stub metaflac.
+# Runs as a child interpreter so the sourced script's globals (REENCODED_SET etc.)
+# never pollute the caller or the repo. Requires stub flac + metaflac on PATH.
 # Env: UNITS_LIB (library root), UNITS_DB (tracking db file).
-###############################################################################
 
 set -o errexit
 set -o nounset
@@ -15,7 +12,7 @@ set -o pipefail
 fail() { echo "  FAIL: $*" >&2; exit 1; }
 pass() { echo "ok"; }
 
-# Source the production script: must NOT auto-run the interactive menu here.
+# Source the production script: it must NOT auto-run the interactive menu here.
 # shellcheck source=../flac_health_reencode.sh
 . "$PROD_SCRIPT"
 
@@ -60,8 +57,8 @@ done < <(find_real_flac_files "$LIB" -print0)
 # --- get_file_fingerprint -----------------------------------------------------
 fp=$(get_file_fingerprint "$LIB/Album/plain.flac") || fail "fingerprint failed"
 # Split the 3-field fingerprint on whitespace. Quoting is deliberately omitted:
-# the whole point is to word-split "<md5> <size> <mtime>" into $1 $2 $3 -- each
-# field is a plain hex/number token with no spaces, so no globbing can occur.
+# the point is to word-split "<md5> <size> <mtime>" into $1 $2 $3, and each field
+# is a plain hex/number token with no spaces, so no globbing can occur.
 # shellcheck disable=SC2086
 set -- $fp
 [ "$#" -eq 3 ]        || fail "fingerprint not 3 fields: <$fp>"
