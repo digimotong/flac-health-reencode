@@ -60,7 +60,7 @@ mkdir_library() {
 #   Runs the sandbox script attached to a PTY. The PTY's output is captured to
 #   CURRENT_OUT (CRLF line endings and raw escapes included).
 #
-#   Two subtleties, both learned the hard way:
+#   Three subtleties, all learned the hard way:
 #     * 'script -c' executes its argument with /bin/sh, so PATH is assigned AND exported
 #       inside the child command rather than prefixed on it. A bare `VAR=x bash` prefix
 #       would apply only to that 'sh', and the later `bash` lookup would then fail with
@@ -70,13 +70,30 @@ mkdir_library() {
 #       surfaced as this case hanging until the runner's per-case timeout killed it. A
 #       redirected regular file is read normally and the run ends on EOF like every other
 #       case.
+#     * TERM is pinned EXPLICITLY. This case asserts the live-bar branch, and the script
+#       deliberately falls back to plain lines for TERM=dumb; util-linux 'script' sets
+#       TERM=dumb on the child when TERM is UNSET, which is exactly how GitHub Actions
+#       runs its steps - so inheriting the ambient TERM made the result depend on the
+#       runner and turned CI red while a normal developer shell stayed green.
+#       PTY_TERM overrides the pinned value (the dumb-terminal case below uses it).
+#       A plain 'xterm' is the fallback so a machine without the -256color terminfo
+#       entry (and no 'tput') still gets a working live bar: the script only needs
+#       '\r' and ASCII, not a feature-rich terminfo.
+if [ -z "${PTY_TERM:-}" ]; then
+    if infocmp xterm-256color >/dev/null 2>&1; then
+        PTY_TERM='xterm-256color'
+    else
+        PTY_TERM='xterm'
+    fi
+fi
 run_under_pty() {
     local sbx="$1"; shift
     CURRENT_OUT="$sbx/pty_output.log"
     local stdin_file child
     stdin_file="$sbx/pty_stdin.txt"
     printf '%s\n' "$@" > "$stdin_file"
-    child="PATH='$sbx/bin:$PATH'; export PATH; exec bash '$sbx/flac_health_reencode.sh'"
+    child="TERM='$PTY_TERM'; export TERM; PATH='$sbx/bin:$PATH'; export PATH;"
+    child="$child exec bash '$sbx/flac_health_reencode.sh'"
     if timeout 30 script -qec "$child" /dev/null \
             < "$stdin_file" > "$CURRENT_OUT" 2>&1; then
         LAST_STATUS=0
@@ -161,4 +178,37 @@ grep -qE -- "${ESC}\[" "$CURRENT_OUT" \
 # rather than a bar, so no "Progress:" line may appear either.)
 absent_re 'Progress: \[#'
 echo "ok: case_tty (non-tty control emits no escapes and no bar)"
+
+# ===========================================================================
+# TERM=dumb on a PTY must degrade to PLAIN lines, not the animated one.
+# ===========================================================================
+# The script treats a dumb terminal as "cannot redraw in place": no carriage
+# return and no erase sequence, but progress is still reported as ordinary
+# "Progress: ..." lines. Pinned here because it is the fallback that keeps a text
+# console readable, and because util-linux 'script' hands the child TERM=dumb
+# whenever TERM is unset (see run_under_pty) - so this branch is easy to hit by
+# accident and must be covered deliberately.
+SBX3=''
+make_sandbox SBX3
+register_sandbox "$SBX3"
+mkdir_library "$SBX3"
+
+PTY_TERM=dumb run_under_pty "$SBX3" '1' '' 'q'
+
+[ "$LAST_STATUS" -eq 0 ] || _fail "dumb-term run exited $LAST_STATUS, expected 0"
+# Still a complete, readable scan ...
+occur_re 'Scan complete\.'
+# ... reported as plain lines ...
+occur_re 'Progress: \[#'
+# ... with none of the live display's control bytes.
+absent_re "${ESC}\[K"
+# The script's own in-place redraw shows up as a line that STARTS with a carriage return,
+# which a dumb terminal must never receive. Bare '\r' bytes are NOT that: the PTY's line
+# discipline (onlcr) turns every '\n' into CRLF, and an echoed blank input line becomes a
+# lone "\r\n" - both look like a leading CR to awk. So the check ignores empty lines and
+# looks only at real content.
+if LC_ALL=C awk '/^\r/ && /[^\r]/ { found = 1 } END { exit found ? 0 : 1 }' "$CURRENT_OUT"; then
+    _fail "TERM=dumb run used in-place redraws (a content line starts with a carriage return)"
+fi
+echo "ok: case_tty (TERM=dumb falls back to plain progress lines)"
 

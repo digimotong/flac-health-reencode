@@ -112,25 +112,41 @@ jobs:
           echo "ok: all required files are tracked."
         shell: bash
 
-      - name: Install dependencies
+      # The version is INSTALLED EXPLICITLY, not taken from apt. `apt-get install
+      # shellcheck` follows the runner image, and when ubuntu-latest started shipping
+      # 0.11.0 this job went red on the version pin below for every PR - a toolchain
+      # change masquerading as a code failure. Pinning the download keeps CI
+      # deterministic and makes a bump a deliberate, reviewable edit.
+      #
+      # The checksum is published by the upstream release; verify it, because a
+      # corrupt or substituted tarball would otherwise be executed by the next step.
+      - name: Install shellcheck (pinned)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+          want="0.11.0"
+          url="https://github.com/koalaman/shellcheck/releases/download/v${want}/shellcheck-v${want}.linux.x86_64.tar.gz"
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "$tmp/shellcheck.tgz" "$url"
+          # SHA256 of the published linux.x86_64 tarball for v0.11.0.
+          echo "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  ${tmp}/shellcheck.tgz" \
+            | sha256sum -c - > /dev/null
+          tar -xzf "$tmp/shellcheck.tgz" -C "$tmp"
+          sudo install -m 0755 "$tmp/shellcheck-v$want/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
         shell: bash
 
       # The runner script is the single source of truth for how the repo is linted,
       # so CI cannot invoke shellcheck differently from a developer. It prints the
-      # resolved version, which the pin below is asserted against: if apt starts
-      # shipping a different shellcheck this fails with a clear message instead of
-      # surfacing as mystery diagnostics.
+      # resolved version, which the pin below is asserted against: a mismatched
+      # install fails here with a clear message instead of surfacing as mystery
+      # diagnostics.
       - name: Pin the shellcheck major.minor version
         run: |
-          want="0.9"
+          want="0.11"
           got="$(shellcheck --version | awk '/^version:/ {print $2}')"
           echo "shellcheck $got (pinned to $want.x)"
           if [ "${got%.*}" != "$want" ]; then
             echo "::error::shellcheck $got found, but the repo is pinned to $want.x;"
-            echo "::error::review the new diagnostics (0.10 dropped e.g. --rcfile) before bumping."
+            echo "::error::update the pinned download AND this guard together, after reviewing the new diagnostics."
             exit 1
           fi
         shell: bash
