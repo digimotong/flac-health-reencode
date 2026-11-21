@@ -14,29 +14,39 @@
 #   STUB_FLAC_SLEEP       seconds to sleep on the re-encode path
 #   STUB_FLAC_TEST_SLEEP  seconds to sleep on the verify path ('flac -t')
 #   STUB_FLAC_SLOT_DIR    directory that turns the stub into a concurrency probe
+#   STUB_FLAC_RECORD_ARGS file that receives one line per invocation (args joined)
+#   STUB_FLAC_MD5_CHECK   1 = emulate flac >= 1.5: a FLAC->FLAC re-encode of a file
+#                         containing MD5MISMATCH exits 1 unless --until= is passed
 #
 # The sleeps exist so case_parallel.sh can hold N operations open at once and
 # observe real overlap: an instant stub finishes before the parent can fork the
 # next worker, so even a serial implementation can look parallel. They are kept
 # separate so a case can slow one operation without touching the other.
 #
-# STUB_FLAC_SLOT_DIR makes the overlap assertion exact: each invocation claims the
-# lowest-numbered free slot via `mkdir` (atomic), so a process winning slot N has
-# proven that N-1 siblings were in flight at that instant, and the highest rank
-# claimed IS the peak concurrency (no clocks or floats involved). One record file
-# per process avoids interleaved shared appends. The probe covers both modes, so a
-# parallel scan is measurable too; it is released from an EXIT trap, which fires
-# on every exit path (including the failure return for an unreadable input, where a
-# trailing rmdir would be skipped). Ungated, it would cost a leaked slot that
-# inflates the next run's ranking, hence the env-var gate.
+# STUB_FLAC_SLOT_DIR measures real overlap without inferring it from slot ranks.
+# Each invocation atomically increments a counter, records the value it got (that IS
+# the number of stubs live at that instant, including itself), sleeps, then decrements.
+# Everything runs under one `flock` on a lock file, so the read-modify-write cannot be
+# interleaved - the earlier mkdir-slot scheme could hand two processes the same rank if
+# a slot directory was removed mid-scan, which showed up as a phantom "peak 3 of 4".
+# The probe covers both modes (a parallel scan is measurable too), and the decrement is
+# on an EXIT trap so it fires on every exit path, including the unreadable-input return.
+# Ungated it would leave a stale counter that inflates the next run, hence the gate.
 
 out=''
 infile=''
 prev=''
+until_seen=false
 for arg in "$@"; do
     if [ "$prev" = '-o' ]; then
         out="$arg"
     fi
+    case "$arg" in
+        --until=*)
+            # Any non-zero --until disables the flac >= 1.5 input-MD5 comparison.
+            until_seen=true
+            ;;
+    esac
     prev="$arg"
 done
 
@@ -45,25 +55,44 @@ done
 # would be an array assignment (SC2124) and silently joins trailing words.
 infile="${*: -1}"
 
-# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Claimed BEFORE the mode branches
-# so a scan's verifies are measurable, and held for this whole invocation.
-slot=''
+# Concurrency probe (see STUB_FLAC_SLOT_DIR above). Entered BEFORE the mode branches
+# so a scan's verifies are measurable, and released by an EXIT trap after them.
+slot_live=''
 if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
     mkdir -p "$STUB_FLAC_SLOT_DIR"
-    n=0
-    while :; do
-        n=$((n + 1))
-        mkdir "$STUB_FLAC_SLOT_DIR/$n" 2>/dev/null && break
-        # 64 is far above any worker count a test uses; the guard exists only so a
-        # leaked slot cannot spin here forever.
-        if [ "$n" -ge 64 ]; then
-            n=0
-            break
-        fi
-    done
-    slot="$STUB_FLAC_SLOT_DIR/$n"
-    printf '%s\n' "$n" > "$STUB_FLAC_SLOT_DIR/$$.rank"
-    trap 'rmdir "$slot" 2>/dev/null || true' EXIT
+    # One lock for the counter, one file holding its current value.
+    probe_lock="$STUB_FLAC_SLOT_DIR/.counter.lock"
+    probe_count="$STUB_FLAC_SLOT_DIR/.counter"
+
+    # Serialise every read-modify-write of the counter on the lock file, so two
+    # concurrent stubs can never observe/increment the same value.
+    probe_incr() {
+        (
+            flock 9
+            [ -f "$probe_count" ] || printf '0\n' > "$probe_count"
+            read -r cur < "$probe_count"
+            cur=$((cur + 1))
+            printf '%s\n' "$cur" > "$probe_count"
+            printf '%s\n' "$cur"
+        ) 9>>"$probe_lock"
+    }
+    # Invoked indirectly: the EXIT trap below calls it on every exit path.
+    # shellcheck disable=SC2329
+    probe_decr() {
+        (
+            flock 9
+            [ -f "$probe_count" ] || printf '0\n' > "$probe_count"
+            read -r cur < "$probe_count"
+            cur=$((cur > 0 ? cur - 1 : 0))
+            printf '%s\n' "$cur" > "$probe_count"
+        ) 9>>"$probe_lock"
+    }
+
+    slot_live="$(probe_incr)"
+    # Record the concurrency this invocation OBSERVED. One record per live stub, so
+    # the count of records stays "one per invocation of the stub".
+    printf '%s\n' "$slot_live" > "$STUB_FLAC_SLOT_DIR/$$.rank"
+    trap 'probe_decr' EXIT
 fi
 
 if [[ " $* " == *' -t '* ]]; then
@@ -83,10 +112,29 @@ if [ -n "${STUB_FLAC_SLEEP:-}" ]; then
     sleep "$STUB_FLAC_SLEEP"
 fi
 
+# Optional invocation log (one line per call, args space-joined), so a test can
+# assert HOW MANY attempts a file took and WHICH flags the retry carried.
+if [ -n "${STUB_FLAC_RECORD_ARGS:-}" ]; then
+    printf '%s\n' "$*" >> "$STUB_FLAC_RECORD_ARGS"
+fi
+
 # Re-encode mode: overwrite the temp target with a single file-INDEPENDENT marker
 # line, so tests can assert "original replaced by the marker" and "no backup ever
 # carries the marker" without depending on the file name.
 if [ -n "$out" ]; then
     printf 'REENCODE_OK\n' > "$out"
+fi
+
+# Emulate flac >= 1.5's FLAC->FLAC integrity check (upstream commit a9306bb): when
+# the input's STREAMINFO MD5 disagrees with the audio it decodes to - the damaged
+# input this script exists to repair - flac writes the output and then exits 1 with
+# "MD5sum of input is different from MD5sum of output". A non-zero --until
+# suppresses the comparison, which is the escape hatch reencode_one_file uses.
+# Gated by STUB_FLAC_MD5_CHECK so every other case keeps the plain behaviour, and
+# keyed on a content marker so a fixture can choose which files "mismatch".
+if [ "${STUB_FLAC_MD5_CHECK:-0}" = '1' ] && [ -n "$out" ] \
+        && grep -q MD5MISMATCH "$infile" 2>/dev/null && [ "$until_seen" != 'true' ]; then
+    echo "stub flac: $infile: ERROR: MD5sum of input is different from MD5sum of output" >&2
+    exit 1
 fi
 exit 0

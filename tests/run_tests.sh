@@ -101,6 +101,20 @@ for case in "$THIS_DIR"/case_*.sh; do
         else
             echo "  FAIL  $name"
         fi
+        # Annotate the run so the failing CASE is named on the PR's checks page
+        # instead of only "Process completed with exit code 1": one of these cases
+        # is timing-sensitive, and a flake that cannot be named cannot be fixed.
+        # GitHub renders these lines as annotations; harmless when unset.
+        if [ "${GITHUB_ACTIONS:-}" = 'true' ]; then
+            printf '::error file=tests/%s::%s failed (exit %s)\n' "$name" "$name" "$rc"
+            # The single most useful line from the case's own output, so the
+            # annotation itself says WHY, not just which case.
+            reason="$(grep -m1 -aE 'FAIL: |_fail ' "$log" || true)"
+            if [ -n "$reason" ]; then
+                reason="${reason#"${reason%%[![:space:]]*}"}"
+                printf '::error file=tests/%s::%s\n' "$name" "$reason"
+            fi
+        fi
         echo "  -------- $name output --------"
         cat "$log"
         echo "  ------------------------------"

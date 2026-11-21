@@ -37,6 +37,13 @@ LIB="$SBX/lib"
 DB="$LIB/.flac_scan_data/reencoded.db"
 BAKROOT="$SBX/lib_backup"
 
+# The concurrency probe in tests/stub_flac counts live invocations under `flock`
+# (util-linux). Without it the probe cannot measure overlap, and every assertion here
+# would be meaningless, so SKIP loudly instead of failing or passing vacuously.
+command -v flock >/dev/null 2>&1 \
+    || { echo "SKIP: flock (util-linux) not available; the concurrency probe cannot measure overlap"
+         exit 0; }
+
 for i in $(seq 1 "$FILE_COUNT"); do
     mkdir -p "$LIB/Album $i"
     write_file "$LIB/Album $i/track$i.flac" "orig-$i"
@@ -79,23 +86,35 @@ probe_reset() {
     mkdir -p "$PROBE"
 }
 
-# probe_peak : the highest slot rank claimed during the run on $PROBE.
+# probe_peak : the highest concurrency any stub invocation observed. Each invocation
+# records the live-stub count at the instant it started, so the maximum IS the peak.
 probe_peak() {
     local rank
     rank=$(cat "$PROBE"/*.rank 2>/dev/null | sort -n | tail -n1)
     echo "${rank:-0}"
 }
 
-# probe_records : how many times the stub was invoked to re-encode a file. Independent
-# of output parsing, so it also pins "exactly one re-encode per file".
+# probe_records : how many stub INVOCATIONS were recorded. Each invocation writes one
+# rank file, but the name is the stub's PID and PIDs are finite, so over a very long run
+# two invocations could reuse a name and the count would come out low. That is why the
+# assertions compare against a generous tolerance plus an exact "one DB row per file"
+# check, rather than treating this as an exact invocation count.
 probe_records() {
     count_find "$PROBE" -name '*.rank'
 }
 
-# probe_slots_left : slot directories still claimed after the run. Must be 0; a leaked
-# slot would inflate the NEXT run's ranking and mask a degraded pool.
+# probe_slots_left : invocations the counter still believes are live after the run.
+# Must be 0: a non-zero value means an invocation never released its slot, which would
+# inflate the NEXT run's measurement (and hide a degraded pool).
 probe_slots_left() {
-    count_find "$PROBE" -mindepth 1 -maxdepth 1 -type d
+    local n=0
+    if [ -f "$PROBE/.counter" ]; then
+        read -r n < "$PROBE/.counter" || n=0
+    fi
+    case "${n:-0}" in
+        ''|*[!0-9]*) n=0 ;;
+    esac
+    printf '%s\n' "$n"
 }
 
 # work_reset : forget which files are already reencoded and restore the library, so the
@@ -365,8 +384,11 @@ scan_run 1 SCAN_SEQ_CSV
     || _fail "jobs=1 scan: scanned count != $SCAN_COUNT"
 [ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \
     || _fail "jobs=1 scan: expected exactly ${#SCAN_BAD[@]} error lines"
-# Sequential scan renders its historical plain-text bar line.
-occur_re 'Progress: \[#+-*\]'
+# A captured SEQUENTIAL scan reports through its per-file lines only: the shared
+# progress display draws a bar on a terminal, plain "Progress:" lines for a POOLED
+# captured run, and nothing at all for a sequential captured one (a bar there
+# would just interleave with the per-file output the user can already see).
+absent_re 'Progress: \[#'
 # A scan must not announce workers it is not using: the marker appears only when jobs > 1,
 # so its absence here is part of the jobs=1 contract.
 absent_re 'Scanning with [0-9]+ worker\(s\)'
@@ -379,6 +401,10 @@ assert_peak 1 'jobs=1 scan' "$SCAN_COUNT"
 echo "  .. jobs=4 scan run (${SCAN_COUNT} files)"
 scan_run 4 SCAN_PAR_CSV
 occur_re 'Scanning with 4 worker\(s\)'
+# A POOLED captured scan reports progress as plain lines, because its per-file
+# output is suppressed during the run. This is the regression anchor for a
+# parallel scan that used to render nothing at all.
+occur_re 'Progress: \[#+-*\]'
 [ "$(captured_count 'Scanned ([0-9]+) files')" -eq "$SCAN_COUNT" ] \
     || _fail "jobs=4 scan: scanned count != $SCAN_COUNT"
 [ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \

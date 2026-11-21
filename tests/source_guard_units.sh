@@ -112,4 +112,151 @@ validate_backup_root "$VB_LIB" "$LIB/Album_backup"  || fail "rejected a legitima
 # The near-miss: a SIBLING sharing a name prefix must not be treated as inside.
 validate_backup_root "$VB_LIB" "$LIB/Album_backup/sub" || fail "rejected a legitimate sibling subtree"
 
+# --- render_progress (shared progress display) --------------------------------
+# Deterministic checks: timings off (so no clock is involved) and a fixed width,
+# so the exact frame is predictable. This is the format every long-running option
+# shares, so a change here is a change to all of them.
+PROGRESS_COLS=80
+PROGRESS_WIDTH=30
+
+# Half-way: half the bar filled, the counters and label in the documented shape.
+[ "$(render_progress 5 10 2 'failed' 0)" = \
+    '[###############---------------]  50% (5/10) | failed: 2' ] || fail "render_progress half-way wrong"
+
+# Start and end states.
+case "$(render_progress 0 10 0 'failed' 0)" in
+    '[------------------------------]   0% (0/10) | failed: 0') : ;;
+    *) fail "render_progress 0/N wrong: $(render_progress 0 10 0 'failed' 0)" ;;
+esac
+case "$(render_progress 10 10 3 'failed' 0)" in
+    '[##############################] 100% (10/10) | failed: 3') : ;;
+    *) fail "render_progress N/N wrong: $(render_progress 10 10 3 'failed' 0)" ;;
+esac
+
+# A done count above the total is clamped, never overflows the bar.
+case "$(render_progress 99 10 0 'failed' 0)" in
+    *'100% (10/10)'*) : ;;
+    *) fail "render_progress does not clamp done > total" ;;
+esac
+
+# A zero/empty total prints nothing at all (it would divide by zero).
+[ -z "$(render_progress 0 0 0 'failed' 0)" ] || fail "render_progress printed for total=0"
+
+# The frame always fits the terminal: never wider than PROGRESS_COLS, even on a
+# narrow one. Below the width where even the MINIMUM bar plus the counters fit,
+# the counters and label win and the bar is dropped entirely, so the line can
+# never wrap (a wrapped line is what breaks a single-line '\r' display).
+for cols in 40 60 80 200; do
+    PROGRESS_COLS=$cols
+    line=$(render_progress 123 456 7 'failed' 0)
+    [ "${#line}" -le "$cols" ] || fail "render_progress exceeds ${cols} cols (${#line}): $line"
+done
+# The counters + label + bar alone need ~29 columns; at 28 they still fit once the
+# bar is dropped.
+PROGRESS_COLS=28
+line=$(render_progress 123 456 7 'failed' 0)
+if [ "${#line}" -gt 28 ] || [ -z "$line" ]; then
+    fail "render_progress exceeds 28 cols: $line"
+fi
+# At a comfortable width the bar itself is present.
+PROGRESS_COLS=80
+case "$(render_progress 123 456 7 'failed' 0)" in
+    '['*'] '*'(123/456)'*) : ;;
+    *) fail "render_progress dropped the bar at 80 cols" ;;
+esac
+# The counters survive every width, however narrow.
+case "$(render_progress 123 456 7 'failed' 0)" in
+    *'| failed: 7') : ;;
+    *) fail "render_progress lost its counters" ;;
+esac
+
+# Timings: none before the first completion (no ETA can exist yet); an ETA is
+# present once work has completed, and the elapsed/ETA fields are "M:SS" shaped.
+PROGRESS_START=$(date +%s)
+case "$(render_progress 0 10 0 'failed' 1)" in
+    *ETA*) fail "render_progress shows an ETA before any file completed" ;;
+esac
+rendered=$(render_progress 5 10 0 'failed' 1)
+case "$rendered" in
+    *' ETA '*) : ;;
+    *) fail "render_progress shows no ETA mid-run: $rendered" ;;
+esac
+case "$rendered" in
+    *'| '[0-9]*:[0-9][0-9]' ETA '[0-9]*:[0-9][0-9]) : ;;
+    *) fail "render_progress timing fields malformed: $rendered" ;;
+esac
+
+# format_duration: M:SS under an hour, H:MM:SS from an hour, nothing for garbage.
+[ "$(format_duration 0)"    = '0:00' ]    || fail "format_duration 0 wrong"
+[ "$(format_duration 65)"   = '1:05' ]    || fail "format_duration 65 wrong"
+[ "$(format_duration 3600)" = '1:00:00' ] || fail "format_duration 3600 wrong"
+[ "$(format_duration 7325)" = '2:02:05' ] || fail "format_duration 7325 wrong"
+[ -z "$(format_duration '')" ] || fail "format_duration accepted an empty value"
+
+# progress_* lifecycle: updates outside a run are no-ops; the live display draws
+# once per whole percent and always lands on the final N/N state.
+#
+# stdout here is NOT a terminal, so progress_begin would choose the plain-line
+# form. These assertions are about the LIVE (single-line) form, so run with that
+# decided and pin the plain form separately below.
+PROGRESS_ACTIVE=0
+[ -z "$(progress_update 5 10 0)" ] || fail "progress_update drew while inactive"
+progress_begin 0 'failed'
+[ "$PROGRESS_ACTIVE" -eq 0 ] || fail "progress_begin activated for a zero-length run"
+
+# Plain form (what a captured pooled run gets): one self-terminated line per percent.
+progress_begin 4 'failed'
+[ "$PROGRESS_ACTIVE" -eq 1 ] || fail "progress_begin did not activate"
+[ "$PROGRESS_DRAW_LIVE" -eq 0 ] || fail "progress_begin drew live without a tty"
+plain=$(progress_update 1 0)
+case "$plain" in
+    'Progress: [#'*'  25% (1/4) | failed: 0'*) : ;;
+    *) fail "plain progress line malformed: $plain" ;;
+esac
+case "$plain" in
+    *$'\r'*|*$'\033'*) fail "plain progress line contains terminal control bytes" ;;
+esac
+progress_end
+
+# Live form, with a total large enough that consecutive files share a percent:
+# 1/1000 and 2/1000 both round to 0%, so only the FIRST of them may redraw. The
+# final update must still render even though 100% arrives right after 99%.
+progress_begin 1000 'failed'
+PROGRESS_ACTIVE=1
+PROGRESS_DRAW_LIVE=1
+# Start clean: the plain-form run above left its own high-water marks behind, and
+# progress_begin (which normally resets them) chose the plain form without a tty.
+PROGRESS_LAST_PCT=-1
+PROGRESS_LAST_DONE=-1
+# Capture each frame to a file. progress_update keeps its per-percent high-water
+# marks in the CURRENT shell, so a call must never sit inside an extra $( ... )
+# (it would still print, but the caller would only ever see the first draw).
+# A DRAWN live frame always ends with the erase-line escape; compare the raw
+# trailing bytes rather than grep, whose bracket expression would misread "\033".
+FRAMES=$(mktemp "${TMPDIR:-/tmp}/flac_progress_frames.XXXXXX")
+trap 'rm -f "$FRAMES"' EXIT
+erase_tail=$'\033[K'
+frame_was_drawn() {
+    local content
+    content=$(cat "$1")
+    case "$content" in
+        *"$erase_tail") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+progress_update 1 0 > "$FRAMES"
+frame_was_drawn "$FRAMES" || fail "live progress did not draw the first percent"
+progress_update 2 0 > "$FRAMES"
+if frame_was_drawn "$FRAMES"; then
+    fail "live progress redrew without advancing a percent"
+fi
+progress_update 10 1 > "$FRAMES"
+frame_was_drawn "$FRAMES" || fail "live progress did not draw on the next percent"
+progress_update 1000 2 > "$FRAMES"
+grep -qF '100% (1000/1000)' "$FRAMES" || fail "live progress did not render the final N/N state"
+# The final state is always drawn, even though 100% comes right after 99%.
+frame_was_drawn "$FRAMES" || fail "live progress did not land on the final state"
+progress_end
+[ "$PROGRESS_ACTIVE" -eq 0 ] || fail "progress_end left progress active"
+
 echo "ok: source-guard units"

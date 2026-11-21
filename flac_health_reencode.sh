@@ -11,6 +11,15 @@
 # min(4, nproc); 1 means strictly sequential. Each worker writes its own shard
 # (run log + tracking DB, or a scan failure list) which the parent merges, so no
 # two workers ever append to the same file.
+#
+# Every long-running option (1, 2, 4, 5) reports through ONE progress API
+# (progress_begin/progress_update/progress_end), driven by COMPLETED files rather
+# than dispatched ones. On a terminal that is a single self-updating line
+# ("[###---] 42% (420/1000) | failed 3 | 04:12 ETA 02:34"); when stdout is
+# redirected it degrades to periodic plain "Progress:" lines. The renderer uses
+# only '\r' and ASCII (plus the standard erase-to-end-of-line CSI), so the Debian
+# text console and GNOME Terminal both display it correctly; TERM=dumb falls back
+# to plain lines.
 
 # Configuration file path
 CONFIG_FILE="$(dirname "$(realpath "$0")")/flac_health_config.json"
@@ -21,8 +30,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Progress tracking
-PROGRESS_WIDTH=50
+# Progress bar geometry. PROGRESS_WIDTH is the preferred bar width in columns;
+# the renderer shrinks it (down to PROGRESS_MIN_WIDTH) when the terminal is too
+# narrow for the counters/label/timings, so the line never wraps.
+PROGRESS_WIDTH=30
+PROGRESS_MIN_WIDTH=10
+PROGRESS_MAX_WIDTH=30
 
 # Cached by stdout_is_tty(), so a render loop pays the [ -t 1 ] test once.
 declare -g STDOUT_IS_TTY=''
@@ -30,6 +43,24 @@ declare -g STDOUT_IS_TTY=''
 # 1: per-file status lines also go to the terminal. 0: log only - the live
 # single-line progress bar would otherwise be scattered by them.
 declare -g STATUS_TO_CONSOLE=1
+
+# Progress state, all owned by the progress_* API below. PROGRESS_ACTIVE is 0
+# outside a run's begin/end window, which is what makes progress_update a no-op
+# for code (and child processes) that is not drawing a bar. PROGRESS_DRAW_LIVE is
+# 1 when the display can be rewritten in place (a real terminal), 0 for the plain
+# periodic-line fallback (pipe, redirect, TERM=dumb). The LAST_* fields are the
+# redraw high-water marks, so a run renders at most ~100 times (one per whole
+# percent) however many files it has.
+declare -g PROGRESS_ACTIVE=0
+declare -g PROGRESS_DRAW_LIVE=0
+declare -g PROGRESS_TOTAL=0
+declare -g PROGRESS_DONE=0
+declare -g PROGRESS_FAIL=0
+declare -g PROGRESS_LABEL='Failed'
+declare -g PROGRESS_START=0
+declare -g PROGRESS_COLS=80
+declare -g PROGRESS_LAST_PCT=-1
+declare -g PROGRESS_LAST_DONE=-1
 
 # Pool state: high-water worker id, i.e. how many shards the run created. Ids
 # are allocated per FILE, so it usually exceeds the job count, and it is 0 for a
@@ -186,45 +217,220 @@ stdout_is_tty() {
     [ "$STDOUT_IS_TTY" = "1" ]
 }
 
-# Draws the bar/percent text, with a trailing space so a status label can follow
-# on the same row. Emits no carriage return, newline or clearing - callers pick
-# the animated (show_progress) or plain form.
-render_progress() {
-    local current=$1
-    local total=$2
-    local errors=$3
-    local label="${4:-Errors}"
-    local percent=$((current * 100 / total))
-    local filled=$((percent * PROGRESS_WIDTH / 100))
-    local empty=$((PROGRESS_WIDTH - filled))
-
-    printf "["
-    printf "%${filled}s" | tr ' ' '#'
-    printf "%${empty}s" | tr ' ' '-'
-    printf "] %3d%% (%d/%d) | %s: %d " "$percent" "$current" "$total" "$label" "$errors"
-}
-
-# Progress bar as one self-updating line on a terminal; a plain text line
-# otherwise, so pipes/CI captures stay clean. Must be the last thing drawn
-# before an interactive prompt, and no bare status text may be echoed to the
-# console between calls (see write_status/STATUS_TO_CONSOLE).
-show_progress() {
-    if stdout_is_tty; then
-        printf "\r"
-        render_progress "$@"
-        printf "\033[K"
+# Formatted "H:MM:SS" (or "M:SS" under an hour) from a whole number of seconds.
+# $1 = seconds. Prints nothing for a non-numeric value, so a caller can drop the
+# field rather than print a nonsense estimate.
+format_duration() {
+    local secs="${1:-}"
+    [[ "$secs" =~ ^[0-9]+$ ]] || return 0
+    if [ "$secs" -ge 3600 ]; then
+        printf '%d:%02d:%02d' $((secs / 3600)) $(( (secs % 3600) / 60 )) $((secs % 60))
     else
-        printf "Progress: "
-        render_progress "$@"
-        printf "\n"
+        printf '%d:%02d' $((secs / 60)) $((secs % 60))
     fi
 }
 
-# Erases the bar line. No-op off a terminal (nothing was drawn there).
-clear_progress() {
-    if stdout_is_tty; then
-        printf "\r\033[K"
+# Renders progress AS TEXT (no carriage return, no clearing, no newline), so the
+# caller decides whether it is a one-line animation or a plain line:
+#
+#   [####################----------]  62% (620/1000) | failed: 3 | 04:12 ETA 02:34
+#
+# The leading "[#...-] NNN% (done/total)" core survives every degradation, so it
+# is the part output consumers can rely on. Time fields appear only when timings
+# are asked for ($5=1) and there is a meaningful estimate (ETA needs at least one
+# completed file). The bar shrinks to fit PROGRESS_COLS, from PROGRESS_MAX_WIDTH
+# down to PROGRESS_MIN_WIDTH, and the timing fields are dropped before the bar
+# would go below the minimum, so the line never wraps.
+# $1 = done, $2 = total, $3 = failures, $4 = label, $5 = show timings (0/1).
+render_progress() {
+    local done="$1"
+    local total="$2"
+    local fails="$3"
+    local label="${4:-Failed}"
+    local show_times="${5:-0}"
+    local percent core timing width avail filled empty elapsed_text eta_text
+    local bar_filled='' bar_empty=''
+
+    [ "$total" -gt 0 ] || return 0
+    [ "$done" -le "$total" ] || done="$total"
+
+    percent=$(( done * 100 / total ))
+    # "%3d%%" keeps the suffix a fixed width as the count climbs.
+    printf -v core ' %3d%% (%d/%d) | %s: %d' "$percent" "$done" "$total" "$label" "$fails"
+
+    timing=''
+    if [ "$show_times" = '1' ] && [ "$done" -gt 0 ]; then
+        local elapsed now eta
+        now=$(date +%s)
+        elapsed=$(( now - PROGRESS_START ))
+        [ "$elapsed" -lt 0 ] && elapsed=0
+        elapsed_text=$(format_duration "$elapsed")
+        if [ "$done" -lt "$total" ]; then
+            eta=$(( elapsed * (total - done) / done ))
+            eta_text=$(format_duration "$eta")
+            timing=" | ${elapsed_text} ETA ${eta_text}"
+        elif [ -n "$elapsed_text" ]; then
+            timing=" | ${elapsed_text}"
+        fi
     fi
+
+    # The line is "[" + bar + "]" + core + timing; keep it inside the terminal.
+    width=$PROGRESS_WIDTH
+    [ "$width" -gt "$PROGRESS_MAX_WIDTH" ] && width=$PROGRESS_MAX_WIDTH
+    avail=$(( PROGRESS_COLS - ( ${#core} + ${#timing} + 2 ) ))
+    [ "$avail" -lt "$width" ] && width=$avail
+    if [ "$width" -lt "$PROGRESS_MIN_WIDTH" ]; then
+        # Too narrow for the timings: retry without them before shrinking further.
+        if [ -n "$timing" ]; then
+            timing=''
+            avail=$(( PROGRESS_COLS - ( ${#core} + 2 ) ))
+            width=$PROGRESS_MAX_WIDTH
+            [ "$avail" -lt "$width" ] && width=$avail
+        fi
+        # Still too narrow for even the minimum bar: drop the bar, keep the
+        # counters. A wrapped line would wreck a single-line '\r' display, and the
+        # counters are the part that must stay readable.
+        if [ "$width" -lt "$PROGRESS_MIN_WIDTH" ]; then
+            printf ' %3d%% (%d/%d) | %s: %d%s' "$percent" "$done" "$total" "$label" "$fails" "$timing"
+            return 0
+        fi
+    fi
+
+    filled=$(( percent * width / 100 ))
+    empty=$(( width - filled ))
+    # Pure-bash padding (no tr/seq child per redraw): printf '%*s' emits spaces.
+    printf -v bar_filled '%*s' "$filled" ''
+    printf -v bar_empty '%*s' "$empty" ''
+    printf '[%s%s]%s%s' "${bar_filled// /#}" "${bar_empty// /-}" "$core" "$timing"
+}
+
+# Resolves the terminal width once per run: 'tput cols' when it is available and
+# sanely wide, else $COLUMNS, else 80. A live display is padded by the renderer,
+# so this only decides where the counters sit.
+progress_resolve_cols() {
+    local cols=''
+    if stdout_is_tty && [ "${TERM:-}" != 'dumb' ] && command -v tput >/dev/null 2>&1; then
+        cols=$(tput cols 2>/dev/null) || cols=''
+    fi
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols="${COLUMNS:-}"
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+    [ "$cols" -lt 20 ] && cols=80
+    PROGRESS_COLS=$cols
+    return 0
+}
+
+# Starts progress reporting for ONE run of $1 files. Everything after this is a
+# no-op unless a run is active, so stray calls (and child processes, which start
+# from PROGRESS_ACTIVE=0) can never draw over the parent's line.
+# A live single-line display needs a real terminal AND a terminfo that is not
+# 'dumb'; a pipe or redirect cannot be rewritten in place, so it gets plain
+# periodic lines instead - unless the caller asked for no display at all, which
+# is what a captured sequential run does (its per-file status lines already say
+# everything). Sets PROGRESS_ACTIVE/PROGRESS_DRAW_LIVE/PROGRESS_TOTAL/
+# PROGRESS_START and, when live, draws the initial 0% state.
+# $1 = total files, $2 = counter label (e.g. 'Failed' or 'Errors'),
+# $3 = quiet when captured (1 = no plain lines off a terminal, 0 = emit them).
+progress_begin() {
+    local total="$1"
+    local label="${2:-Failed}"
+    local quiet_off_tty="${3:-0}"
+
+    PROGRESS_ACTIVE=0
+    PROGRESS_DRAW_LIVE=0
+    PROGRESS_TOTAL=0
+    PROGRESS_DONE=0
+    PROGRESS_FAIL=0
+    PROGRESS_LAST_PCT=-1
+    PROGRESS_LAST_DONE=-1
+
+    # A zero-length run has nothing to report, and render_progress divides by total.
+    [ "$total" -gt 0 ] || return 0
+
+    PROGRESS_TOTAL=$total
+    PROGRESS_LABEL=$label
+    PROGRESS_START=$(date +%s)
+    if stdout_is_tty && [ "${TERM:-}" != 'dumb' ]; then
+        PROGRESS_ACTIVE=1
+        PROGRESS_DRAW_LIVE=1
+        progress_resolve_cols
+        progress_update 0 0
+    elif [ "$quiet_off_tty" != '1' ]; then
+        PROGRESS_ACTIVE=1
+    fi
+    return 0
+}
+
+# Reports $1 completed files, of which $2 failed.
+#
+# A live display redraws in place only when the whole percent ADVANCES (or the
+# run completes and that state has not been drawn yet), which caps a run at ~100
+# redraws however large the library is. A non-live display writes a plain,
+# self-terminated line on the same cadence, so a redirected long run still shows
+# progress without flooding its log.
+progress_update() {
+    local done="$1"
+    local fails="${2:-0}"
+    local pct total
+
+    if [ "$PROGRESS_ACTIVE" != '1' ]; then return 0; fi
+    if [ "$PROGRESS_TOTAL" -le 0 ]; then return 0; fi
+    [ "$done" -le "$PROGRESS_TOTAL" ] || done="$PROGRESS_TOTAL"
+
+    total="$PROGRESS_TOTAL"
+    pct=$(( done * 100 / total ))
+    # Cheap guard first: below the last drawn percent nothing is redrawn, which is
+    # the common case for a large library.
+    if (( pct < PROGRESS_LAST_PCT )); then
+        return 0
+    fi
+    # Then skip an equal percent, unless this is the run's final state.
+    if (( pct == PROGRESS_LAST_PCT )) && (( done != total || PROGRESS_LAST_DONE == total )); then
+        return 0
+    fi
+    PROGRESS_LAST_PCT=$pct
+    PROGRESS_LAST_DONE=$done
+    PROGRESS_DONE=$done
+    PROGRESS_FAIL=$fails
+
+    if [ "$PROGRESS_DRAW_LIVE" = '1' ]; then
+        printf '\r'
+        render_progress "$done" "$PROGRESS_TOTAL" "$fails" "$PROGRESS_LABEL" 1
+        # Erase any tail the previous (wider) line left behind - e.g. a 3-digit
+        # ETA becoming 2 digits. Standard VT100 CSI, supported everywhere.
+        printf '\033[K'
+    else
+        printf 'Progress: '
+        render_progress "$done" "$PROGRESS_TOTAL" "$fails" "$PROGRESS_LABEL" 1
+        printf '\n'
+    fi
+    return 0
+}
+
+# Erases the live bar line before a status or summary line is printed (and from
+# the interrupt handler, so its message is not appended to the bar). No-op when
+# nothing live is drawn. Deliberately does NOT end progress: the next update
+# redraws the bar.
+progress_clear() {
+    if [ "$PROGRESS_ACTIVE" = '1' ] && [ "$PROGRESS_DRAW_LIVE" = '1' ]; then
+        printf '\r\033[K'
+    fi
+    return 0
+}
+
+# Ends progress reporting for the run: draws the final 100% state if it was never
+# drawn, then terminates a live line with a newline so any summary that follows
+# starts on its own row. Safe to call when no run is active.
+progress_end() {
+    if [ "$PROGRESS_ACTIVE" != '1' ]; then
+        return 0
+    fi
+    progress_update "$PROGRESS_TOTAL" "$PROGRESS_FAIL"
+    if [ "$PROGRESS_DRAW_LIVE" = '1' ]; then
+        printf '\n'
+    fi
+    PROGRESS_ACTIVE=0
+    PROGRESS_DRAW_LIVE=0
+    return 0
 }
 
 # Writes one status line to the run log, and to the terminal while
@@ -234,7 +440,17 @@ write_status() {
     local log_file="$2"
     printf '%s\n' "$line" >> "$log_file"
     if [ "$STATUS_TO_CONSOLE" = "1" ]; then
-        printf '%s\n' "$line"
+        if [ "$PROGRESS_ACTIVE" = '1' ] && [ "$PROGRESS_DRAW_LIVE" = '1' ]; then
+            # Wipe the live bar first, then print on its own row and redraw the
+            # bar, so a sequential run can show both without gluing them together.
+            progress_clear
+            printf '%s\n' "$line"
+            render_progress "$PROGRESS_DONE" "$PROGRESS_TOTAL" "$PROGRESS_FAIL" \
+                "$PROGRESS_LABEL" 1
+            printf '\033[K'
+        else
+            printf '%s\n' "$line"
+        fi
     fi
 }
 
@@ -523,10 +739,29 @@ reencode_one_file() {
     fi
 
     # Reencode the file using the specified FLAC parameters.
+    #
+    # flac >= 1.5 refuses a FLAC->FLAC re-encode when the input's STREAMINFO MD5
+    # disagrees with the audio it decodes to ("MD5sum of input is different from
+    # MD5sum of output"). That is exactly the damaged-input case
+    # --decode-through-errors exists for, so on those files the new check would
+    # turn every repair into a failure. Upstream disables the comparison whenever a
+    # non-zero --until is given, so: encode normally first (keeping the check, and
+    # its corruption warning, for healthy files) and retry ONCE with
+    # --until=<total samples>, which is the whole file and encodes the same range.
+    local total_samples=''
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
-        write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
-        [ -f "$temp_file" ] && rm "$temp_file"
-        return 1
+        total_samples=$(metaflac --show-total-samples "$flac_file" 2>/dev/null || true)
+        rm -f "$temp_file"
+        if ! [[ "$total_samples" =~ ^[0-9]+$ ]] || [ "$total_samples" -eq 0 ] \
+            || ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent \
+                    --until="$total_samples" -o "$temp_file" "$flac_file"; then
+            write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
+            [ -f "$temp_file" ] && rm "$temp_file"
+            return 1
+        fi
+        # Log-only (not console): the retry is a cost worth explaining in the audit
+        # trail, but it is not an error and would otherwise scroll past unnoticed.
+        echo "Note: damaged input; re-encoded with --until=$total_samples after flac refused the plain re-encode (MD5 check): $flac_file" >> "$log_file"
     fi
 
     # mkdir -p builds the whole relative chain, so a fresh backup root needs no
@@ -654,9 +889,14 @@ merge_reencode_shards() {
 # $3 = per-worker result channel (the tracking DB for reencodes)
 # $4 = library root, $5 = backup root
 # $6 = NUL-separated input list (fully written before the call)
-# $7 = output mode: 0 = animated bar, 1 = inline statuses (sequential), 2 = replay
-# $8 = label for the bar's tallies
+# $7 = output mode: 0 = live bar on a terminal, 1 = sequential statuses only
+#      (no terminal), 2 = pooled without a terminal: plain progress lines plus a
+#      replay of the per-file statuses in file order
+# $8 = label for the bar's counter (e.g. 'Failed')
 # Sets POOL_PROCESSED, POOL_SUCCESS, POOL_FAIL, POOL_MODE, POOL_WORKERS_USED.
+# Owns the run's progress display: calls progress_begin before the work and
+# progress_end (which lands on the final 100%) once every file has been counted,
+# so a caller's summary never shares a row with the bar.
 run_file_pool() {
     local jobs="$1"
     local log_file="$2"
@@ -679,45 +919,48 @@ run_file_pool() {
     # Empty for a reencode: its channel goes straight into $3 (the real DB) on the
     # sequential path.
     POOL_SEQ_CHANNEL_PREFIX="${POOL_SEQ_CHANNEL_PREFIX:-}"
-    POOL_TOTAL_FILES=0
 
     # jobs=1: no children and no shards, equivalent to the pre-parallel behavior.
     # The channel is resolved per FILE via _pool_seq_channel, so ids climb exactly
     # as in the dispatch loop and a caller replaying shards by id stays correct.
     if [ "$jobs" -le 1 ]; then
-        local flac_file total_files id
+        local flac_file total_files seq_channel quiet=0
+        # Mode 1 is a captured sequential run: no bar, and no plain progress lines
+        # either (its per-file status lines already describe every step).
+        [ "$POOL_MODE" -eq 1 ] && quiet=1
         total_files=$(_count_nul_list "$list_path")
-        id=0
+        progress_begin "$total_files" "$label" "$quiet"
         while IFS= read -r -d '' flac_file; do
-            POOL_PROCESSED=$((POOL_PROCESSED + 1))
-            # No pool redraws the bar on this path, so the caller's cadence rule
-            # decides when to render; the scan keeps its historical 50-file/1%
-            # rule so its tty animation stays byte-identical.
-            if [ "$POOL_MODE" -eq 0 ]; then
-                show_progress "$POOL_PROCESSED" "$total_files" "$POOL_FAIL" "$label"
-            elif [ -n "${POOL_SEQ_PROGRESS_FN:-}" ]; then
-                "$POOL_SEQ_PROGRESS_FN" "$POOL_PROCESSED" "$total_files" "$POOL_FAIL" "$label"
-            fi
-            local seq_channel
-            seq_channel="$(_pool_seq_channel "$id" "$result_channel" "$log_file")"
+            seq_channel="$(_pool_seq_channel "$POOL_PROCESSED" "$result_channel" "$log_file")"
             if _pool_call_worker "$flac_file" "$seq_channel" "$log_file" "$library_dir" "$backup_root"; then
                 POOL_SUCCESS=$((POOL_SUCCESS + 1))
             else
                 POOL_FAIL=$((POOL_FAIL + 1))
             fi
-            id=$((id + 1))
+            POOL_PROCESSED=$((POOL_PROCESSED + 1))
+            # Advance only when a file COMPLETED, so the bar tracks finished work
+            # rather than work that has merely been started.
+            progress_update "$POOL_PROCESSED" "$POOL_FAIL"
         done < "$list_path"
+        progress_end
         return 0
     fi
 
     _pool_setup_state "$jobs" "$log_file" "$list_path"
+    # Up-front count so the bar starts from a real denominator (the dispatch loop
+    # is bounded by the same figure). A pooled run always reports progress: a
+    # terminal gets the live bar, anything else gets plain periodic lines.
+    progress_begin "$(_count_nul_list "$list_path")" "$label" 0
     _pool_dispatch_loop "$list_path" "$jobs" "$log_file" "$result_channel" \
         "$library_dir" "$backup_root" "$label"
     _pool_drain "$label"
 
-    # Tally the workers' result files BEFORE replaying per-file lines, or the
-    # replay would appear ahead of the summary it accompanies.
+    # Tally any worker result the sweep did not consume BEFORE replaying per-file
+    # lines, or the replay would appear ahead of the summary it accompanies.
     _pool_tally_results
+    # Every file is now counted, so land the bar on N/N and end its line before
+    # anything else is printed.
+    progress_end
     if [ "$POOL_MODE" -eq 2 ]; then
         _pool_replay_status_lines
     fi
@@ -864,6 +1107,10 @@ _pool_start_worker() {
         result_channel="$(shard_path_for "$log_file" "$worker_id" "$POOL_CHANNEL_KIND")"
         # Statuses must never reach the screen while the parent owns the bar line.
         STATUS_TO_CONSOLE=0
+        # A child must never draw progress either: it would interleave its own
+        # carriage returns with the parent's single-line bar.
+        PROGRESS_ACTIVE=0
+        PROGRESS_DRAW_LIVE=0
         if _pool_call_worker "$flac_file" "$result_channel" "$log_shard" \
                 "$library_dir" "$backup_root"; then
             rc=0
@@ -884,12 +1131,21 @@ _pool_start_worker() {
 # Drops every already-exited pid from the in-flight list and reports how many are
 # still running (POOL_RUNNING). 'kill -0' is portable and, unlike 'wait -n',
 # never consumes a status this function could not report.
+#
+# This is also where a run's completions are COUNTED: a pid that has exited maps
+# to its worker id, whose result shard is consumed, so the tallies and the
+# progress bar advance as each file finishes rather than when the whole pool
+# drains.
 _pool_sweep_finished() {
-    local remaining=() p
+    local remaining=() p worker_id
     for p in "${POOL_PIDS[@]}"; do
         if kill -0 "$p" 2>/dev/null; then
             remaining+=("$p")
         else
+            worker_id="${POOL_WORKER_EXIT[$p]:-}"
+            if [ -n "$worker_id" ]; then
+                _pool_consume_result "$worker_id"
+            fi
             unset 'POOL_WORKER_EXIT[$p]'
         fi
     done
@@ -898,9 +1154,39 @@ _pool_sweep_finished() {
     return 0
 }
 
+# Consumes one worker's result record and folds it into the run tally. Keyed by
+# worker id (not pid) and deleting the record as it reads it, so a sweep that
+# sees the same id twice cannot double-count it; a pid-reuse rebind simply finds
+# no record and counts nothing.
+# $1 = worker id.
+_pool_consume_result() {
+    local worker_id="$1"
+    local result_file key value counted=0
+
+    result_file="$(shard_path_for "$POOL_LOG_FILE" "$worker_id" result)"
+    [ -s "$result_file" ] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PROCESSED)
+                POOL_PROCESSED=$((POOL_PROCESSED + ${value:-0}))
+                counted=1
+                ;;
+            FAIL)
+                POOL_FAIL=$((POOL_FAIL + ${value:-0}))
+                ;;
+        esac
+    done < "$result_file"
+    rm -f "$result_file"
+    if [ "$counted" = '1' ]; then
+        POOL_SUCCESS=$((POOL_PROCESSED - POOL_FAIL))
+    fi
+    return 0
+}
+
 # Feeds the list to the pool, keeping POOL_JOBS workers in flight. Every dispatched
 # path is appended to the index (so a replay keeps file order), and completions are
-# swept before each start so finished pids do not pile up.
+# swept (and counted, and drawn) before each start so finished pids do not pile up
+# and the bar advances while the pool keeps working.
 # $1 = NUL-separated list, $2 = worker count, $3 = run log,
 # $4 = result channel, $5 = library root, $6 = backup root, $7 = bar label.
 _pool_dispatch_loop() {
@@ -910,79 +1196,60 @@ _pool_dispatch_loop() {
     local result_channel="$4"
     local library_dir="$5"
     local backup_root="$6"
-    local label="$7"
     local flac_file total_files
 
     total_files=$(_count_nul_list "$list_path")
-    # Read by _pool_drain for its closing N/N render.
-    # shellcheck disable=SC2034  # read by _pool_drain (same script scope)
-    POOL_TOTAL_FILES="$total_files"
 
     exec 3< "$list_path"
     while IFS= read -r -d '' flac_file <&3; do
         printf '%s\n' "$flac_file" >> "$POOL_INDEX"
 
-        # Backpressure: block on ANY worker finishing, then sweep, so a freed slot
-        # is refilled immediately instead of after the whole batch.
+        # Backpressure: block on ANY worker finishing, then sweep (counting and
+        # drawing every completion), so a freed slot is refilled immediately
+        # instead of after the whole batch.
         while :; do
             _pool_sweep_finished
+            progress_update "$POOL_PROCESSED" "$POOL_FAIL"
             [ "$POOL_RUNNING" -lt "$jobs" ] && break
             wait -n "${POOL_PIDS[@]}" 2>/dev/null || true
         done
 
         if ! _pool_start_worker "$POOL_NEXT_ID" "$flac_file" "$log_file" \
                 "$library_dir" "$backup_root"; then
+            # A failed fork is a completed (failed) file with no result record.
             POOL_FAIL=$((POOL_FAIL + 1))
             POOL_PROCESSED=$((POOL_PROCESSED + 1))
+            POOL_SUCCESS=$((POOL_PROCESSED - POOL_FAIL))
+            progress_update "$POOL_PROCESSED" "$POOL_FAIL"
         fi
         POOL_NEXT_ID=$((POOL_NEXT_ID + 1))
-
-        # Redrawn on EVERY dispatch, so the bar reflects real progress rather than
-        # merely dispatched work. Guarded on a non-empty list: show_progress divides
-        # by the total.
-        if [ "$POOL_MODE" -eq 1 ] || [ "$POOL_MODE" -eq 0 ]; then
-            [ "$total_files" -gt 0 ] && _pool_report_progress "$total_files" "$label"
-        fi
     done
     exec 3<&-
     return 0
 }
 
-# Waits for the last in-flight workers, sweeping completions as they land. The
-# non-blocking first sweep means an already-empty pool returns immediately.
-# $1 = bar label.
+# Waits for the last in-flight workers, sweeping (and counting, and drawing) each
+# completion as it lands. The non-blocking first sweep means an already-empty pool
+# returns immediately. No final render is needed here: the caller's progress_end
+# draws the closing N/N once the tally is complete.
 _pool_drain() {
-    local label="$1"
     while :; do
         _pool_sweep_finished
+        progress_update "$POOL_PROCESSED" "$POOL_FAIL"
         [ "$POOL_RUNNING" -eq 0 ] && break
         wait -n "${POOL_PIDS[@]}" 2>/dev/null || true
     done
-    # Final render: the last completions land during the drain and would otherwise
-    # never be drawn, leaving the bar short of N/N.
-    if [ "${POOL_TOTAL_FILES:-0}" -gt 0 ] \
-            && { [ "$POOL_MODE" -eq 1 ] || [ "$POOL_MODE" -eq 0 ]; }; then
-        _pool_report_progress "$POOL_TOTAL_FILES" "$label"
-    fi
     return 0
 }
 
-# Renders one progress update from the COMPLETION tally (POOL_PROCESSED/
-# POOL_FAIL), so a captured run's footer matches its replayed per-file lines.
-# $1 = total file count, $2 = bar label.
-_pool_report_progress() {
-    local total="$1"
-    local label="$2"
-    show_progress "$POOL_PROCESSED" "$total" "$POOL_FAIL" "$label"
-    return 0
-}
-
-# Reads the KEY=VALUE records every worker wrote into its own '<shard>.result'
-# and updates POOL_PROCESSED/POOL_SUCCESS/POOL_FAIL. One record per file, written
-# by the worker, so each outcome is counted exactly once; files are removed as
-# they are read, making this idempotent.
+# Reads any KEY=VALUE records a sweep did not consume (a worker that exited
+# between the last sweep and the drain's exit, or a fork-failure rundown) and
+# updates POOL_PROCESSED/POOL_SUCCESS/POOL_FAIL. Normally a no-op safety net: the
+# per-exit sweep already consumed every record. One record per file, written by
+# the worker, so each outcome is counted exactly once; files are removed as they
+# are read, making this idempotent.
 _pool_tally_results() {
-    local shard_path result_file key value
+    local shard result_file key value
 
     # Ids are handed out per FILE, not per worker slot (8 files on 4 workers own
     # shards w0..w7), hence the high-water id rather than the job count.
@@ -1059,6 +1326,12 @@ _pool_interrupt_cleanup() {
 
     local p
 
+    # Wipe the live bar first: the message below must start on its own row rather
+    # than be appended to a half-drawn progress line.
+    progress_clear
+    PROGRESS_ACTIVE=0
+    PROGRESS_DRAW_LIVE=0
+
     printf '\nInterrupted (signal %s): stopping workers...\n' "$signo" >&2
 
     # Kill each worker AND its 'flac' grandchild: killing only the worker leaves a
@@ -1111,19 +1384,53 @@ _pool_interrupt_cleanup() {
     exit "$((128 + signo))"
 }
 
-# The sequential scan's ORIGINAL cadence (every 50 files, or on a whole-percent
-# advance), preserved verbatim because the tty rendering is pinned by tests.
-# SCAN_LAST_PERCENT is script-scope state the caller initialises.
-# $1 = processed, $2 = total, $3 = errors, $4 = label (ignored: a scan bar has none)
-_scan_seq_progress() {
-    local processed="$1"
-    local total="$2"
-    local errors="$3"
-
-    if (( processed % 50 == 0 || processed * 100 / total > SCAN_LAST_PERCENT )); then
-        show_progress "$processed" "$total" "$errors"
-        SCAN_LAST_PERCENT=$((processed * 100 / total))
+# One mode policy for every operation, so options 1/2/4/5 behave identically:
+#   mode 0 - a terminal: the live single-line bar. Pooled children keep status
+#            text off the screen (it goes to their log shards), and a sequential
+#            run reprints the bar under each status line instead.
+#   mode 1 - no terminal, jobs<=1: sequential; no bar (progress lines would only
+#            add noise to an already per-file log).
+#   mode 2 - no terminal, jobs>1: periodic plain "Progress:" lines while the pool
+#            runs, then the per-file status lines replayed in FILE ORDER.
+# Echoes the mode; $1 = worker count.
+select_pool_mode() {
+    local jobs="$1"
+    if stdout_is_tty; then
+        printf '0\n'
+    elif [ "$jobs" -le 1 ]; then
+        printf '1\n'
+    else
+        printf '2\n'
     fi
+}
+
+# Runs the reencode pool for one fully-materialised seed list and folds the
+# workers' shards back into the run log and tracking DB. Shared by options 2/4/5
+# so the progress rendering, per-file status routing and shard merge cannot drift
+# between them. Sets POOL_PROCESSED/POOL_SUCCESS/POOL_FAIL (and POOL_WORKERS_USED,
+# already consumed by the merge).
+# $1 = worker count, $2 = run log, $3 = tracking DB, $4 = library root,
+# $5 = backup root, $6 = NUL-separated seed list.
+run_reencode_pool() {
+    local jobs="$1"
+    local log_file="$2"
+    local db_path="$3"
+    local library_dir="$4"
+    local backup_root="$5"
+    local seed_list="$6"
+    local pool_mode
+
+    pool_mode=$(select_pool_mode "$jobs")
+    # Pooled workers must never echo status text over the live bar; a sequential
+    # run keeps statuses on the console and lets write_status reprint the bar.
+    if [ "$pool_mode" -eq 0 ] && [ "$jobs" -gt 1 ]; then
+        STATUS_TO_CONSOLE=0
+    fi
+    run_file_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list" "$pool_mode" "failed"
+    STATUS_TO_CONSOLE=1
+
+    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
     return 0
 }
 
@@ -1163,13 +1470,17 @@ run_scan_pool() {
     local library_dir="${4%/}"
     local mode
 
-    # A scan has no per-file status text of its own to hide: this function prints
-    # its errors from the shards, in order. Mode 1 = sequential (progress via the
-    # hook below), mode 2 = pooled with worker output replayed afterwards. The
-    # bar itself is owned by scan_library.
-    mode=2
-    if [ "$jobs" -le 1 ]; then
+    # A scan has no per-file status text of its own to hide: it prints its errors
+    # from the shards, in order, after the run. The same mode policy as the reencode
+    # paths: a terminal gets the live bar (0); a captured sequential run emits no
+    # bar (1); a captured pooled run gets periodic plain progress lines and the
+    # replayed per-file lines (2).
+    if stdout_is_tty; then
+        mode=0
+    elif [ "$jobs" -le 1 ]; then
         mode=1
+    else
+        mode=2
     fi
 
     POOL_WORKER_FN="_scan_pool_worker"
@@ -1177,8 +1488,6 @@ run_scan_pool() {
     # A PER-FILE failure list, so even the sequential path needs one shard per
     # file (named from the run-log basename, like the pooled path).
     POOL_SEQ_CHANNEL_PREFIX="$(basename "$log_file")"
-    # Only the sequential path uses this hook; the pooled path redraws per dispatch.
-    POOL_SEQ_PROGRESS_FN="_scan_seq_progress"
     # Collected into a temp file, not a variable, because a path may contain any
     # byte but NUL and a newline-containing path would look like two entries.
     SCAN_FAILURES_FILE="$(mktemp "${TMPDIR:-/tmp}/flac_scan_fail.XXXXXX")"
@@ -1272,25 +1581,21 @@ scan_library() {
 
     error_count=0
     start_time=$(date +%s)
-    # Whole-percent high-water mark for the sequential progress cadence
-    # (see _scan_seq_progress), kept in script scope across the run.
-    SCAN_LAST_PERCENT=0
 
-    # jobs=1 keeps the historical strictly-sequential behavior, and its output is
-    # byte-identical to it: same progress cadence, same interleaved error lines.
-    # jobs>1 runs the pool, whose worker ids match dispatch order, so the errors
-    # it reports afterwards come out in exactly this same file order.
+    # jobs=1 is strictly sequential (no children); jobs>1 runs the pool, whose
+    # worker ids match dispatch order, so the errors it reports afterwards come out
+    # in the same file order either way.
     jobs="$(get_jobs)"
     if [ "$jobs" -gt 1 ]; then
         echo ""
         echo "Scanning with $jobs worker(s)..."
         echo ""
     fi
+    # The progress display (live bar, or plain lines when captured) is owned by the
+    # pool: it starts on the 0% state and ends on the final N/N line, so the error
+    # list and summary below start on a clean row.
     run_scan_pool "$jobs" "$scan_list_file" "$scan_log" "$library_dir"
     processed_count="$POOL_PROCESSED"
-
-    # Clear progress line
-    clear_progress
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
@@ -1500,35 +1805,19 @@ reencode_library() {
         return 0
     fi
 
-    # Per-file status text and a single-line animated bar cannot share a live
-    # terminal, so reporting depends on the destination and the worker count:
-    #   mode 1 - jobs=1: historical behavior, statuses echoed as each file is done.
-    #   mode 0 - pooled on a terminal: statuses stay in the shards, merged into the
-    #            run log later, so nothing glues onto the animated bar.
-    #   mode 2 - pooled on a pipe/redirect: no bar to protect, so per-file lines
-    #            are replayed in FILE ORDER once the pool drains.
-    local pool_mode
-    if [ "$jobs" -le 1 ]; then
-        pool_mode=1
-    elif stdout_is_tty; then
-        pool_mode=0
-    else
-        pool_mode=2
-    fi
-
     # The work list is fully materialised before the pool starts, so a worker's
     # temp file can never be picked up mid-run.
     echo ""
     echo "Processing $total_files file(s) with $jobs worker(s)..."
     echo ""
-    run_file_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
-        "$seed_list" "$pool_mode" "Failed"
+    # Progress display, status routing and the shard merge are shared with options
+    # 4/5 (see run_reencode_pool), so all long-running options render identically.
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list"
     success_count=$POOL_SUCCESS
     fail_count=$POOL_FAIL
 
-    # Fold each worker's log and DB shards into the run log and the real DB, then
-    # discard the work list.
-    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    # Discard the work list (the shards were already folded back by the helper).
     rm -f "$seed_list"
     rmdir "$seed_dir" 2>/dev/null || true
 
@@ -1638,13 +1927,6 @@ reencode_all_files() {
 
     start_time=$(date +%s)
 
-    # Render mode: on a terminal keep one fixed single-line bar and hold status
-    # text off the screen (STATUS_TO_CONSOLE=0); on a pipe print every
-    # SUCCESS/FAILURE line as text. Either way the log gets every status. stdout's
-    # tty state is resolved once here, not in the loop.
-    local live_tty
-    if stdout_is_tty; then live_tty=1; else live_tty=0; fi
-
     # Materialise the work list FIRST: find_real_flac_files excludes the script's
     # own paths, but not a temp file written into a library directory during the
     # run, and a live "find | pool" pipe could hand such a temp to a worker.
@@ -1653,34 +1935,17 @@ reencode_all_files() {
     mkdir -p "$seed_dir"
     find_real_flac_files "$library_dir" -print0 > "$seed_list"
 
-    if [ "$jobs" -le 1 ]; then
-        pool_mode=1
-    else
-        # A single-line bar and per-file status text cannot share a terminal, so
-        # pooled tty runs keep statuses in the log (mode 0) and rely on the bar,
-        # while pooled captured runs replay them in file order (mode 2).
-        if [ "$live_tty" = "1" ]; then pool_mode=0; else pool_mode=2; fi
-    fi
-    if [ "$pool_mode" -eq 1 ]; then
-        STATUS_TO_CONSOLE=$(( 1 - live_tty ))
-    fi
-
     echo "Processing $total_files file(s) with $jobs worker(s)..."
-    run_file_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
-        "$seed_list" "$pool_mode" "Failed"
+    # Same progress display, status routing and shard merge as options 2/5.
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list"
     processed_count=$POOL_PROCESSED
     success_count=$POOL_SUCCESS
     fail_count=$POOL_FAIL
 
-    # Fold each worker's log + DB shards into the run log and the real tracking
-    # DB, then discard the work list.
-    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    # Discard the work list (the shards were already folded back by the helper).
     rm -f "$seed_list"
     rmdir "$seed_dir" 2>/dev/null || true
-
-    # Clear the progress line and restore console status output.
-    clear_progress
-    STATUS_TO_CONSOLE=1
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
@@ -1838,35 +2103,17 @@ reencode_new_files() {
         printf '%s\0' "$flac_file" >> "$seed_list"
     done
 
-    # Render mode as in reencode_all_files(): one animated bar on a terminal
-    # (statuses stay in the log), replayed status lines in file order otherwise.
-    local live_tty
-    if stdout_is_tty; then live_tty=1; else live_tty=0; fi
-    if [ "$jobs" -le 1 ]; then
-        pool_mode=1
-        STATUS_TO_CONSOLE=$(( 1 - live_tty ))
-    elif [ "$live_tty" = "1" ]; then
-        pool_mode=0
-    else
-        pool_mode=2
-    fi
-
     echo "Processing $new_count file(s) with $jobs worker(s)..."
-    run_file_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
-        "$seed_list" "$pool_mode" "Failed"
+    # Same progress display, status routing and shard merge as options 2/4.
+    run_reencode_pool "$jobs" "$log_file" "$db_path" "$library_dir" "$backup_root" \
+        "$seed_list"
     processed_count=$POOL_PROCESSED
     success_count=$POOL_SUCCESS
     fail_count=$POOL_FAIL
 
-    # Fold each worker's log + DB shards into the run log and the real tracking
-    # DB, then discard the work list.
-    merge_reencode_shards "$log_file" "$db_path" "$POOL_WORKERS_USED"
+    # Discard the work list (the shards were already folded back by the helper).
     rm -f "$seed_list"
     rmdir "$seed_dir" 2>/dev/null || true
-
-    # Clear the progress line and restore console status output.
-    clear_progress
-    STATUS_TO_CONSOLE=1
 
     end_time=$(date +%s)
     duration=$((end_time - start_time))
