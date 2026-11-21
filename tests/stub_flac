@@ -14,6 +14,9 @@
 #   STUB_FLAC_SLEEP       seconds to sleep on the re-encode path
 #   STUB_FLAC_TEST_SLEEP  seconds to sleep on the verify path ('flac -t')
 #   STUB_FLAC_SLOT_DIR    directory that turns the stub into a concurrency probe
+#   STUB_FLAC_RECORD_ARGS file that receives one line per invocation (args joined)
+#   STUB_FLAC_MD5_CHECK   1 = emulate flac >= 1.5: a FLAC->FLAC re-encode of a file
+#                         containing MD5MISMATCH exits 1 unless --until= is passed
 #
 # The sleeps exist so case_parallel.sh can hold N operations open at once and
 # observe real overlap: an instant stub finishes before the parent can fork the
@@ -33,10 +36,17 @@
 out=''
 infile=''
 prev=''
+until_seen=false
 for arg in "$@"; do
     if [ "$prev" = '-o' ]; then
         out="$arg"
     fi
+    case "$arg" in
+        --until=*)
+            # Any non-zero --until disables the flac >= 1.5 input-MD5 comparison.
+            until_seen=true
+            ;;
+    esac
     prev="$arg"
 done
 
@@ -83,10 +93,29 @@ if [ -n "${STUB_FLAC_SLEEP:-}" ]; then
     sleep "$STUB_FLAC_SLEEP"
 fi
 
+# Optional invocation log (one line per call, args space-joined), so a test can
+# assert HOW MANY attempts a file took and WHICH flags the retry carried.
+if [ -n "${STUB_FLAC_RECORD_ARGS:-}" ]; then
+    printf '%s\n' "$*" >> "$STUB_FLAC_RECORD_ARGS"
+fi
+
 # Re-encode mode: overwrite the temp target with a single file-INDEPENDENT marker
 # line, so tests can assert "original replaced by the marker" and "no backup ever
 # carries the marker" without depending on the file name.
 if [ -n "$out" ]; then
     printf 'REENCODE_OK\n' > "$out"
+fi
+
+# Emulate flac >= 1.5's FLAC->FLAC integrity check (upstream commit a9306bb): when
+# the input's STREAMINFO MD5 disagrees with the audio it decodes to - the damaged
+# input this script exists to repair - flac writes the output and then exits 1 with
+# "MD5sum of input is different from MD5sum of output". A non-zero --until
+# suppresses the comparison, which is the escape hatch reencode_one_file uses.
+# Gated by STUB_FLAC_MD5_CHECK so every other case keeps the plain behaviour, and
+# keyed on a content marker so a fixture can choose which files "mismatch".
+if [ "${STUB_FLAC_MD5_CHECK:-0}" = '1' ] && [ -n "$out" ] \
+        && grep -q MD5MISMATCH "$infile" 2>/dev/null && [ "$until_seen" != 'true' ]; then
+    echo "stub flac: $infile: ERROR: MD5sum of input is different from MD5sum of output" >&2
+    exit 1
 fi
 exit 0

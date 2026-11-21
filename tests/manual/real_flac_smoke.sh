@@ -123,7 +123,23 @@ $expected"
     #
     # KEEP THIS COMMAND IN STEP WITH reencode_one_file() in flac_health_reencode.sh
     # (its 'flac --verify --compression-level-0 --decode-through-errors' line): that
-    # is what defines "salvageable", so both sides must use the same flags.
+    # is what defines "salvageable", so both sides must use the same flags - INCLUDING
+    # the --until retry. flac >= 1.5 refuses a FLAC->FLAC re-encode whose decoded
+    # audio no longer matches the input's MD5 (which is the whole point of repairing
+    # a damaged file), and a non-zero --until disables that comparison.
+    salvage_one() {
+        local src="$1" dst="$2" total
+        flac --verify --compression-level-0 --decode-through-errors --preserve-modtime \
+             --silent -o "$dst" "$src" && return 0
+        total="$(metaflac --show-total-samples "$src" 2>/dev/null || true)"
+        rm -f "$dst"
+        case "$total" in
+            ''|*[!0-9]*|0) return 1 ;;
+        esac
+        flac --verify --compression-level-0 --decode-through-errors --preserve-modtime \
+             --silent --until="$total" -o "$dst" "$src"
+    }
+
     local n want_format got_format salvageable got_samples
     for n in 02 04; do
         want_format="$(metaflac --show-bps --show-sample-rate --show-channels \
@@ -135,8 +151,7 @@ $expected"
 
         # A measurement, not a fixture: outside the library and the backup tree, so
         # it can skew neither the residue checks nor the backup count.
-        flac --verify --compression-level-0 --decode-through-errors --preserve-modtime \
-             --silent -o "$sbx/salvage$n.flac" "$pristine/track$n.corrupt" \
+        salvage_one "$pristine/track$n.corrupt" "$sbx/salvage$n.flac" \
             || mlib_fail "jobs=$jobs: could not measure the salvageable length of track$n"
         salvageable="$(metaflac --show-total-samples "$sbx/salvage$n.flac")"
         got_samples="$(metaflac --show-total-samples "$sbx/lib/track$n.flac")"

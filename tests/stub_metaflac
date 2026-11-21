@@ -23,6 +23,28 @@ case " $* " in
             exit 0
         fi
         ;;
+    *' --show-total-samples '*)
+        # The script reads this ONLY on the damaged-input retry path (see
+        # reencode_one_file): flac >= 1.5 refuses a FLAC->FLAC re-encode whose
+        # decoded audio no longer matches the input's STREAMINFO MD5, and a non-zero
+        # --until disables that comparison. Any positive, stable number works here,
+        # since the stub never actually trims. Derived from the file size so it is
+        # deterministic and non-zero for every real (non-empty) fixture.
+        file=''
+        prev=''
+        for arg in "$@"; do
+            if [ "$prev" = '--show-total-samples' ]; then
+                file="$arg"
+                break
+            fi
+            prev="$arg"
+        done
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            size=$(wc -c < "$file")
+            printf '%s\n' "$(( size * 100 ))"
+            exit 0
+        fi
+        ;;
 esac
 
 # Anything else: report success with no output (callers tolerate that).

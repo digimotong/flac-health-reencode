@@ -160,3 +160,15 @@ sudo apt-get install flac jq
 # macOS
 brew install flac jq
 ```
+
+### flac 1.5 and later
+
+flac 1.5 added a check that refuses to re-encode a FLAC file to FLAC when the
+input's stored MD5 signature no longer matches the audio it decodes to
+(`ERROR: MD5sum of input is different from MD5sum of output`). That is precisely
+the state of a damaged file, so on 1.5+ the script re-encodes **twice** for those
+files: once normally, and - only if flac refuses - once more with
+`--until=<total samples>`, which upstream uses to disable that comparison while
+still encoding the whole file. Healthy files are still encoded once and keep the
+check, and every such retry is noted in the run log. Nothing needs configuring;
+older flac versions simply never take the second path.

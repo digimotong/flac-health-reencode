@@ -739,10 +739,29 @@ reencode_one_file() {
     fi
 
     # Reencode the file using the specified FLAC parameters.
+    #
+    # flac >= 1.5 refuses a FLAC->FLAC re-encode when the input's STREAMINFO MD5
+    # disagrees with the audio it decodes to ("MD5sum of input is different from
+    # MD5sum of output"). That is exactly the damaged-input case
+    # --decode-through-errors exists for, so on those files the new check would
+    # turn every repair into a failure. Upstream disables the comparison whenever a
+    # non-zero --until is given, so: encode normally first (keeping the check, and
+    # its corruption warning, for healthy files) and retry ONCE with
+    # --until=<total samples>, which is the whole file and encodes the same range.
+    local total_samples=''
     if ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent -o "$temp_file" "$flac_file"; then
-        write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
-        [ -f "$temp_file" ] && rm "$temp_file"
-        return 1
+        total_samples=$(metaflac --show-total-samples "$flac_file" 2>/dev/null || true)
+        rm -f "$temp_file"
+        if ! [[ "$total_samples" =~ ^[0-9]+$ ]] || [ "$total_samples" -eq 0 ] \
+            || ! flac --verify --compression-level-0 --decode-through-errors --preserve-modtime --silent \
+                    --until="$total_samples" -o "$temp_file" "$flac_file"; then
+            write_status "FAILURE: Reencoding failed for $flac_file" "$log_file"
+            [ -f "$temp_file" ] && rm "$temp_file"
+            return 1
+        fi
+        # Log-only (not console): the retry is a cost worth explaining in the audit
+        # trail, but it is not an error and would otherwise scroll past unnoticed.
+        echo "Note: damaged input; re-encoded with --until=$total_samples after flac refused the plain re-encode (MD5 check): $flac_file" >> "$log_file"
     fi
 
     # mkdir -p builds the whole relative chain, so a fresh backup root needs no
