@@ -365,8 +365,11 @@ scan_run 1 SCAN_SEQ_CSV
     || _fail "jobs=1 scan: scanned count != $SCAN_COUNT"
 [ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \
     || _fail "jobs=1 scan: expected exactly ${#SCAN_BAD[@]} error lines"
-# Sequential scan renders its historical plain-text bar line.
-occur_re 'Progress: \[#+-*\]'
+# A captured SEQUENTIAL scan reports through its per-file lines only: the shared
+# progress display draws a bar on a terminal, plain "Progress:" lines for a POOLED
+# captured run, and nothing at all for a sequential captured one (a bar there
+# would just interleave with the per-file output the user can already see).
+absent_re 'Progress: \[#'
 # A scan must not announce workers it is not using: the marker appears only when jobs > 1,
 # so its absence here is part of the jobs=1 contract.
 absent_re 'Scanning with [0-9]+ worker\(s\)'
@@ -379,6 +382,10 @@ assert_peak 1 'jobs=1 scan' "$SCAN_COUNT"
 echo "  .. jobs=4 scan run (${SCAN_COUNT} files)"
 scan_run 4 SCAN_PAR_CSV
 occur_re 'Scanning with 4 worker\(s\)'
+# A POOLED captured scan reports progress as plain lines, because its per-file
+# output is suppressed during the run. This is the regression anchor for a
+# parallel scan that used to render nothing at all.
+occur_re 'Progress: \[#+-*\]'
 [ "$(captured_count 'Scanned ([0-9]+) files')" -eq "$SCAN_COUNT" ] \
     || _fail "jobs=4 scan: scanned count != $SCAN_COUNT"
 [ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \

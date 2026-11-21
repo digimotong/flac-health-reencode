@@ -16,6 +16,9 @@
 # pin the branch both ways: taken on a tty, not taken otherwise. Without the negative
 # control, "the marker appeared" would not prove the branch was chosen.
 #
+# It also pins that the live bar REACHES 100%: it is driven by completed files, and it
+# once stayed frozen at "0% (0/N)" for a whole run.
+#
 # `script` missing (or lacking PTY support) reports a SKIP rather than failing.
 
 set -o errexit
@@ -123,7 +126,12 @@ tty_occur_re "${ESC}\[K"
 # 3. The colourised "Library: <path>" banner must carry a real ESC too.
 tty_occur_re "${ESC}\[0;32mLibrary: "
 
-# 4. Guard the specific bug this case was written to catch: the literal backslash-033 text
+# 4. The live bar must reach completion: the final frame of a finished run is
+#    "100% (N/N)". This is the regression anchor for the bar that used to stay
+#    frozen at "0% (0/N)" because it was drawn from an unfilled counter.
+tty_occur_re "\\[#+\\] +100% \\(2/2\\)"
+
+# 5. Guard the specific bug this case was written to catch: the literal backslash-033 text
 #    must NEVER reach the terminal (that would mean a printf lost its escape
 #    interpretation).
 if grep -qF '\033[' "$CURRENT_OUT"; then
@@ -148,7 +156,9 @@ occur_re 'Scan complete\.'
 absent_re "${ESC}\[K"
 grep -qE -- "${ESC}\[" "$CURRENT_OUT" \
     && _fail "non-tty run emitted real ESC sequences"
-# The bar is a plain, self-terminated "Progress: [...]" line instead.
-occur_re 'Progress: \[#+-*\]'
-echo "ok: case_tty (non-tty control emits no escapes)"
+# And no animated bar was drawn at all: the live form is TTY-only. (This sandbox
+# runs jobs=1, and a captured sequential run reports through its per-file lines
+# rather than a bar, so no "Progress:" line may appear either.)
+absent_re 'Progress: \[#'
+echo "ok: case_tty (non-tty control emits no escapes and no bar)"
 
