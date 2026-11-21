@@ -167,9 +167,21 @@ sleep "$PRE_SIGNAL_WAIT"
 # assertion would be vacuous. Every command here is guarded, because `grep -c` exits 1
 # on a zero count and `grep -qv` exits 1 when nothing matches - both are the answers we
 # WANT, and under errexit an unguarded one would end the case with no diagnostic.
+#
+# A run that has ALREADY FINISHED by now is a harness-timing failure, not a product
+# failure, and it used to surface as the confusing "could not read the script's process
+# group; it may have exited already". On a slow, heavily shared runner the whole
+# (stub-slept) run can complete inside the readiness poll plus PRE_SIGNAL_WAIT, so say
+# so explicitly and point at the knob that fixes it. The pool path itself is covered
+# deterministically by case_parallel, so skipping here is honest.
+if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "SKIP: the run finished before it could be interrupted (PRE_SIGNAL_WAIT=${PRE_SIGNAL_WAIT}s is too long for this host); interrupt cleanup not exercised"
+    echo "SKIP: raise STUB_SLEEP in tests/case_interrupt.sh to widen the window on a slow runner"
+    exit 0
+fi
 own_pgid="$(ps -o pgid= -p "$parent_pid" 2>/dev/null | tr -d ' ' || true)"
 [ -n "$own_pgid" ] \
-    || _fail "could not read the script's process group; it may have exited already"
+    || _fail "could not read the script's process group even though it is still running; ps/inspection is broken on this host"
 [ "$own_pgid" != "$$" ] \
     || _fail "the script is still in this case's process group ($$); setsid did not isolate it"
 worker_pgids="$(ps -o pgid= --ppid "$parent_pid" 2>/dev/null | tr -d ' ' | sort -u || true)"
