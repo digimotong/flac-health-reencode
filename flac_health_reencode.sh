@@ -584,6 +584,21 @@ validate_backup_root() {
     lib_real="$(canonical_dir "$library_dir")" || lib_real="$library_dir"
     bak_real="$(canonical_dir "$backup_root")" || bak_real="$backup_root"
 
+    # A backup at the filesystem root is refused, including the spellings that do not
+    # look like it: '/tmp/..' collapses to '/', and '//' survives as a spelling in its
+    # own right (a stored '//' reaches this check as '///', after one trailing slash is
+    # stripped). Mirroring a library there would scatter originals across the root
+    # filesystem, and the '<backup>/<rel>' prefix test below cannot see it - for '//'
+    # its pattern is "//*", which never matches. All-slash spellings are therefore
+    # refused together.
+    case "$bak_real" in
+        *[!/]*|'') : ;;                              # has a non-slash: a real path
+        *)
+            echo "Error: The backup directory cannot be the filesystem root." >&2
+            return 1
+            ;;
+    esac
+
     if [ "$lib_real" = "$bak_real" ]; then
         echo "Error: The backup directory cannot be the library itself ($bak_real)." >&2
         return 1
@@ -789,6 +804,19 @@ reencode_one_file() {
     else
         echo "Backup created for: $flac_file -> $backup_target" >> "$log_file"
     fi
+
+    # The temp was created by flac with the umask's permissions and this process's
+    # owner, and --preserve-modtime only restores the timestamp, so 'mv' would
+    # otherwise hand the library a file with different mode/owner than the original
+    # (a strict umask can drop a media server's read access). The BACKUP is faithful
+    # (cp -p); make the replacement faithful too, before it takes the original's
+    # place. Best-effort: a chown the user is not allowed to make is normal (the file
+    # is already theirs) and must not fail the reencode, but a chmod failure is worth
+    # a log line because the file then differs from its neighbours.
+    if ! chmod --reference="$flac_file" "$temp_file" 2>/dev/null; then
+        echo "WARNING: could not copy the original permissions onto the reencoded file: $flac_file" >> "$log_file"
+    fi
+    chown --reference="$flac_file" "$temp_file" 2>/dev/null || true
 
     # Replace the original file with the reencoded version.
     if ! mv "$temp_file" "$flac_file"; then
@@ -1024,11 +1052,17 @@ _count_lines() {
 # $1 = library root.
 acquire_run_lock() {
     local library_dir="$1"
-    local lock_dir="${library_dir}/.flac_scan_data/lock"
-    local owner_pid=''
+    local lock_dir owner_pid=''
 
     RUN_LOCK_DIR=''
     command -v ps >/dev/null 2>&1 || return 0
+    # Key the lock on the RESOLVED library, so two spellings or a symlinked route to
+    # the same library ('/mnt/music', '/mnt/music/', '/media/music -> /mnt/music')
+    # collide exactly as they should. canonical_dir returns 1 when the directory is
+    # unusable, which leaves the lock inside the spelling the caller gave.
+    library_dir="$(canonical_dir "$library_dir")" || library_dir="${1%/}"
+    lock_dir="${library_dir}/.flac_scan_data/lock"
+
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 0
 
     if mkdir "$lock_dir" 2>/dev/null; then
@@ -1249,7 +1283,14 @@ _pool_sweep_finished() {
             unset 'POOL_WORKER_EXIT[$p]'
         fi
     done
-    POOL_PIDS=("${remaining[@]}")
+    # Guarded for bash 4.3, where expanding an EMPTY array under 'set -u' is an
+    # error (4.4 fixed that): this assignment runs on every sweep, including the
+    # one that empties the pool.
+    if [ "${#remaining[@]}" -gt 0 ]; then
+        POOL_PIDS=("${remaining[@]}")
+    else
+        POOL_PIDS=()
+    fi
     POOL_RUNNING=${#POOL_PIDS[@]}
     return 0
 }
@@ -2198,11 +2239,19 @@ reencode_new_files() {
         return
     fi
 
-    # Discovery pass: gather files absent from the tracking DB.
+    # Discovery pass: gather files absent from the tracking DB. Fingerprinting every
+    # file takes a while on a large library (three child processes per file), so a
+    # counter is printed every 1000 files - on stderr to a terminal only, so a piped
+    # run's captured output is unchanged.
     echo "Checking which FLAC files have never been reencoded ($db_entries entry/entries in '$db_path')..."
     new_files=()
     skipped_count=0
+    checked_count=0
     while IFS= read -r -d '' flac_file; do
+        checked_count=$((checked_count + 1))
+        if stdout_is_tty && [ $((checked_count % 1000)) -eq 0 ]; then
+            printf '\r  checked %d of %d file(s)...\033[K' "$checked_count" "$total_files" >&2
+        fi
         # Guard on the exit status, not on a non-empty string: an unreadable or
         # corrupt fingerprint makes get_file_fingerprint return 1, and the file is
         # then treated as new below.
@@ -2219,6 +2268,10 @@ reencode_new_files() {
     done < <(find_real_flac_files "$library_dir" -print0)
 
     new_count=${#new_files[@]}
+    # End the counter line, so what follows starts on a clean row.
+    if stdout_is_tty && [ "$checked_count" -ge 1000 ]; then
+        printf '\r\033[K' >&2
+    fi
 
     if [ "$new_count" -eq 0 ]; then
         echo ""

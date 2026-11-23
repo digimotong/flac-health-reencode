@@ -161,3 +161,36 @@ find_result="$(find "$LIB4/Album" -name 'tmp_*' -print)"
 
 echo "ok: reencode_guards (stale .part cleared before re-encode)"
 
+# ===========================================================================
+# E. The REPLACEMENT keeps the original's mode and owner.
+#    flac writes the temp with the umask's permissions, and --preserve-modtime only
+#    restores the timestamp, so without an explicit copy the 'mv' would hand the
+#    library a file with different permissions than the one it replaced (a strict
+#    umask dropping a media server's read access is the case that matters).
+# ===========================================================================
+SBX5=''
+make_sandbox SBX5
+register_sandbox "$SBX5"
+LIB5="$SBX5/lib"
+mkdir -p "$LIB5/Album"
+write_file "$LIB5/Album/keep-mode.flac" 'orig'
+write_file "$LIB5/Album/default-mode.flac" 'orig'
+# A mode no umask would produce, so the assertion cannot pass by coincidence.
+chmod 640 "$LIB5/Album/keep-mode.flac"
+
+run_script "$SBX5" '4' 'REENCODE ALL' '' 'q'
+
+file_eq "$LIB5/Album/keep-mode.flac" "$RE_MARKER" \
+    || _fail "the file was not re-encoded, so its mode proves nothing"
+mode_kept="$(stat -c %a "$LIB5/Album/keep-mode.flac")"
+[ "$mode_kept" = '640' ] \
+    || _fail "re-encode changed the file mode: expected 640, got $mode_kept"
+# Ownership is copied best-effort; when nothing changed hands it must be unchanged.
+own_before="$(stat -c '%u:%g' "$LIB5/Album/keep-mode.flac")"
+own_backup="$(stat -c '%u:%g' "$SBX5/lib_backup/Album/keep-mode.flac")"
+[ "$own_before" = "$own_backup" ] \
+    || _fail "re-encoded file is owned by $own_before but its backup by $own_backup"
+
+echo "ok: reencode_guards (mode and owner preserved on the replacement)"
+
+

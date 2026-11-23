@@ -236,4 +236,39 @@ file_eq "$DEEP/Album/song.flac" 'CANCEL-ME' \
 file_eq "$LIB4/Album/song.flac" "$RE_MARKER"
 echo "ok: backup_location (cancelled run creates no backup dir)"
 
+# ===========================================================================
+# F. The filesystem root is refused even spelled in a way that canonicalises to it.
+#    '<backup>/<rel>' is built by prefix substitution, and for a backup of '//' the
+#    prefix test in validate_backup_root becomes "//*", which never matches - so a
+#    '//' or '/tmp/..' answer would have been accepted and the originals scattered
+#    across the root filesystem.
+# ===========================================================================
+SBX5=''
+make_sandbox SBX5
+register_sandbox "$SBX5"
+LIB5="$SBX5/lib"
+mkdir -p "$LIB5/Album"
+write_file "$LIB5/Album/song.flac" 'ROOT-ME'
+for root_spelling in '///' "$SBX5/../"; do
+    # '///' is literally what a stored '//' becomes once the script strips one trailing
+    # slash, and unlike '//' it has no special spelling for the OS to preserve, so it
+    # is the value that reaches validation. '<first-level-dir>/..' is '/' because '..'
+    # of a directory at the root is the root (make_sandbox creates $SBX5 in TMPDIR).
+    # No host-dependent probe is used, and none is wanted: it only became a silent SKIP.
+    printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
+        "$LIB5" "$root_spelling" > "$SBX5/flac_health_config.json"
+    run_script "$SBX5" '5' 'y' '' 'q'
+    # The refusal may name the root or the library-inside-backup rule (both are true
+    # for '<first-level>/..'); what matters is that nothing was re-encoded.
+    if ! clean_sandbox_output | grep -qE 'Error: The (backup directory cannot be the filesystem root|library cannot be inside the backup directory)'; then
+        echo "--- output for '$root_spelling' ---"
+        clean_sandbox_output | tail -8
+        _fail "a run with backup root '$root_spelling' was not refused"
+    fi
+    file_eq "$LIB5/Album/song.flac" 'ROOT-ME' \
+        || _fail "a run spelling the backup root as '$root_spelling' re-encoded the library anyway"
+done
+
+echo "ok: backup_location (filesystem root refused, however spelled)"
+
 
