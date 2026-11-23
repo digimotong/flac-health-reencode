@@ -123,3 +123,31 @@ occur_re 'Successful reencodes: 1'
 miss "$LIB2/.flac_scan_data/lock"
 
 echo "ok: run_lock (a stale lock is broken)"
+
+# ---------------------------------------------------------------------------
+# D. The lock keys on the RESOLVED library, so a second run that reaches the same
+#    library by another spelling is refused too. Without canonicalisation the two
+#    would take different lock paths and overlap - the exact corruption the lock
+#    exists to prevent.
+# ---------------------------------------------------------------------------
+SBX3=''
+make_sandbox SBX3
+register_sandbox "$SBX3"
+LIB3="$SBX3/lib"
+mkdir -p "$LIB3/Album"
+write_file "$LIB3/Album/song.flac" 'clean-audio'
+# A symlinked route to the same library: '<sbx>/alias' -> '<sbx>/lib'.
+ln -s "$LIB3" "$SBX3/alias"
+# The other run holds the lock as the script writes it: inside the RESOLVED library.
+start_lock_holder "$LIB3"
+
+# Configure the library by the SYMLINK path, with a trailing slash for good measure.
+printf '{"library_path": "%s", "backup_path": "%s", "version": "1.1"}\n' \
+    "$SBX3/alias/" "$SBX3/lib_backup" > "$SBX3/flac_health_config.json"
+run_script "$SBX3" '5' 'y' '' 'q'
+stop_lock_holder "$LIB3"
+occur_re "Another copy of this script is already working on '$LIB3'"
+file_eq "$LIB3/Album/song.flac" 'clean-audio' \
+    || _fail "a run reaching the library via a symlink bypassed the lock"
+
+echo "ok: run_lock (a symlinked route to the same library is refused)"
