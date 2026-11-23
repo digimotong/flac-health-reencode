@@ -80,6 +80,59 @@ load_reencoded_set "$DB"
 # Path-with-spaces round-trips through the DB (path is the LAST field).
 grep -qE 'track one\.flac$' "$DB" || fail "db missing path with spaces"
 
+# --- temp_path_for_file -------------------------------------------------------
+# The reencode temp sits beside the original. Normally 'tmp_<base>.part' (unchanged
+# from before); for a basename so long that the 9 extra bytes would exceed
+# TEMP_NAME_MAX, a fixed-length name hashed from the full path instead - a name the
+# kernel can create AND unlink, without which the file could never be re-encoded.
+[ "$(temp_path_for_file "/m/Music/A/track.flac")" = "/m/Music/A/tmp_track.flac.part" ] \
+    || fail "temp_path_for_file changed the ordinary temp name"
+# Spaces and non-ASCII characters are carried verbatim while the name still fits.
+[ "$(temp_path_for_file "/m/My Music/Thé Bleu.flac")" = "/m/My Music/tmp_Thé Bleu.flac.part" ] \
+    || fail "temp_path_for_file mangled a short name with spaces/accents"
+# A slash-less path keeps a directory component (dirname's '.'), never a bare name.
+[ "$(temp_path_for_file "track.flac")" = "./tmp_track.flac.part" ] \
+    || fail "temp_path_for_file lost the relative directory"
+
+# 255 ASCII bytes: the temp name (264) cannot exist, so a hashed one is used.
+# '02 - ' (5) + 245 characters + '.flac' (5) = 255.
+LONG_STEM=''
+printf -v LONG_STEM '%*s' 245 ''
+LONG_ASCII="/m/Music/A/02 - ${LONG_STEM// /x}.flac"
+long_tmp=$(temp_path_for_file "$LONG_ASCII") || fail "temp_path_for_file failed on a long name"
+[ "$long_tmp" != "$(dirname "$LONG_ASCII")/tmp_$(basename "$LONG_ASCII").part" ] \
+    || fail "temp_path_for_file kept the over-long temp name"
+[ "$(printf '%s' "${long_tmp##*/}" | wc -c)" -le 255 ] \
+    || fail "hashed temp name still exceeds NAME_MAX: ${long_tmp##*/}"
+case "${long_tmp##*/}" in
+    tmp_*.part) : ;;
+    *) fail "hashed temp name does not keep the tmp_*.part convention: ${long_tmp##*/}" ;;
+esac
+case "${long_tmp##*/}" in
+    *[!0-9a-fA-F_.tmp]) fail "hashed temp name is not plain hex: ${long_tmp##*/}" ;;
+esac
+[ "${long_tmp%/*}" = "/m/Music/A" ] || fail "hashed temp left the album directory: $long_tmp"
+
+# Deterministic: the interrupt sweep and the worker derive it independently, so the
+# same file must always yield the same name...
+[ "$(temp_path_for_file "$LONG_ASCII")" = "$long_tmp" ] \
+    || fail "temp_path_for_file is not deterministic for a long name"
+# ...but unique per file, so two long names in ONE album can never share a temp.
+# (Only the last character changes, so the replacement name is long as well.)
+LONG_OTHER="${LONG_ASCII%x.flac}y.flac"
+[ "$(printf '%s' "${LONG_OTHER##*/}" | wc -c)" -eq 255 ] || fail "second long fixture is not 255 bytes"
+[ "$(temp_path_for_file "$LONG_OTHER")" != "$long_tmp" ] \
+    || fail "two long names in one album collided on the same temp"
+
+# BYTES, not characters: 255 bytes of 2-byte 'é' is 127 characters, so a
+# locale-aware length check would keep the 264-byte name and reintroduce the bug.
+MB_SEG=''
+for (( i = 0; i < 125; i++ )); do MB_SEG="${MB_SEG}é"; done
+LONG_MB="/m/Music/A/${MB_SEG}.flac"
+[ "$(printf '%s' "${LONG_MB##*/}" | wc -c)" -eq 255 ] || fail "multibyte fixture is not 255 bytes"
+[ "$(temp_path_for_file "$LONG_MB")" != "/m/Music/A/tmp_${MB_SEG}.flac.part" ] \
+    || fail "temp_path_for_file measured characters, not bytes, for a multibyte name"
+
 # --- derive_backup_path -------------------------------------------------------
 # Pure: '<library>_backup', with any trailing slash normalised away first so
 # '/media/Music/' cannot yield '/media/Music/_backup'.
