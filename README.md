@@ -117,13 +117,13 @@ makes it look busy.
 
 ## Troubleshooting
 
-- `flac`, `metaflac` and `jq` are checked before the menu appears. A missing
-  tool exits with status `1` and a message naming the command, so install it and
-  run the script again.
+- `flac`, `metaflac`, `jq` and `md5sum` are checked before the menu appears. A
+  missing tool exits with status `1` and a message naming the command, so install
+  it and run the script again.
 
 ## Development
 
-Requires Bash 4.3+, `jq`, and `shellcheck` for linting.
+Requires Bash 4.3+, `jq`, `md5sum` (coreutils), and `shellcheck` for linting.
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -161,14 +161,15 @@ for what each script proves.
 ## Requirements
 
 - Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
-- `flac` (which also provides `metaflac`) and `jq`
+- `flac` (which also provides `metaflac`), `jq`, and `md5sum` (coreutils; names the
+  temp file of a basename too long for `tmp_<name>.part`)
 
 ```bash
 # Debian / Ubuntu
-sudo apt-get install flac jq
+sudo apt-get install flac jq coreutils
 
 # macOS
-brew install flac jq
+brew install flac jq md5sha1sum
 ```
 
 ### flac 1.5 and later

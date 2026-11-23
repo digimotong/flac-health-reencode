@@ -68,7 +68,7 @@ declare -g PROGRESS_LAST_DONE=-1
 declare -g POOL_WORKERS_USED=0
 
 # Interrupt cleanup state. POOL_TEMP_LIST is the run-local list of the in-library
-# temp files (tmp_<base>.part) the parent has dispatched, POOL_SEED_LIST is the
+# temp files (see temp_path_for_file) the parent has dispatched, POOL_SEED_LIST is the
 # run's NUL-separated work list, and POOL_INTERRUPT_ARMED latches so the handler
 # runs its sweep once. All three are only meaningful while a pooled run is in
 # flight: a scan dispatches no reencode temps and simply leaves POOL_TEMP_LIST
@@ -167,10 +167,11 @@ get_jobs() {
 # Required tools, checked before anything writes the config (a bare
 # "jq: command not found" would exit 127 and leave a zero-byte config behind).
 # Maps each command to its Debian/Ubuntu package for the install hint.
-for cmd in flac metaflac jq; do
+for cmd in flac metaflac jq md5sum; do
     if ! command -v "$cmd" &>/dev/null; then
         case "$cmd" in
             jq) pkg=jq ;;
+            md5sum) pkg=coreutils ;;   # hashes the temp name of an over-long basename
             *)  pkg=flac ;;   # the flac package also provides metaflac
         esac
         echo "Error: The '$cmd' command is not installed. Please install it (e.g., sudo apt-get install $pkg) and try again."
@@ -718,6 +719,56 @@ ensure_backup_root() {
     return 0
 }
 
+# Longest derived file NAME, in BYTES. 255 is the NAME_MAX ext4, XFS, Btrfs, ZFS
+# and the usual NFS/SMB servers agree on.
+readonly TEMP_NAME_MAX=255
+
+# Prints the in-library temp path a reencode of $1 will use. The ONE source of
+# truth: reencode_one_file creates it and _pool_start_worker records it for the
+# interrupt sweep, so the two can never disagree.
+#
+# Normally '<dir>/tmp_<base>.part', NOT '*.flac', so a live temp is invisible to
+# find_real_flac_files and an interrupted-run leftover can never be picked up by a
+# later scan or reencode-NEW. That name is 9 bytes LONGER than the original, so a
+# basename near NAME_MAX - Lidarr copies a long track title verbatim - yields a name
+# the kernel can neither create (flac: "ERROR initializing encoder", state
+# FLAC__STREAM_ENCODER_IO_ERROR) nor unlink (rm: "File name too long"), and the file
+# could never be reencoded. When the name does not fit, use
+# 'tmp_<md5 of the full path>.part' instead: fixed length, unique per file (two
+# workers in one directory can never share a temp) and deterministic, so the
+# pre-delete in reencode_one_file still clears a leftover from an interrupted run.
+# Returns 1 if no hash could be computed (only possible on the long-name path).
+temp_path_for_file() {
+    local flac_file="$1"
+    local file_dir base name digest
+    # Byte semantics, like the kernel's own limit: in a UTF-8 locale ${#name}
+    # counts multi-byte characters as one each, so it under-reports the on-disk
+    # length (a 255-byte name of 'é's looks like 128 characters).
+    local LC_ALL=C
+
+    # Same result as dirname/basename for a normal absolute path, without two forks
+    # per file. A slash-less path keeps '.' as dirname would; a '*/' basename also
+    # falls back to '.' rather than printing an empty one.
+    case "$flac_file" in
+        */*) file_dir=${flac_file%/*}; base=${flac_file##*/} ;;
+        *)   file_dir='.';              base=$flac_file ;;
+    esac
+    [ -n "$file_dir" ] || file_dir='/'
+    [ -n "$base" ] || base='.'
+
+    name="tmp_${base}.part"
+    if [ "${#name}" -gt "$TEMP_NAME_MAX" ]; then
+        digest=$(printf '%s' "$flac_file" | md5sum 2>/dev/null) || return 1
+        # md5sum prefixes its "<hex>  -" output; the hex is all that is kept.
+        digest=${digest%% *}
+        if ! [[ "$digest" =~ ^[0-9a-fA-F]+$ ]]; then
+            return 1
+        fi
+        name="tmp_${digest}.part"
+    fi
+    printf '%s/%s\n' "$file_dir" "$name"
+}
+
 # Core single-file reencode: back the original up into the mirrored backup tree,
 # run flac with --verify --compression-level-0 --decode-through-errors
 # --preserve-modtime, then replace the original with the reencoded temp on
@@ -734,19 +785,20 @@ reencode_one_file() {
     local library_dir="${4%/}"
     local backup_root="${5%/}"
 
-    local file_dir base temp_file backup_target
+    local temp_file backup_target
 
-    # Determine the file's directory and file name.
-    file_dir=$(dirname "$flac_file")
-    base=$(basename "$flac_file")
-    # 'tmp_<base>.part', NOT '*.flac', so a live temp is invisible to
-    # find_real_flac_files and an interrupted-run leftover can never be picked
-    # up by a later scan or reencode-NEW.
-    temp_file="${file_dir}/tmp_${base}.part"
+    # The temp sits beside the original so the final 'mv' stays on one filesystem.
+    # See temp_path_for_file for the naming (and the long-basename fallback).
+    if ! temp_file=$(temp_path_for_file "$flac_file"); then
+        write_status "FAILURE: Could not derive a temp file name for $flac_file" "$log_file"
+        return 1
+    fi
 
     # flac (without -f) refuses to write an existing output, so clear any
-    # leftover temp from an interrupted run. The name is the script's own.
-    rm -f "$temp_file"
+    # leftover temp from an interrupted run. The name is the script's own. A
+    # failure here is only a diagnostic: flac refuses the existing output anyway,
+    # and a name it cannot unlink must not abort the run with a raw 'rm' error.
+    rm -f "$temp_file" 2>/dev/null || true
 
     # A file outside the library root (possible for a row in a hand-edited or
     # older scan CSV) has nowhere to be backed up, so it is refused rather than
@@ -1032,8 +1084,8 @@ _count_lines() {
 
 # Serialises whole runs (scan, reencode 2/4/5) so two copies started at once cannot
 # share a run log, seed list or shard directory, or delete each other's temp files:
-# those names are timestamped to the SECOND and the per-file temp is a fixed
-# 'tmp_<base>.part', so same-second runs would overlap.
+# those names are timestamped to the SECOND and the per-file temp is derived from the
+# file itself (see temp_path_for_file), so same-second runs would overlap.
 #
 # The lock is a LOCK DIRECTORY created with 'mkdir' - atomic on every filesystem this
 # script supports - holding the owner's pid. A lock FILE plus flock(1) was the obvious
@@ -1218,9 +1270,15 @@ _pool_start_worker() {
     # Record the temp this file will use BEFORE forking, so the interrupt handler can
     # sweep it even if the signal lands mid-write. Appending to the run's manifest
     # (rather than a blanket find -delete) keeps a running sibling's live temp out of
-    # the sweep. A scan worker writes no temp, so its entry is skipped.
+    # the sweep. A scan worker writes no temp, so its entry is skipped. The name comes
+    # from the same helper reencode_one_file uses, so the sweep can never miss a temp.
     if [ "${POOL_CHANNEL_KIND:-db}" = 'db' ] && [ -n "$POOL_TEMP_LIST" ]; then
-        printf '%s\n' "${flac_file%/*}/tmp_${flac_file##*/}.part" >> "$POOL_TEMP_LIST"
+        local temp_path
+        # Missing the manifest entry is not fatal: the worker re-derives the same
+        # name and removes its own temp on every failure path.
+        if temp_path=$(temp_path_for_file "$flac_file"); then
+            printf '%s\n' "$temp_path" >> "$POOL_TEMP_LIST"
+        fi
     fi
 
     (
