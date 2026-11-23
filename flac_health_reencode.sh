@@ -82,6 +82,10 @@ declare -g POOL_PROCESSED=0
 declare -g POOL_SUCCESS=0
 declare -g POOL_FAIL=0
 
+# Path of the run-lock directory this process holds, or ''. Empty means no lock is
+# held (see acquire_run_lock / release_run_lock).
+declare -g RUN_LOCK_DIR=''
+
 # Set by run_scan_pool: files that failed verification, and files that could not
 # be tested at all. Declared here so 'set -u' callers can always read them.
 declare -g POOL_ERRORS=0
@@ -998,6 +1002,73 @@ _count_lines() {
     printf '%s\n' "$count"
 }
 
+# Serialises whole runs (scan, reencode 2/4/5) so two copies started at once cannot
+# share a run log, seed list or shard directory, or delete each other's temp files:
+# those names are timestamped to the SECOND and the per-file temp is a fixed
+# 'tmp_<base>.part', so same-second runs would overlap.
+#
+# The lock is a LOCK DIRECTORY created with 'mkdir' - atomic on every filesystem this
+# script supports - holding the owner's pid. A lock FILE plus flock(1) was the obvious
+# alternative, but a lock is held for as long as any process keeps the fd open, and a
+# script fd holding it is inherited by every child: a worker, or a grandchild a worker
+# spawns, would keep the library locked after this process had exited (observed as a
+# re-run refusing the lock the moment the previous run finished).
+#
+# A lock whose owner is gone (killed -9, machine rebooted) is broken automatically:
+# the owner's pid file is compared against the live process table. That process also
+# exports RUN_LOCK_DIR, so the EXIT trap can remove the lock on a normal exit and on a
+# signal handler's exit; a run that dies without a trap leaves a stale lock that the
+# next run breaks in one read.
+# Returns 0 when the lock is held (RUN_LOCK_DIR set), or 1 with the reason on stdout.
+# A no-op returning 0 when 'ps' is unavailable, since liveness can then not be judged.
+# $1 = library root.
+acquire_run_lock() {
+    local library_dir="$1"
+    local lock_dir="${library_dir}/.flac_scan_data/lock"
+    local owner_pid=''
+
+    RUN_LOCK_DIR=''
+    command -v ps >/dev/null 2>&1 || return 0
+    mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 0
+
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lock_dir/pid"
+        RUN_LOCK_DIR="$lock_dir"
+        return 0
+    fi
+
+    # Somebody else's lock. Two runs start together, so the owner may not have written
+    # its pid yet: treat an unreadable pid as live, never as stale.
+    owner_pid=$(cat "$lock_dir/pid" 2>/dev/null) || owner_pid=''
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+        # A stale lock from a run that died without its trap. Break it ONCE and retry;
+        # two runs breaking it at the same time both fail and both report busy, which
+        # is safe (a retried manual run succeeds).
+        rm -rf "$lock_dir" 2>/dev/null || true
+        if mkdir "$lock_dir" 2>/dev/null; then
+            printf '%s\n' "$$" > "$lock_dir/pid"
+            RUN_LOCK_DIR="$lock_dir"
+            return 0
+        fi
+    fi
+
+    echo "Error: Another copy of this script is already working on '$library_dir'."
+    echo "Wait for it to finish (or stop it) and try again - two runs at once would"
+    echo "overwrite each other's log, work list and temp files."
+    return 1
+}
+
+# Removes this process's run lock, if it holds one. Safe to call any number of times:
+# the EXIT trap of the menu loop calls it, and a signal handler ends the process with
+# an explicit exit that runs it too.
+release_run_lock() {
+    if [ -n "${RUN_LOCK_DIR:-}" ] && [ -d "$RUN_LOCK_DIR" ]; then
+        rm -rf "$RUN_LOCK_DIR" 2>/dev/null || true
+        RUN_LOCK_DIR=''
+    fi
+    return 0
+}
+
 # Creates the shard directory and the parent's in-flight state for one pooled run:
 # the dispatch index (file order, so the replay is deterministic) and the
 # pid -> worker-id map. $1 = worker count, $2 = run log path, $3 = the run's
@@ -1144,6 +1215,13 @@ _pool_start_worker() {
         exit "$rc"
     ) &
     pid=$!
+    # A failed fork leaves $! empty (or with a pid that cannot be tracked): report it
+    # so the caller counts the file as a FAILURE. Without this the id simply never
+    # produced a result shard and the file vanished from every tally, which is how a
+    # lost file used to look like a clean run.
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
     # shellcheck disable=SC2034  # read by _pool_sweep_finished (same script scope)
     POOL_WORKER_EXIT["$pid"]="$worker_id"
     POOL_PIDS+=("$pid")
@@ -1295,21 +1373,23 @@ _pool_tally_results() {
 # On a captured (non-tty) pooled run, prints the per-file SUCCESS/FAILURE lines in
 # FILE ORDER at the end: during the run they went only to the workers' log shards,
 # so this gives a piped run the same feedback a sequential one has without
-# interleaving worker output. Order comes from the dispatch index.
+# interleaving worker output.
+#
+# Order comes from the ids themselves: worker ids are allocated in DISPATCH order
+# (i.e. file order) and each id owns exactly one log shard, so replaying shard 0..N-1
+# and appending each shard's lines once reproduces file order without ever opening
+# the dispatch index. That also keeps this O(number of files): the previous version
+# nested a grep of every shard per file, which is O(N^2) process launches and
+# minutes-to-hours of dead time on a captured run of a real library - and for a
+# scan, whose worker writes no log shard at all, it was pure waste.
 _pool_replay_status_lines() {
-    local flac_file shard_path
+    local id shard_path
 
-    [ -s "$POOL_INDEX" ] || return 0
-
-    while IFS= read -r flac_file; do
-        for (( shard = 0; shard < POOL_NEXT_ID; shard++ )); do
-            shard_path="$(shard_path_for "$POOL_LOG_FILE" "$shard" log)"
-            [ -s "$shard_path" ] || continue
-            # Each file is handled by exactly one worker, so grepping this
-            # shard for its path pulls just its own line(s), WARNINGs included.
-            grep -F -- "$flac_file" "$shard_path" 2>/dev/null || true
-        done
-    done < "$POOL_INDEX"
+    for (( id = 0; id < POOL_NEXT_ID; id++ )); do
+        shard_path="$(shard_path_for "$POOL_LOG_FILE" "$id" log)"
+        [ -s "$shard_path" ] || continue
+        cat "$shard_path"
+    done
     return 0
 }
 
@@ -1396,11 +1476,33 @@ _pool_interrupt_cleanup() {
     if [ -n "${POOL_SEED_LIST:-}" ]; then
         rm -f "$POOL_SEED_LIST" 2>/dev/null || true
     fi
+    # Every OTHER seed list in the seed directory belongs to an earlier run that was
+    # killed (the run lock serialises concurrent ones, so no live run can be using
+    # them): those files are transient too, so clear them instead of letting each
+    # interrupted run leave one behind.
+    if [ -n "${POOL_SEED_LIST:-}" ] && [ -d "$(dirname "$POOL_SEED_LIST")" ]; then
+        rm -f "$(dirname "$POOL_SEED_LIST")"/*.paths 2>/dev/null || true
+    fi
     # A 'shards' sibling directory holds this run's shards when the run log lives
     # outside the library; remove it if this run created it. rm -rf (not rmdir) so a
     # killed worker's leftovers inside cannot strand it.
+    #
+    # Guarded: a kill -9 of this process releases the run lock at once, so a re-run
+    # can begin while this handler is still running. Deleting the live run's shard
+    # dir would destroy its dispatch index and temp manifest, so only a directory
+    # that holds nothing but THIS run's shards (prefixed with the log's basename) is
+    # removed; files are already gone, so an empty dir is removed too.
     if [ -n "${POOL_SHARD_DIR:-}" ] && [ -d "$POOL_SHARD_DIR" ]; then
-        rm -rf "$POOL_SHARD_DIR" 2>/dev/null || true
+        local foreign=''
+        if [ -n "${POOL_LOG_FILE:-}" ]; then
+            foreign=$(find "$POOL_SHARD_DIR" -mindepth 1 -maxdepth 1 \
+                          ! -name "$(basename "$POOL_LOG_FILE")*" -print -quit 2>/dev/null) || foreign=''
+        else
+            foreign='unknown'
+        fi
+        if [ -z "$foreign" ]; then
+            rm -rf "$POOL_SHARD_DIR" 2>/dev/null || true
+        fi
     fi
 
     exit "$((128 + signo))"
@@ -1591,6 +1693,14 @@ scan_library() {
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/reports" "${scan_data_dir}/logs"
 
+    # One run per library at a time (see acquire_run_lock). A scan writes a log and
+    # a CSV, so overlapping it with another run in the same second would overwrite
+    # the other run's files.
+    if ! acquire_run_lock "$library_dir"; then
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+
     # Same timestamp for both, so a run's CSV and summary log pair up. The CSV is
     # the machine-readable manifest for option 2 and exists only when errors do;
     # the summary log is written on EVERY scan so each run leaves an audit record.
@@ -1678,6 +1788,14 @@ scan_library() {
         report_line="(none - no errors found)"
     fi
 
+    # Files a worker could not even be started for were neither verified nor
+    # reported, so say so explicitly instead of leaving them out of every count
+    # (POOL_UNTESTED was computed upstream but never shown before).
+    if [ "${POOL_UNTESTED:-0}" -gt 0 ]; then
+        echo "WARNING: $POOL_UNTESTED file(s) could not be tested (worker could not start); they are NOT included in the counts above."
+        echo "Check free memory / process limits and re-run the scan."
+    fi
+
     # Every scan, clean or not, leaves a human-readable audit trail alongside the
     # reports/logs the reencode flows use.
     {
@@ -1690,6 +1808,7 @@ scan_library() {
     } > "$scan_log"
 
     echo "Scan summary saved to: $scan_log"
+    release_run_lock
     read -rp "Press Enter to return to main menu..."
 }
 
@@ -1725,6 +1844,7 @@ reencode_library() {
 
     if [ -z "$latest_csv" ]; then
         echo "No CSV file found in '$library_dir'. Please run a scan first."
+        release_run_lock
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
@@ -1733,6 +1853,7 @@ reencode_library() {
     read -rp "Type 'Y' to confirm using this CSV file for reencoding: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "User did not confirm. Aborting reencoding process."
+        release_run_lock
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
@@ -1747,6 +1868,14 @@ reencode_library() {
         return 0
     fi
     if ! ensure_backup_root "$backup_root"; then
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+
+    # One run per library at a time (see acquire_run_lock): the log, work list and
+    # shard names are second-resolution, so a second concurrent run would overwrite
+    # this run's files.
+    if ! acquire_run_lock "$library_dir"; then
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
@@ -1778,7 +1907,10 @@ reencode_library() {
     local filter_log="${log_file}.filter.log"
     local flac_file
     seed_dir="${scan_data_dir}/seed"
-    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    # '$$' as well as the log basename: a second run in the same second would
+    # otherwise truncate this run's work list (the run lock prevents that too, but a
+    # unique name keeps the file safe on its own).
+    seed_list="${seed_dir}/$(basename "$log_file").$$.paths"
     mkdir -p "$seed_dir"
     : > "$seed_list"
 
@@ -1832,6 +1964,7 @@ reencode_library() {
         echo "No files to process - nothing to do." >> "$log_file"
         rm -f "$seed_list"
         rmdir "$seed_dir" 2>/dev/null || true
+        release_run_lock
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
@@ -1853,11 +1986,14 @@ reencode_library() {
     rmdir "$seed_dir" 2>/dev/null || true
 
     echo "Reencoding complete at $(date)" | tee -a "$log_file"
-    echo "Total files processed: $total_files" | tee -a "$log_file"
+    # The pool's own count, as options 4/5 report - not the seed count, which would
+    # hide any file the pool never actually processed.
+    echo "Total files processed: $POOL_PROCESSED" | tee -a "$log_file"
     echo "Successful reencodes: $success_count" | tee -a "$log_file"
     echo "Failed reencodes: $fail_count" | tee -a "$log_file"
     echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
+    release_run_lock
     read -rp "Press Enter to return to main menu..."
 }
 
@@ -1921,6 +2057,7 @@ reencode_all_files() {
     read -rp "Type 'REENCODE ALL' to confirm: " confirm
     if [ "$confirm" != "REENCODE ALL" ]; then
         echo "Reencode cancelled."
+        release_run_lock
         read -rp "Press Enter to return to main menu..."
         return
     fi
@@ -1930,6 +2067,14 @@ reencode_all_files() {
     if ! ensure_backup_root "$backup_root"; then
         read -rp "Press Enter to return to main menu..."
         return
+    fi
+
+    # One run per library at a time (see acquire_run_lock): the log, work list and
+    # shard names are second-resolution, so a second concurrent run would overwrite
+    # this run's files.
+    if ! acquire_run_lock "$library_dir"; then
+        read -rp "Press Enter to return to main menu..."
+        return 0
     fi
 
     # Create scan data directory and log file
@@ -1962,7 +2107,10 @@ reencode_all_files() {
     # own paths, but not a temp file written into a library directory during the
     # run, and a live "find | pool" pipe could hand such a temp to a worker.
     seed_dir="${scan_data_dir}/seed"
-    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    # '$$' as well as the log basename: a second run in the same second would
+    # otherwise truncate this run's work list (the run lock prevents that too, but a
+    # unique name keeps the file safe on its own).
+    seed_list="${seed_dir}/$(basename "$log_file").$$.paths"
     mkdir -p "$seed_dir"
     find_real_flac_files "$library_dir" -print0 > "$seed_list"
 
@@ -1989,6 +2137,7 @@ reencode_all_files() {
     echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Duration: ${duration} seconds" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
+    release_run_lock
     read -rp "Press Enter to return to main menu..."
 }
 
@@ -2020,6 +2169,14 @@ reencode_new_files() {
     # Create scan data directory and determine tracking DB path.
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/logs"
+
+    # One run per library at a time (see acquire_run_lock): the log, work list and
+    # shard names are second-resolution, so a second concurrent run would overwrite
+    # this run's files.
+    if ! acquire_run_lock "$library_dir"; then
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
 
     db_path=$(get_reencoded_db_path "$library_dir")
     # Must be a plain command, not $(), so the global REENCODED_SET is populated
@@ -2071,6 +2228,7 @@ reencode_new_files() {
             echo "All $total_files FLAC files have already been reencoded."
         fi
         echo "Nothing to do. If you added new music, run this option again after adding files."
+        release_run_lock
         read -rp "Press Enter to return to main menu..."
         return
     fi
@@ -2127,7 +2285,10 @@ reencode_new_files() {
     # The list was classified in the discovery pass above, so a temp file a worker
     # creates can never be picked up as "new" mid-run. Serialise it NUL-separated.
     seed_dir="${scan_data_dir}/seed"
-    seed_list="${seed_dir}/$(basename "$log_file").paths"
+    # '$$' as well as the log basename: a second run in the same second would
+    # otherwise truncate this run's work list (the run lock prevents that too, but a
+    # unique name keeps the file safe on its own).
+    seed_list="${seed_dir}/$(basename "$log_file").$$.paths"
     mkdir -p "$seed_dir"
     : > "$seed_list"
     for flac_file in "${new_files[@]}"; do
@@ -2160,6 +2321,7 @@ reencode_new_files() {
     echo "Backups stored in: $backup_root" | tee -a "$log_file"
     echo "Duration: ${duration} seconds" | tee -a "$log_file"
     echo "Detailed log saved as: $log_file"
+    release_run_lock
     read -rp "Press Enter to return to main menu..."
 }
 
@@ -2214,15 +2376,19 @@ set_paths() {
         ''|0) new_jobs='default' ;;
         *[!0-9]*)
             echo "Error: '$new_jobs' is not a positive number of workers."
+            # 'return 0', never 1: under 'set -o errexit' a 1 here propagates out of
+            # main_menu and ENDS the script, right after telling the user to press
+            # Enter to go back to the menu. Options 2/4/5 all return 0 on their
+            # error paths for the same reason.
             read -rp "Press Enter to return to main menu..."
-            return 1
+            return 0
             ;;
     esac
 
     if [ -z "$new_path" ] || [ "$new_path" == "null" ]; then
         echo "Error: A library path is required."
         read -rp "Press Enter to return to main menu..."
-        return 1
+        return 0
     fi
 
     # The library may be entered for the first time here, so check it exists to
@@ -2230,13 +2396,13 @@ set_paths() {
     if [ ! -d "$new_path" ]; then
         echo "Error: The directory '$new_path' does not exist."
         read -rp "Press Enter to return to main menu..."
-        return 1
+        return 0
     fi
 
     if [ -n "$new_backup" ] && ! validate_backup_root "$new_path" "$new_backup"; then
         echo "Backup directory not changed."
         read -rp "Press Enter to return to main menu..."
-        return 1
+        return 0
     fi
 
     save_config "$new_path" "$new_backup" "$new_jobs"
@@ -2325,6 +2491,11 @@ main_menu() {
 # Loop the menu. The BASH_SOURCE guard keeps it from auto-running when the file
 # is sourced (the test suite sources it to unit-test individual functions).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # The run lock a menu operation took is released however this process ends: a
+    # normal return, 'q', errexit, or a signal handler that exits. A run killed in a
+    # way that skips this trap (kill -9) leaves a stale lock that the next run breaks
+    # by checking the recorded pid (see acquire_run_lock).
+    trap 'release_run_lock' EXIT
     while true; do
         main_menu
     done
