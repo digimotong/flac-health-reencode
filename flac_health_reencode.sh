@@ -913,7 +913,10 @@ run_file_pool() {
     # High-water mark published before the tally, for callers that read their own
     # shards back (the scan).
     POOL_WORKERS_USED=0
-    # Seams defaulting to a reencode; the scan overrides all three.
+    # Seams defaulting to a reencode; the scan overrides all three and
+    # run_reencode_pool resets them (see _pool_reset_seams), because the menu loop
+    # reuses this process and a stale scan seam would silently turn a reencode
+    # into a verification.
     POOL_WORKER_FN="${POOL_WORKER_FN:-_reencode_pool_worker}"
     POOL_CHANNEL_KIND="${POOL_CHANNEL_KIND:-db}"
     # Empty for a reencode: its channel goes straight into $3 (the real DB) on the
@@ -1062,6 +1065,25 @@ _pool_seq_channel() {
         return 0
     fi
     printf '%s\n' "$caller_channel"
+}
+
+# Restores the pool's operation seams to their reencode defaults: the worker to run
+# per file, the kind of result channel it writes, and whether the sequential path
+# gives each file its own shard.
+#
+# These are PROCESS globals and run_file_pool only fills in a default when one is
+# UNSET, while the menu loop reuses one process for every operation. run_scan_pool
+# sets all three, so without this a scan earlier in the SAME session left the scan
+# worker plugged in, and the next reencode (options 2/4/5) only verified each file
+# with 'flac -t': every file counted as a success, no backup was written and the
+# tracking DB never grew - a silent no-op that looked like a clean run.
+# Idempotent, so both a reencode (before its run) and a scan (after its run) can
+# call it; call it as a plain command, never inside $(...).
+_pool_reset_seams() {
+    POOL_WORKER_FN="_reencode_pool_worker"
+    POOL_CHANNEL_KIND="db"
+    POOL_SEQ_CHANNEL_PREFIX=""
+    return 0
 }
 
 # Invokes the configured per-file worker: the one place that decides WHICH
@@ -1421,6 +1443,11 @@ run_reencode_pool() {
     local pool_mode
 
     pool_mode=$(select_pool_mode "$jobs")
+    # Establish this run's operation explicitly: with 'set -u' a reset is also what
+    # lets run_file_pool talk about the seams at all. A scan earlier in the session
+    # would otherwise leave the scan worker in place and this run would only verify
+    # each file (no backup, no DB row) while reporting every one a success.
+    _pool_reset_seams
     # Pooled workers must never echo status text over the live bar; a sequential
     # run keeps statuses on the console and lets write_status reprint the bar.
     if [ "$pool_mode" -eq 0 ] && [ "$jobs" -gt 1 ]; then
@@ -1493,6 +1520,10 @@ run_scan_pool() {
     SCAN_FAILURES_FILE="$(mktemp "${TMPDIR:-/tmp}/flac_scan_fail.XXXXXX")"
     run_file_pool "$jobs" "$log_file" "" "$library_dir" "" \
         "$list_path" "$mode" "Errors"
+    # Leave the process on the documented (reencode) seams: these are globals that
+    # outlive the call, and the next operation in this same menu session must not
+    # inherit the scan worker. Also releases them for 'set -u' readers below.
+    _pool_reset_seams
 
     # Collect the failure lists: ids match dispatch order, so replaying them in
     # ascending order reproduces sequential report order. run_file_pool stops at
