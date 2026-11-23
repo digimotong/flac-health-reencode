@@ -32,7 +32,7 @@ accepts `q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
-| `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. |
+| `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. Warns if any file could not be tested. |
 | `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
 | `3` | Set/Update library path & backup directory | First-run setup; also sets the worker count. Validates that the backup destination is safe. |
 | `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
@@ -108,6 +108,13 @@ disks and NVMe alike without starving a media server reading the same library.
 Raise it on fast local storage; set `jobs: 1` if the library is on a slow network
 share where concurrent access makes things worse.
 
+Only one run at a time may work on a library: a second copy (or a second choice
+from the menu of a running one) is refused with a message naming the library,
+because the two would overwrite each other's log, work list and temp files. A run
+that was killed leaves a note in `.flac_scan_data/lock`; the next run clears it
+automatically, or you can delete that directory if a recycled process id ever
+makes it look busy.
+
 ## Troubleshooting
 
 - `flac`, `metaflac` and `jq` are checked before the menu appears. A missing
@@ -133,6 +140,9 @@ Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
 overlaps and that the merged log, CSV report and tracking database are identical
 at any worker count, and `tests/case_interrupt.sh` covers interrupt cleanup.
+`tests/case_session_state.sh` covers several operations in one menu session (a
+scan followed by a reencode), and `tests/case_run_lock.sh` covers the
+one-run-per-library lock.
 
 Nothing above proves the audio, since `flac`/`metaflac` are stubs there.
 `tests/manual/` closes that gap against real binaries in `TMPDIR` sandboxes: it
