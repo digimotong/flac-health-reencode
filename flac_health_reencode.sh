@@ -485,12 +485,35 @@ get_file_fingerprint() {
     printf '%s %s %s\n' "$md5" "$size" "$mtime"
 }
 
+# Recording format, shared by the tracking DB and every reencode shard: ONE record
+# per reencoded file, NUL-TERMINATED, "<md5> <size> <mtime> <path>\0".
+#
+# NUL, not a newline: the path is a filesystem name, so a filename containing a
+# newline would otherwise split into two rows, and the second one (a fragment that is
+# not under the library) would carry no usable fingerprint for option 5. With a NUL
+# record the path is opaque data, exactly like the work lists. The three numeric
+# fields come first because they never contain a space, so the path is everything
+# after the third one.
+#
+# Migration: DBs written by older versions are newline-delimited
+# ("<md5> <size> <mtime> <path>\n"). load_reencoded_set and migrate_reencoded_db both
+# still READ that form - a legacy DB is never dropped or refused - and the next
+# reencode run rewrites it into the NUL form (see migrate_reencoded_db).
+
+# 0 when the file holds at least one NUL byte, i.e. it is in the NUL record form.
+db_is_nul_format() {
+    [ -f "$1" ] || return 1
+    [ "$(tr -d -c '\000' < "$1" | wc -c)" -gt 0 ]
+}
+
 # Loads the tracking DB into REENCODED_SET, keyed "<md5>|<size>"; blank and
 # comment lines are skipped. Sets the array in the CURRENT shell, so call it as
 # a plain command, never inside $().
+# Reads both on-disk forms (see the recording format above), so an upgraded install
+# keeps its history and option 5 keeps skipping the files it already processed.
 load_reencoded_set() {
     local db_path="$1"
-    local md5 size mtime path_line
+    local md5 size mtime rest record
 
     REENCODED_SET=()
 
@@ -498,18 +521,61 @@ load_reencoded_set() {
         return 0
     fi
 
-    while IFS= read -r path_line || [ -n "$path_line" ]; do
-        [ -z "$path_line" ] && continue
-        case "$path_line" in \#*) continue ;; esac
-        read -r md5 size mtime _rest <<< "$path_line"
+    if db_is_nul_format "$db_path"; then
+        while IFS= read -r -d '' record; do
+            [ -z "$record" ] && continue
+            # Field 1..3 are space-free numbers/hashes; the path is the tail.
+            read -r md5 size mtime rest <<< "$record"
+            [ -z "$md5" ] && continue
+            REENCODED_SET["$md5|$size"]=1
+        done < "$db_path"
+        return 0
+    fi
+
+    # Legacy newline form.
+    while IFS= read -r record || [ -n "$record" ]; do
+        [ -z "$record" ] && continue
+        case "$record" in \#*) continue ;; esac
+        read -r md5 size mtime rest <<< "$record"
         [ -z "$md5" ] && continue
         REENCODED_SET["$md5|$size"]=1
     done < "$db_path"
 }
 
+# Rewrites a legacy (newline-delimited) tracking DB into the NUL record form, in
+# place via a temp file and one mv, so a crash mid-rewrite leaves either the old DB
+# or the new one - never a truncated file. Idempotent: a DB that is already in the
+# NUL form (or does not exist) is left alone, which is also why every shard that is
+# about to be merged into it can call this unconditionally.
+# MUST run with no writer active: the parent calls it before it forks the pool.
+# $1 = DB path. 0 on success (including "nothing to do").
+migrate_reencoded_db() {
+    local db_path="$1"
+    local tmp_path line migrated=0
+
+    [ -f "$db_path" ] || return 0
+    [ -s "$db_path" ] || return 0
+    db_is_nul_format "$db_path" && return 0
+
+    tmp_path="${db_path}.migrating.$$"
+    : > "$tmp_path" || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue ;; esac
+        printf '%s\0' "$line" >> "$tmp_path" || { rm -f "$tmp_path"; return 1; }
+        migrated=$((migrated + 1))
+    done < "$db_path"
+
+    if ! mv "$tmp_path" "$db_path"; then
+        rm -f "$tmp_path"
+        return 1
+    fi
+    return 0
+}
+
 # Appends a fingerprint to an ARBITRARY file, not the shared DB: each worker uses
 # its own shard so no two processes append to one file (append atomicity is not
-# guaranteed on NFS/SMB, where libraries commonly live). Same line format as
+# guaranteed on NFS/SMB, where libraries commonly live). Same NUL record format as
 # mark_as_reencoded, so a merged shard is indistinguishable from the DB.
 # $1 = target file (a shard, or the DB when jobs=1), $2 = FLAC file.
 record_reencoded_to() {
@@ -520,25 +586,27 @@ record_reencoded_to() {
     fp=$(get_file_fingerprint "$file") || return 1
 
     mkdir -p "$(dirname "$target_path")"
-    printf '%s %s\n' "$fp" "$file" >> "$target_path"
+    printf '%s %s\0' "$fp" "$file" >> "$target_path"
     return 0
 }
 
 # Appends the file's fingerprint to the DB and adds it to REENCODED_SET.
+# A legacy DB is migrated first, so an append can never mix the two record forms.
 # $1 = DB path, $2 = FLAC file. Non-zero if no fingerprint could be made.
 mark_as_reencoded() {
     local db_path="$1"
     local file="$2"
-    local fp md5 size mtime key
+    local fp md5 size mtime rest key
 
     fp=$(get_file_fingerprint "$file") || return 1
 
-    read -r md5 size mtime _rest <<< "$fp"
+    read -r md5 size mtime rest <<< "$fp"
 
     mkdir -p "$(dirname "$db_path")"
-    # Append "<md5> <size> <mtime> <path>"; path is the LAST field so it may
-    # safely contain spaces / special characters.
-    printf '%s\n' "$fp $file" >> "$db_path"
+    migrate_reencoded_db "$db_path" || true
+    # Append "<md5> <size> <mtime> <path>" as ONE NUL-terminated record; the path is
+    # the LAST field and the terminator is NUL, so the name may contain any byte.
+    printf '%s %s\0' "$fp" "$file" >> "$db_path"
 
     key="${md5}|${size}"
     REENCODED_SET["$key"]=1
@@ -911,9 +979,12 @@ shard_path_for() {
     # shard, which would make several workers append to one file.
     case "$kind" in
         log)    ext="log" ;;
+        # NUL-terminated reencode records (see the recording format), merged into the
+        # tracking DB by a plain cat.
         db)     ext="db" ;;
-        # Paths that failed 'flac -t', read back to build the scan report - hence kept
-        # distinct from 'log' (human status text) and 'db' (reencode bookkeeping).
+        # NUL-separated paths that failed 'flac -t', read back to build the scan
+        # report - hence kept distinct from 'log' (human status text) and 'db'
+        # (reencode bookkeeping).
         scan)   ext="scan" ;;
         result) ext="result" ;;
         *)
@@ -928,9 +999,10 @@ shard_path_for() {
 
 # Appends a run's per-worker shards to the real run log and tracking DB, then
 # removes them. Runs after every worker has finished, so the merge is
-# single-threaded. A DB shard holds exactly the lines record_reencoded_to wrote,
-# so this is a plain append that preserves a pre-existing DB; a failed worker
-# still contributes its log shard, and a missing/empty DB shard is fine.
+# single-threaded. A DB shard holds exactly the NUL records record_reencoded_to
+# wrote, so this is a plain append that preserves a pre-existing DB (run_reencode_pool
+# has already migrated any legacy DB to that same form); a failed worker still
+# contributes its log shard, and a missing/empty DB shard is fine.
 # $1 = run log, $2 = tracking DB, $3 = POOL_WORKERS_USED (high-water worker id;
 # ids are per FILE, so this usually exceeds the job count).
 merge_reencode_shards() {
@@ -1764,6 +1836,14 @@ run_reencode_pool() {
     # would otherwise leave the scan worker in place and this run would only verify
     # each file (no backup, no DB row) while reporting every one a success.
     _pool_reset_seams
+    # Bring a legacy newline-delimited tracking DB onto the NUL record format BEFORE
+    # any worker appends to it: the merge below is a plain cat, so a mixed DB would be
+    # born here. Idempotent, and a no-op on a fresh install.
+    if ! migrate_reencoded_db "$db_path"; then
+        echo "WARNING: could not convert the tracking database to its current format:" >&2
+        echo "         $db_path (kept as is; the run continues)" >&2
+    fi
+
     # Pooled workers must never echo status text over the live bar; a sequential
     # run keeps statuses on the console and lets write_status reprint the bar.
     if [ "$pool_mode" -eq 0 ] && [ "$jobs" -gt 1 ]; then

@@ -183,7 +183,8 @@ occur_re "SUCCESS: $LIB/Album $FILE_COUNT/track$FILE_COUNT.flac reencoded succes
     || _fail "jobs=1: processed count != $FILE_COUNT"
 [ "$(captured_count 'Successful reencodes: ([0-9]+)')" -eq "$FILE_COUNT" ] \
     || _fail "jobs=1: success count != $FILE_COUNT"
-[ "$(wc -l < "$DB")" -eq "$FILE_COUNT" ] \
+# The DB holds one NUL-terminated record per file (see db_row_count).
+[ "$(db_row_count "$DB")" -eq "$FILE_COUNT" ] \
     || _fail "jobs=1: DB should hold exactly $FILE_COUNT rows"
 
 # Every original was mirrored, so the parallel run below starts from a known state and
@@ -254,14 +255,16 @@ done
     || _fail "jobs=4: run log should hold all $FILE_COUNT SUCCESS lines"
 
 # ---- DB: one row per file, no duplicates -----------------------------------
-[ "$(wc -l < "$DB")" -eq "$FILE_COUNT" ] \
+[ "$(db_row_count "$DB")" -eq "$FILE_COUNT" ] \
     || _fail "jobs=4: DB should hold exactly $FILE_COUNT rows"
 for i in $(seq 1 "$FILE_COUNT"); do
     db_has_path "$SBX" "$LIB/Album $i/track$i.flac"
 done
 # Exactly one row mentions track1: the per-worker .db shards were merged rather than
-# appended to by racing writers, so no path is recorded twice.
-[ "$(grep -c 'track1\.flac' "$DB")" -eq 1 ] \
+# appended to by racing writers, so no path is recorded twice. (Records are
+# NUL-terminated, so they are split into lines first; the records themselves hold no
+# newlines here.)
+[ "$(db_records "$DB" | grep -c 'track1\.flac')" -eq 1 ] \
     || _fail "jobs=4: track1 appears more than once in the DB"
 
 # ---- concurrency: 4 workers really did run 4 reencodes at once --------------
@@ -587,7 +590,7 @@ occur_re "Processing $NEW_TOTAL file\\(s\\) with 4 worker\\(s\\)"
 assert_peak 4 'option 5 jobs=4 (new files > workers)' "$NEW_TOTAL"
 
 # ---- the DB now covers every file, with no duplicate rows ------------------
-[ "$(wc -l < "$DB")" -eq "$NEW_TOTAL" ] \
+[ "$(db_row_count "$DB")" -eq "$NEW_TOTAL" ] \
     || _fail "option 5: DB should hold exactly $NEW_TOTAL rows"
 for i in $(seq 1 "$NEW_TOTAL"); do
     db_has_path "$SBX" "$LIB/Album/track$i.flac"

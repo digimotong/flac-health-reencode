@@ -140,6 +140,18 @@ for f in "${NAMES[@]}"; do
         || _fail "backup of flagged file #$i is missing or differs from the original: <$f>"
 done
 
+# Every flagged file is also recorded in the tracking DB - including the newline name.
+# That name is a known limit of this case's assertion, not of the DB: db_has_path
+# rebuilds a path from space-split tokens, which cannot express a newline, so the
+# format itself is covered by source_guard_units.sh (a newline record loads as ONE row)
+# and the newline file's own row is counted here.
+for f in "${NAMES[@]}"; do
+    [ "$f" = "$NEWLINE_NAME" ] && continue
+    db_has_path "$SBX" "$f"
+done
+[ "$(db_row_count "$LIB/.flac_scan_data/reencoded.db")" -eq "$FLAGGED" ] \
+    || _fail "the tracking DB should hold exactly $FLAGGED records"
+
 # A name starting with '-' must never be read as an option by any tool it reaches: the
 # scan passes the path to 'flac -t' and the reencode hands it to flac, metaflac and cp.
 # Here it must have gone through the whole pipeline like any other name - its backup

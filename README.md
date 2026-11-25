@@ -78,8 +78,13 @@ path at its first comma, lost every quote in it, and split a newline inside a na
 into two bogus entries).
 
 Reports written by older versions (`.csv`) are still read, preferring whichever file
-is newest, and are never deleted. The tracking database is a separate file
-(`.flac_scan_data/reencoded.db`) and is not affected by the report format.
+is newest, and are never deleted.
+
+The tracking database (`.flac_scan_data/reencoded.db`) is a separate file and is not
+affected by the report format: it holds one NUL-terminated record per reencoded file,
+`<md5> <size> <mtime> <path>`, so a path with any byte in it is one record rather than
+two. A database written by an older version (newline-delimited) is still read, and is
+rewritten in the current form by the next re-encode run.
 
 ## Configuration
 

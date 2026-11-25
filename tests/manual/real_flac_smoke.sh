@@ -224,7 +224,9 @@ $expected"
     local db db_paths total_rows
     db="$sbx/lib/.flac_scan_data/reencoded.db"
     [ -f "$db" ] || mlib_fail "jobs=$jobs: no tracking database at $db"
-    db_paths=$(awk '{print $NF}' "$db" | sort)
+    # Records are NUL-terminated (mlib_db_records splits them); the path is the LAST
+    # field of each.
+    db_paths=$(mlib_db_records "$db" | awk '{print $NF}' | sort)
     total_rows=$(printf '%s\n' "$db_paths" | grep -c . || true)
 
     # Option 2 recorded 2 files, option 4 recorded 5 -> 7 rows.

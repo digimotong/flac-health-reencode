@@ -76,7 +76,7 @@ assert_reencoded() {
 
     [ -f "$lib/.flac_scan_data/reencoded.db" ] \
         || _fail "$sbx: the tracking DB was never written"
-    [ "$(grep -cv '^#' "$lib/.flac_scan_data/reencoded.db")" -eq "$want" ] \
+    [ "$(db_row_count "$lib/.flac_scan_data/reencoded.db")" -eq "$want" ] \
         || _fail "$sbx: tracking DB should hold exactly $want row(s)"
     db_has_path "$sbx" "$lib/Album/broken.flac"
     if [ "$want" -eq 2 ]; then

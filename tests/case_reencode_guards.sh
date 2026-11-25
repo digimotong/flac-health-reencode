@@ -50,7 +50,7 @@ occur_re 'Found 1 FLAC files to scan'
 # The corrupt-looking temp is never counted nor flagged:
 absent_re 'Error detected in:.*tmp_song\\.flac\\.part'
 # And a scan leaves no report (nothing was wrong), so it is not in any report.
-[ -z "$(find "$LIB/.flac_scan_data/reports" -name 'flac_scan_*.ndjson' -o -name 'flac_scan_*.csv' 2>/dev/null)" ] \
+[ -z "$(find "$LIB/.flac_scan_data/reports" \( -name 'flac_scan_*.ndjson' -o -name 'flac_scan_*.csv' \) 2>/dev/null)" ] \
     || _fail "a scan that saw only a .part temp produced an error report"
 
 echo "ok: reencode_guards (temp .part invisible to scan)"

@@ -312,6 +312,37 @@ frame_was_drawn "$FRAMES" || fail "live progress did not land on the final state
 progress_end
 [ "$PROGRESS_ACTIVE" -eq 0 ] || fail "progress_end left progress active"
 
+# --- DB record format: NUL-terminated, legacy DBs still readable ---------------
+# The tracking DB holds one NUL-terminated record per reencoded file, so a path with
+# a newline in it is ONE record instead of two. A DB written by an older version
+# (newline-delimited) must still load, and is migrated on the next write.
+LEGACY_DB="$LIB/.flac_scan_data/legacy_units.db"
+mkdir -p "$(dirname "$LEGACY_DB")"
+printf '%s %s %s %s\n' 0123456789abcdef0123456789abcdef 10 1 "$LIB/Album/plain.flac" > "$LEGACY_DB"
+db_is_nul_format "$LEGACY_DB" && fail "a legacy newline DB was misdetected as NUL-formatted"
+load_reencoded_set "$LEGACY_DB"
+[ "${#REENCODED_SET[@]}" -eq 1 ] || fail "legacy DB row not loaded (count=${#REENCODED_SET[@]})"
+# The first write migrates it, and the result holds both records, NUL-terminated.
+mark_as_reencoded "$LEGACY_DB" "$LIB/Album/track one.flac" || fail "mark_as_reencoded errored on a legacy DB"
+db_is_nul_format "$LEGACY_DB" || fail "the legacy DB was not migrated to the NUL record format"
+[ "$(tr -d -c '\000' < "$LEGACY_DB" | wc -c)" -eq 2 ] || fail "migrated DB does not hold exactly 2 NUL records"
+load_reencoded_set "$LEGACY_DB"
+[ "${#REENCODED_SET[@]}" -eq 2 ] || fail "migrated DB did not load both records (count=${#REENCODED_SET[@]})"
+# Migration is idempotent: a second call leaves a NUL DB byte-identical.
+cp "$LEGACY_DB" "$LEGACY_DB.before"
+migrate_reencoded_db "$LEGACY_DB" || fail "migrate_reencoded_db errored on a NUL DB"
+cmp -s "$LEGACY_DB" "$LEGACY_DB.before" || fail "migrate_reencoded_db rewrote an already-migrated DB"
+rm -f "$LEGACY_DB.before"
+# A path holding a NEWLINE is one record, not two - the bug this format removes.
+NL_DB="$LIB/.flac_scan_data/newline_units.db"
+printf '%s %s %s %s\0' 0123456789abcdef0123456789abcdef 10 1 "$LIB/Album/a"$'\n'"b.flac" > "$NL_DB"
+[ "$(tr -d -c '\000' < "$NL_DB" | wc -c)" -eq 1 ] || fail "newline record fixture is not one NUL record"
+load_reencoded_set "$NL_DB"
+[ "${#REENCODED_SET[@]}" -eq 1 ] || fail "newline-named record did not load as exactly one row"
+# No temp file is left behind by a migration.
+[ -z "$(find "$LIB/.flac_scan_data" -name '*.migrating.*' 2>/dev/null)" ] || fail "a migration temp file was left behind"
+rm -f "$LEGACY_DB" "$NL_DB"
+
 # --- parse_legacy_report_row --------------------------------------------------
 # A legacy (CSV) report row is the whole line with exactly ONE surrounding quote
 # pair removed. The two bugs this replaced: 'IFS=, read' truncated a path at its
