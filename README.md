@@ -4,7 +4,7 @@ Scans a FLAC music library for corrupted files, re-encodes them, and keeps a
 backup of every original it replaces.
 
 It runs `flac -t` over the whole library and writes the failures to a timestamped
-CSV report, then re-encodes them with `flac --verify --compression-level-0
+report, then re-encodes them with `flac --verify --compression-level-0
 --decode-through-errors --preserve-modtime` — the fastest compression level, and
 lossless, so the original timestamps survive. Files are processed several at a
 time (see [Configuration](#configuration)), which is what makes a large library
@@ -32,7 +32,7 @@ accepts `q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
-| `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. Warns if any file could not be tested. |
+| `1` | Scan music library for errors | Read-only. Writes a report; changes no audio file. Warns if any file could not be tested. |
 | `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
 | `3` | Set/Update library path & backup directory | First-run setup; also sets the worker count. Validates that the backup destination is safe. |
 | `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
@@ -56,9 +56,30 @@ it (options 2 and 5) or just prints it (option 4).
 Files inside the script's own `backup_FLAC_originals/` folders (in-library
 backups written by older versions) and its `.flac_scan_data/` directory are never
 scanned, re-encoded or backed up. Re-encoded originals are **not** written inside
-the library either: `.flac_scan_data/` holds the CSV scan reports, the per-run
+the library either: `.flac_scan_data/` holds the scan reports, the per-run
 re-encode logs and `reencoded.db`, the fingerprints of files already re-encoded —
 which is what option 5 skips.
+
+## Scan reports
+
+Option 1 writes `.flac_scan_data/reports/flac_scan_<timestamp>.ndjson` – JSON Lines,
+one object per line – only when it finds errors, so a clean library leaves no report
+behind. There are exactly two record types, and every record carries `type`:
+
+```json
+{"type":"header","generated":"2026-11-24T12:00:00Z","files":1234,"errors":2}
+{"type":"error","filepath":"/m/Music/Artist/Album/A, B.flac"}
+```
+
+The report is what option 2 reads back, so the format has to carry any filename the
+filesystem allows: `jq` does the escaping, which keeps commas, double quotes,
+backslashes and even newlines inside a name intact (an earlier CSV report truncated a
+path at its first comma, lost every quote in it, and split a newline inside a name
+into two bogus entries).
+
+Reports written by older versions (`.csv`) are still read, preferring whichever file
+is newest, and are never deleted. The tracking database is a separate file
+(`.flac_scan_data/reencoded.db`) and is not affected by the report format.
 
 ## Configuration
 
@@ -138,7 +159,7 @@ sandbox. It runs in CI on every push and pull request. If you change the
 
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
-overlaps and that the merged log, CSV report and tracking database are identical
+overlaps and that the merged log, report and tracking database are identical
 at any worker count, and `tests/case_interrupt.sh` covers interrupt cleanup.
 `tests/case_session_state.sh` covers several operations in one menu session (a
 scan followed by a reencode), and `tests/case_run_lock.sh` covers the

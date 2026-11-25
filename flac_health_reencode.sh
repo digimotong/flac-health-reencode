@@ -10,7 +10,9 @@
 # get_jobs(): $FLAC_HEALTH_JOBS, else the config's "jobs" key, else
 # min(4, nproc); 1 means strictly sequential. Each worker writes its own shard
 # (run log + tracking DB, or a scan failure list) which the parent merges, so no
-# two workers ever append to the same file.
+# two workers ever append to the same file. Every shard that records a PATH (the
+# scan's failure shard and the merged failure list) is NUL-separated and read with
+# 'read -r -d ""'; the scan report itself is NDJSON (see write_scan_report).
 #
 # Every long-running option (1, 2, 4, 5) reports through ONE progress API
 # (progress_begin/progress_update/progress_end), driven by COMPLETED files rather
@@ -90,6 +92,10 @@ declare -g RUN_LOCK_DIR=''
 # be tested at all. Declared here so 'set -u' callers can always read them.
 declare -g POOL_ERRORS=0
 declare -g POOL_UNTESTED=0
+
+# Written by parse_legacy_report_row, which 'set -u' callers read back. It holds ONE
+# path, so a newline inside a filename is harmless here (unlike a list).
+declare -g LEGACY_REPORT_PATH=''
 
 # Successfully reencoded files, keyed by md5|size (see load_reencoded_set).
 declare -A REENCODED_SET
@@ -201,7 +207,7 @@ find_real_flac_files() {
 }
 
 # 0 if the path is one of the script's own internal paths, 1 otherwise. Used to
-# filter non-find inputs, e.g. rows from an older scan CSV.
+# filter non-find inputs, e.g. rows from an older scan report.
 is_internal_flac_path() {
     local glob
     # The case patterns must stay UNQUOTED so '*' matches as a glob; quoting them
@@ -801,7 +807,7 @@ reencode_one_file() {
     rm -f "$temp_file" 2>/dev/null || true
 
     # A file outside the library root (possible for a row in a hand-edited or
-    # older scan CSV) has nowhere to be backed up, so it is refused rather than
+    # older scan report) has nowhere to be backed up, so it is refused rather than
     # re-encoded unprotected.
     backup_target="$(get_backup_target "$library_dir" "$backup_root" "$flac_file")"
     if [ -z "$backup_target" ]; then
@@ -844,7 +850,7 @@ reencode_one_file() {
     fi
 
     if [ -e "$backup_target" ]; then
-        # A backup already exists (e.g. a re-run over the same CSV, or a file
+        # A backup already exists (e.g. a re-run over the same report, or a file
         # that is already a reencoded version). Keep the EXISTING backup so the
         # pristine original is never overwritten; the reencode still proceeds.
         echo "Backup already exists (keeping original): $backup_target" >> "$log_file"
@@ -906,7 +912,7 @@ shard_path_for() {
     case "$kind" in
         log)    ext="log" ;;
         db)     ext="db" ;;
-        # Paths that failed 'flac -t', read back to build the CSV - hence kept
+        # Paths that failed 'flac -t', read back to build the scan report - hence kept
         # distinct from 'log' (human status text) and 'db' (reencode bookkeeping).
         scan)   ext="scan" ;;
         result) ext="result" ;;
@@ -1070,16 +1076,125 @@ _count_nul_list() {
     printf '%s\n' "$count"
 }
 
-# Counts newline-terminated records in a file, without the off-by-one that
-# '$(( $(wc -l) + 1 ))' causes when the last record lacks a trailing newline.
-# Empty or absent files count as 0. $1 = file path.
-_count_lines() {
-    local count=0
-    [ -s "$1" ] || { printf '0\n'; return 0; }
-    while IFS= read -r _rec <&4; do
-        count=$((count + 1))
-    done 4< "$1"
-    printf '%s\n' "$count"
+# Writes one scan report as NDJSON (JSON Lines): a header record, then one 'error'
+# record per failing path IN THE GIVEN ORDER. Every record carries "type", so a
+# reader can filter without parsing the whole document.
+#
+#   {"type":"header","generated":"2026-11-24T12:00:00Z","files":1234,"errors":2}
+#   {"type":"error","filepath":"/m/Music/Artist/Album/A, B.flac"}
+#
+# jq is the encoder, so commas, double quotes, backslashes and newlines in a path are
+# escaped per RFC 8259 instead of being pasted into a delimiter-based format. The
+# input is the NUL-separated failure list, read with 'read -r -d ''', so a path can
+# contain any byte but NUL and is never split. Costs one fork per RECORD, i.e. per
+# failure, never per file scanned.
+# $1 = NUL-separated failure list, $2 = output report path, $3 = files scanned,
+# $4 = number of failures.
+write_scan_report() {
+    local list_path="$1"
+    local out_path="$2"
+    local files="$3"
+    local errors="$4"
+    local flac_file
+
+    jq -c -n --arg generated "$(date -u +%FT%TZ)" \
+        --argjson files "$files" --argjson errors "$errors" \
+        '{type: "header", generated: $generated, files: $files, errors: $errors}' \
+        > "$out_path" || return 1
+
+    while IFS= read -r -d '' flac_file; do
+        jq -c -n --arg filepath "$flac_file" \
+            '{type: "error", filepath: $filepath}' >> "$out_path" || return 1
+    done < "$list_path"
+    return 0
+}
+
+# Prints the newest flac_scan_* report in a reports directory, ".ndjson" or the
+# legacy ".csv". Empty when there is none. Prints nothing and succeeds when the
+# directory does not exist yet (nothing has been scanned), rather than failing under
+# 'set -e' the way a bare find on a missing directory would.
+#
+# -maxdepth 1: reports sit directly in the reports directory, so a stray
+# flac_scan_* file in a SUBdirectory (found by recursing) must never be mistaken for
+# the newest report.
+#
+# Newest BY MODIFICATION TIME, chosen in the shell: a find -printf '%T@ %p' is GNU
+# only, and a name sort would pick the wrong report as soon as two runs share a
+# second. The NUL list keeps a space-containing report name intact.
+# $1 = reports directory.
+find_latest_scan_report() {
+    local report_dir="$1"
+    local report latest=''
+    local -a reports=()
+
+    [ -d "$report_dir" ] || return 0
+    while IFS= read -r -d '' report; do
+        reports+=("$report")
+    done < <(find "$report_dir" -maxdepth 1 -type f \
+                 \( -iname 'flac_scan_*.ndjson' -o -iname 'flac_scan_*.csv' \) \
+                 -print0 2>/dev/null)
+
+    for report in "${reports[@]}"; do
+        # 'a -nt b' is false while 'latest' is empty ('' is not a readable file), so
+        # the first candidate always becomes the baseline.
+        if [ -z "$latest" ] || [ "$report" -nt "$latest" ]; then
+            latest="$report"
+        fi
+    done
+
+    [ -n "$latest" ] || return 0
+    printf '%s\n' "$latest"
+}
+
+# Splits a LEGACY CSV report line into LEGACY_REPORT_PATH and prints the path.
+#
+# Prints rather than assigning only, so it is directly unit-testable; callers that
+# must avoid a fork per row read the global instead.
+# A path is the whole line with exactly ONE leading/trailing quote pair removed:
+# 'IFS=, read' truncated "A, B.flac" at the comma, and the blanket '"'-strip that
+# replaced it corrupted a filename with a quote in it. A bare "filepath" header, a
+# '# Scan Report ...' comment and a blank line all yield themselves, so the caller's
+# existing header/comment filters still see them.
+# $1 = one line from a legacy report.
+parse_legacy_report_row() {
+    local line="$1"
+    case "$line" in
+        '"'*'"') LEGACY_REPORT_PATH="${line#\"}"; LEGACY_REPORT_PATH="${LEGACY_REPORT_PATH%\"}" ;;
+        *)       LEGACY_REPORT_PATH="$line" ;;
+    esac
+    printf '%s\n' "$LEGACY_REPORT_PATH"
+}
+
+# Converts a scan report into the NUL-separated path list the reencode pool reads.
+# One pass, in report order. KNOWS the two report formats:
+#   * NDJSON: 'select(.type == "error")' keeps just the failure records, whatever
+#     else the file holds (header, future record types), and jq -j emits the path
+#     followed by a real NUL - so a comma, quote, backslash or newline inside the
+#     name comes back exactly as it went in.
+#   * legacy CSV (reports written by older versions, kept working, never deleted):
+#     unwrapped line by line by parse_legacy_report_row. Rows are filtered by the
+#     CALLER, so the legacy path keeps the same rules it always had.
+# Returns 1 (having written nothing useful) when the report cannot be read.
+# $1 = report path, $2 = output NUL list.
+scan_report_to_nul_list() {
+    local report="$1"
+    local out_path="$2"
+    local line
+
+    : > "$out_path" || return 1
+    case "$report" in
+        *.ndjson|*.NDJSON)
+            jq -j 'select(.type == "error") | .filepath, "\u0000"' "$report" \
+                > "$out_path" || return 1
+            ;;
+        *)
+            while IFS= read -r line || [ -n "$line" ]; do
+                parse_legacy_report_row "$line" >/dev/null
+                printf '%s\0' "$LEGACY_REPORT_PATH" >> "$out_path"
+            done < "$report" || return 1
+            ;;
+    esac
+    return 0
 }
 
 # Serialises whole runs (scan, reencode 2/4/5) so two copies started at once cannot
@@ -1664,7 +1779,7 @@ run_reencode_pool() {
 
 # Per-file body of a pooled scan: verify one file with 'flac -t'. A failing
 # file's PATH (not status text) goes to this worker's own 'scan' shard in dispatch
-# order, so the parent rebuilds the CSV in file order; one writer per file, so no
+# order, so the parent rebuilds the report in file order; one writer per file, so no
 # locking is needed. $1 = file, $2 = scan shard, $3 = log shard (unused),
 # $4/$5 = library/backup root (unused, kept for signature symmetry).
 _scan_pool_worker() {
@@ -1677,7 +1792,11 @@ _scan_pool_worker() {
     # The ONLY record the worker makes: the machine-readable path list the parent
     # replays. It skips the log shard deliberately, because a line there would print a
     # second copy of what the parent already emits in file order.
-    printf '%s\n' "$flac_file" >> "$scan_shard"
+    #
+    # NUL-terminated, not newline-terminated: a path may contain any byte but NUL, so
+    # a filename with a newline in it would otherwise split into two records here -
+    # before any report was written.
+    printf '%s\0' "$flac_file" >> "$scan_shard"
     return 1
 }
 
@@ -1689,8 +1808,10 @@ _scan_pool_worker() {
 # (POOL_UNTESTED) rather than counted as clean or corrupt.
 # $1 = worker count, $2 = NUL-separated list, $3 = run log (names the shard dir),
 # $4 = library root.
-# Sets POOL_PROCESSED, POOL_ERRORS, POOL_UNTESTED, SCAN_FAILED_PATHS,
-# SCAN_FAILURES_FILE (the caller owns and removes that temp file).
+# Sets POOL_PROCESSED, POOL_ERRORS, POOL_UNTESTED, and SCAN_FAILURES_FILE: a
+# NUL-separated list of the failing paths in file order (the caller owns and removes
+# that temp file). There is deliberately no joined-in-a-variable form of that list: a
+# path list in a shell variable is newline- or NUL-lossy.
 run_scan_pool() {
     local jobs="$1"
     local list_path="$2"
@@ -1733,7 +1854,8 @@ run_scan_pool() {
     local bound="$POOL_WORKERS_USED"
     [ "$bound" -gt 0 ] || bound="$POOL_PROCESSED"
 
-    SCAN_FAILED_PATHS=""
+    # Concatenating NUL records is order-preserving and cannot glue two paths
+    # together, so this stays a plain cat even though the shards hold NULs.
     local id shard
     for (( id = 0; id < bound; id++ )); do
         shard="$(shard_path_for "$log_file" "$id" scan)"
@@ -1745,7 +1867,7 @@ run_scan_pool() {
 
     POOL_ERRORS=0
     if [ -s "$SCAN_FAILURES_FILE" ]; then
-        POOL_ERRORS=$(_count_lines "$SCAN_FAILURES_FILE")
+        POOL_ERRORS=$(_count_nul_list "$SCAN_FAILURES_FILE")
     fi
     # A failed fork is a pool failure with no path behind it; surface it so the
     # summary never implies those files were verified.
@@ -1753,10 +1875,11 @@ run_scan_pool() {
     [ "$POOL_UNTESTED" -lt 0 ] && POOL_UNTESTED=0
 
     # Report the errors in file order. The caller has already cleared its bar.
+    # The list is NUL-separated, so a filename with a newline is printed as ONE line
+    # carrying that newline, never as two bogus entries.
     if [ "$POOL_ERRORS" -gt 0 ]; then
         local err_path
-        while IFS= read -r err_path; do
-            SCAN_FAILED_PATHS+="${err_path}"$'\n'
+        while IFS= read -r -d '' err_path; do
             if stdout_is_tty; then
                 printf '%b%s\n' "${RED}Error detected in:${NC} " "$err_path"
             else
@@ -1769,7 +1892,8 @@ run_scan_pool() {
 
 # Prompts for a library directory, then scans it recursively with 'flac -t',
 # skipping the script's own internal paths (FLAC_INTERNAL_PATH_GLOBS). Failing
-# files are recorded, quoted, in a CSV under the library's .flac_scan_data.
+# files are recorded as an NDJSON report under the library's .flac_scan_data (see
+# write_scan_report), which is what option 2 reads back.
 scan_library() {
     config=$(load_config)
     library_path=$(echo "$config" | jq -r '.library_path')
@@ -1792,19 +1916,19 @@ scan_library() {
     scan_data_dir="${library_dir}/.flac_scan_data"
     mkdir -p "${scan_data_dir}/reports" "${scan_data_dir}/logs"
 
-    # One run per library at a time (see acquire_run_lock). A scan writes a log and
-    # a CSV, so overlapping it with another run in the same second would overwrite
+    # One run per library at a time (see acquire_run_lock). A scan writes a log and a
+    # report, so overlapping it with another run in the same second would overwrite
     # the other run's files.
     if ! acquire_run_lock "$library_dir"; then
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
 
-    # Same timestamp for both, so a run's CSV and summary log pair up. The CSV is
-    # the machine-readable manifest for option 2 and exists only when errors do;
+    # Same timestamp for both, so a run's report and summary log pair up. The report
+    # is the machine-readable manifest for option 2 and exists only when errors do;
     # the summary log is written on EVERY scan so each run leaves an audit record.
     timestamp=$(date +%F_%H-%M-%S)
-    csv_output="${scan_data_dir}/reports/flac_scan_${timestamp}.csv"
+    report_output="${scan_data_dir}/reports/flac_scan_${timestamp}.ndjson"
     scan_log="${scan_data_dir}/logs/scan_log_${timestamp}.txt"
 
     echo "Scanning FLAC files in: $library_dir"
@@ -1840,41 +1964,38 @@ scan_library() {
     end_time=$(date +%s)
     duration=$((end_time - start_time))
 
-    # Build the CSV from the pool's failure list with the same order and quoting
+    # Build the report from the pool's NUL-separated failure list, in the same order
     # the sequential loop used, so option 2 consumes either run identically. Only
     # written when failures exist, so a clean scan leaves no manifest behind.
     if [ "$POOL_ERRORS" -gt 0 ]; then
-        {
-            echo "# Scan Report: $(date -u +%FT%TZ) | Files: $total_files | Errors: "
-            echo "filepath"
-            while IFS= read -r flac_file; do
-                [ -n "$flac_file" ] || continue
-                echo "\"${flac_file}\""
-            done < "$SCAN_FAILURES_FILE"
-        } > "$csv_output"
+        if ! write_scan_report "$SCAN_FAILURES_FILE" "$report_output" \
+                "$total_files" "$POOL_ERRORS"; then
+            echo "WARNING: Could not write the scan report to '$report_output'."
+            rm -f "$report_output"
+            report_output=''
+        fi
         error_count="$POOL_ERRORS"
     fi
 
     rm -f "$scan_list_file" "$SCAN_FAILURES_FILE"
 
-    # The CSV only exists when errors were found; remove the never-populated
-    # placeholder so option 2 never sees an empty manifest.
-    if [ "$error_count" -gt 0 ]; then
-        sed -i "s/| Errors: /| Errors: $error_count/" "$csv_output"
+    # The report only exists when errors were found (and could be written); with no
+    # report option 2 has nothing to act on, which is what the summary says.
+    if [ "$error_count" -gt 0 ] && [ -n "$report_output" ]; then
         if stdout_is_tty; then
             printf '%b\n' "${GREEN}Scan complete.${NC}"
             printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
             printf "Found ${RED}%d${NC} errors\n" "$error_count"
-            printf "CSV report generated: ${YELLOW}%s${NC}\n" "$csv_output"
+            printf "Report generated: ${YELLOW}%s${NC}\n" "$report_output"
         else
             echo "Scan complete."
             echo "Scanned $processed_count files in $duration seconds"
             echo "Found $error_count errors"
-            echo "CSV report generated: $csv_output"
+            echo "Report generated: $report_output"
         fi
-        report_line="$csv_output"
+        report_line="$report_output"
     else
-        rm -f "$csv_output"
+        rm -f "$report_output"
         if stdout_is_tty; then
             printf '%b\n' "${GREEN}Scan complete.${NC}"
             printf "Scanned ${YELLOW}%d${NC} files in ${YELLOW}%d${NC} seconds\n" "$processed_count" "$duration"
@@ -1911,10 +2032,11 @@ scan_library() {
     read -rp "Press Enter to return to main menu..."
 }
 
-# Reads the newest scan CSV from the library, confirms with the user, then
-# re-encodes each file it lists. Skips the report metadata row and header, and
-# any path in the script's own internal area (older/exported CSVs may contain
-# them).
+# Reads the newest scan report from the library, confirms with the user, then
+# re-encodes each file it lists. Accepts the NDJSON reports scan_library writes and
+# the legacy CSV reports older versions wrote (any user's old reports are left in
+# place). Filters out the 'filepath' header, '#' comments, and any path in the
+# script's own internal area (older/exported reports may contain them).
 # The backup root is resolved once (resolve_backup_path) and each file is
 # mirrored into it, originals never living inside the library.
 reencode_library() {
@@ -1922,7 +2044,7 @@ reencode_library() {
     library_path=$(echo "$config" | jq -r '.library_path')
     
     if [ -z "$library_path" ] || [ "$library_path" == "null" ]; then
-        read -rp "Enter the directory containing your FLAC scan CSV files (typically your music library): " library_path
+        read -rp "Enter the directory containing your FLAC scan reports (typically your music library): " library_path
         save_config "$library_path"
     fi
 
@@ -1934,22 +2056,19 @@ reencode_library() {
         return 0
     fi
 
-    # Locate the latest CSV file in reports directory (by modification time).
+    # Locate the newest report (.ndjson, or a legacy .csv) by modification time.
     scan_data_dir="${library_dir}/.flac_scan_data/reports"
-    latest_csv=$(find "$scan_data_dir" -type f -iname "flac_scan_*.csv" -printf "%T@ %p\n" \
-                 | sort -n \
-                 | tail -1 \
-                 | cut -d' ' -f2-)
+    latest_report=$(find_latest_scan_report "$scan_data_dir")
 
-    if [ -z "$latest_csv" ]; then
-        echo "No CSV file found in '$library_dir'. Please run a scan first."
+    if [ -z "$latest_report" ]; then
+        echo "No scan report found in '$library_dir'. Please run a scan first."
         release_run_lock
         read -rp "Press Enter to return to main menu..."
         return 0
     fi
 
-    echo "Latest scan CSV file found: $latest_csv"
-    read -rp "Type 'Y' to confirm using this CSV file for reencoding: " confirm
+    echo "Latest scan report found: $latest_report"
+    read -rp "Type 'Y' to confirm using this report for reencoding: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "User did not confirm. Aborting reencoding process."
         release_run_lock
@@ -1995,14 +2114,16 @@ reencode_library() {
         echo "Reencoding started at $(date)"
         echo "Library: $library_dir"
         echo "Backups: $backup_root"
-        echo "CSV: $latest_csv"
+        echo "Report: $latest_report"
         echo "Workers: $jobs"
         echo ""
     } > "$log_file"
 
-    # Discovery pass: build the filtered, DEDUPLICATED work list, keeping the
-    # CSV's own order. A hand-edited or merged report can repeat a path, and two
-    # workers must never race the same file, so duplicates are reported and dropped.
+    # Discovery pass: turn the report into a NUL-separated path list (one pass, see
+    # scan_report_to_nul_list), then build the filtered, DEDUPLICATED work list from
+    # it, keeping the report's own order. A hand-edited or merged report can repeat a
+    # path, and two workers must never race the same file, so duplicates are reported
+    # and dropped.
     local filter_log="${log_file}.filter.log"
     local flac_file
     seed_dir="${scan_data_dir}/seed"
@@ -2013,16 +2134,27 @@ reencode_library() {
     mkdir -p "$seed_dir"
     : > "$seed_list"
 
+    # The report's raw rows, NUL-separated, before the filters below. Kept in a file
+    # (never a variable or $(...)) so a path with any byte but NUL survives intact.
+    report_rows="$(mktemp "${TMPDIR:-/tmp}/flac_report_rows.XXXXXX")"
+    if ! scan_report_to_nul_list "$latest_report" "$report_rows"; then
+        echo "Error: Could not read the scan report '$latest_report'."
+        echo "Error: Could not read the scan report '$latest_report'." >> "$log_file"
+        rm -f "$report_rows" "$filter_log" "$seed_list"
+        rmdir "$seed_dir" 2>/dev/null || true
+        release_run_lock
+        read -rp "Press Enter to return to main menu..."
+        return 0
+    fi
+
     total_files=0
     success_count=0
     fail_count=0
     duplicate_count=0
     declare -A SEEN_LIST=()
-    while IFS=, read -r flac_file; do
-        # Remove any surrounding quotes.
-        flac_file=${flac_file//\"/}
-
-        # Skip the header row and scan_library's leading '# Scan Report: ...' row.
+    while IFS= read -r -d '' flac_file; do
+        # Skip the legacy report's header row and scan_library's '# Scan Report: ...'
+        # row (an NDJSON report has neither, but a legacy CSV does).
         if [[ "$flac_file" == "filepath" ]] || [[ "$flac_file" == \#* ]]; then
             continue
         fi
@@ -2048,14 +2180,15 @@ reencode_library() {
 
         total_files=$((total_files + 1))
         printf '%s\0' "$flac_file" >> "$seed_list"
-    done < "$latest_csv"
+    done < "$report_rows"
 
     unset SEEN_LIST
+    rm -f "$report_rows"
     [ -s "$filter_log" ] && cat "$filter_log"
     rm -f "$filter_log"
     if [ "$duplicate_count" -gt 0 ]; then
-        echo "Ignored $duplicate_count duplicate row(s) in the CSV."
-        printf '%s\n' "Ignored $duplicate_count duplicate row(s) in the CSV." >> "$log_file"
+        echo "Ignored $duplicate_count duplicate row(s) in the report."
+        printf '%s\n' "Ignored $duplicate_count duplicate row(s) in the report." >> "$log_file"
     fi
 
     if [ "$total_files" -eq 0 ]; then

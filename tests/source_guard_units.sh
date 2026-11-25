@@ -312,4 +312,57 @@ frame_was_drawn "$FRAMES" || fail "live progress did not land on the final state
 progress_end
 [ "$PROGRESS_ACTIVE" -eq 0 ] || fail "progress_end left progress active"
 
+# --- parse_legacy_report_row --------------------------------------------------
+# A legacy (CSV) report row is the whole line with exactly ONE surrounding quote
+# pair removed. The two bugs this replaced: 'IFS=, read' truncated a path at its
+# first comma, and a blanket '"'-strip corrupted any name containing a quote.
+LEGACY_REPORT_PATH=''
+parse_legacy_report_row '"/m/Music/A, B.flac"' >/dev/null
+# Checked through the GLOBAL (a plain command, not $(...)): a command substitution
+# would run the parser in a subshell and the caller would never see the assignment -
+# which is exactly the reason the option-2 loop calls it as a plain command.
+[ "$LEGACY_REPORT_PATH" = '/m/Music/A, B.flac' ] \
+    || fail "legacy row lost its comma: <$LEGACY_REPORT_PATH>"
+# Interior double quotes survive; only the outer pair is unwrapped. (Double-quoted
+# literals: the input is a row holding a real '"' byte, not the two characters \".)
+[ "$(parse_legacy_report_row "\"/m/Music/A, B\"c.flac\"")" = '/m/Music/A, B"c.flac' ] \
+    || fail "legacy row corrupted an interior quote: $(parse_legacy_report_row "\"/m/Music/A, B\"c.flac\"")"
+# A backslash and a single quote are ordinary data.
+[ "$(parse_legacy_report_row '"/m/Music/back\slash.flac"')" = '/m/Music/back\slash.flac' ] \
+    || fail "legacy row mangled a backslash"
+[ "$(parse_legacy_report_row '"/m/Music/back\slash.flac"')" = "/m/Music/back\\slash.flac" ] \
+    || fail "legacy row mangled a backslash (comparison)"
+[ "$(parse_legacy_report_row "\"/m/Music/it's.flac\"")" = "/m/Music/it's.flac" ] \
+    || fail "legacy row mangled a single quote"
+# An unquoted row is taken verbatim, so a hand-written report keeps working.
+[ "$(parse_legacy_report_row '/m/Music/plain.flac')" = '/m/Music/plain.flac' ] \
+    || fail "legacy row mangled an unquoted path"
+# The header, a comment and a blank line pass through unchanged, so the caller's
+# existing filters still recognise them.
+[ "$(parse_legacy_report_row 'filepath')" = 'filepath' ] || fail "legacy header not passed through"
+[ "$(parse_legacy_report_row '# Scan Report: x')" = '# Scan Report: x' ] || fail "legacy comment not passed through"
+[ -z "$(parse_legacy_report_row '')" ] || fail "legacy blank line not passed through"
+# An empty quoted field unwraps to an empty path, which the caller drops.
+[ -z "$(parse_legacy_report_row '""')" ] || fail "empty quoted row did not unwrap to empty"
+
+# --- find_latest_scan_report ---------------------------------------------------
+# Newest by mtime across BOTH extensions, and nothing at all for a directory that
+# does not exist yet (a scan has never run), which must not fail under 'set -e'.
+LATEST_DIR="$LIB/.report_latest_test"
+mkdir -p "$LATEST_DIR/sub"
+[ -z "$(find_latest_scan_report "$LATEST_DIR")" ] || fail "find_latest_scan_report found a report in an empty dir"
+[ -z "$(find_latest_scan_report "$LIB/.no_such_reports_dir")" ] || fail "find_latest_scan_report reported a missing dir"
+printf '%s\n' '{}' > "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv"
+printf '%s\n' '{}' > "$LATEST_DIR/flac_scan_2021-01-01_00-00-00.ndjson"
+# An unrelated file, and one in a subdirectory, are never candidates.
+printf '%s\n' 'x' > "$LATEST_DIR/notes.txt"
+printf '%s\n' '{}' > "$LATEST_DIR/sub/flac_scan_2999-01-01_00-00-00.ndjson"
+[ "$(find_latest_scan_report "$LATEST_DIR")" = "$LATEST_DIR/flac_scan_2021-01-01_00-00-00.ndjson" ] \
+    || fail "find_latest_scan_report did not pick the newest .ndjson: $(find_latest_scan_report "$LATEST_DIR")"
+# A newer legacy CSV still wins, so an old-style report is never ignored.
+touch "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv"
+[ "$(find_latest_scan_report "$LATEST_DIR")" = "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv" ] \
+    || fail "find_latest_scan_report ignored a newer legacy .csv"
+rm -rf "$LATEST_DIR"
+
 echo "ok: source-guard units"
