@@ -60,32 +60,6 @@ the library either: `.flac_scan_data/` holds the scan reports, the per-run
 re-encode logs and `reencoded.db`, the fingerprints of files already re-encoded —
 which is what option 5 skips.
 
-## Scan reports
-
-Option 1 writes `.flac_scan_data/reports/flac_scan_<timestamp>.ndjson` – JSON Lines,
-one object per line – only when it finds errors, so a clean library leaves no report
-behind. There are exactly two record types, and every record carries `type`:
-
-```json
-{"type":"header","generated":"2026-11-24T12:00:00Z","files":1234,"errors":2}
-{"type":"error","filepath":"/m/Music/Artist/Album/A, B.flac"}
-```
-
-The report is what option 2 reads back, so the format has to carry any filename the
-filesystem allows: `jq` does the escaping, which keeps commas, double quotes,
-backslashes and even newlines inside a name intact (an earlier CSV report truncated a
-path at its first comma, lost every quote in it, and split a newline inside a name
-into two bogus entries).
-
-Reports written by older versions (`.csv`) are still read, preferring whichever file
-is newest, and are never deleted.
-
-The tracking database (`.flac_scan_data/reencoded.db`) is a separate file and is not
-affected by the report format: it holds one NUL-terminated record per reencoded file,
-`<md5> <size> <mtime> <path>`, so a path with any byte in it is one record rather than
-two. A database written by an older version (newline-delimited) is still read, and is
-rewritten in the current form by the next re-encode run.
-
 ## Configuration
 
 On first run the script creates `flac_health_config.json` next to itself. Option 3
@@ -162,25 +136,6 @@ and `metaflac` binaries, so it needs no FLAC tools and touches nothing outside a
 sandbox. It runs in CI on every push and pull request. If you change the
 `flac`/`metaflac` flags the script passes, update `tests/stub_flac` and
 `tests/stub_metaflac` to match.
-
-`flac_health_reencode.sh` is the entry point (header, globals, modules, menu loop);
-the work lives in sourced modules beside it, so the entry can stay readable:
-
-| File | Holds |
-|------|-------|
-| `lib/common.sh` | tty probe and small pure helpers |
-| `lib/config.sh` | the config file, worker count, which files are real library content |
-| `lib/backup.sh` | backup roots, fingerprints, the tracking database |
-| `lib/progress.sh` | the shared progress bar and status lines |
-| `lib/pool.sh` | the worker pool, shard helpers, run lock, interrupt handling |
-| `lib/scan.sh` | option 1 and the report writer/readers |
-| `lib/reencode.sh` | options 2/4/5 and the path/worker settings |
-
-They are plain Bash sourced into one shell, so a full installation is the script
-plus this `lib/` directory next to it. Keep them together. The shared state they
-all use (the pool seams, progress counters, the tracking set) and the
-`.flac_scan_data` layout are declared in the entry script's header, so read that
-first.
 
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
