@@ -2,7 +2,9 @@
 # FLAC Health Check & Re-encode Utility: scans a library with 'flac -t', then
 # re-encodes the failures, backing up every original first.
 #
-# Requires: bash 4.3+, flac, metaflac (in the flac package) and jq.
+# Requires: bash 4.3+, flac, metaflac (in the flac package), jq and md5sum, on
+#           Linux with GNU userland (nproc, stat -c, chmod/chown --reference);
+#           see README.md, "Platform support".
 # Usage:    ./flac_health_reencode.sh  (menu-driven; see README.md)
 #
 # Per-file work runs through one operation-agnostic worker pool (run_file_pool),
@@ -2689,7 +2691,14 @@ set_paths() {
             new_backup="$current_backup"
         fi
     fi
-    new_backup="$(printf '%s' "$new_backup" | sed 's:/$::')"
+    # Trailing slashes normalised in the shell (no sed): the root '/' and an empty
+    # answer are left exactly as they were, one trailing slash is stripped otherwise
+    # (resolve_backup_path strips any remainder), so the stored spelling never ends in
+    # a slash.
+    case "$new_backup" in
+        ''|'/') : ;;
+        *)      new_backup="${new_backup%/}" ;;
+    esac
 
     # Blank (or 0) clears the key so get_jobs() re-derives it. A non-numeric
     # answer is refused rather than written: a junk value in the config would be

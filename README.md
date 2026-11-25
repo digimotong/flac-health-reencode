@@ -149,7 +149,8 @@ makes it look busy.
 
 ## Development
 
-Requires Bash 4.3+, `jq`, `md5sum` (coreutils), and `shellcheck` for linting.
+Requires Bash 4.3+, `jq`, `md5sum` (coreutils), and `shellcheck` for linting, on
+Linux with the GNU userland described under [Platform support](#platform-support).
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -189,14 +190,25 @@ for what each script proves.
 - Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
 - `flac` (which also provides `metaflac`), `jq`, and `md5sum` (coreutils; names the
   temp file of a basename too long for `tmp_<name>.part`)
+- GNU userland (`find`, `sed`, `stat`, `chmod`/`chown --reference`, `nproc`); see
+  [Platform support](#platform-support)
 
 ```bash
 # Debian / Ubuntu
 sudo apt-get install flac jq coreutils
-
-# macOS
-brew install flac jq md5sha1sum
 ```
+
+## Platform support
+
+The supported target is **Linux with GNU coreutils and Bash 4.3 or newer** – that
+is what CI runs and what the test suite exercises. The script relies on GNU
+behaviour (`nproc`, `stat -c`, `chmod`/`chown --reference`) and on Bash 4.3+
+features (`wait -n`, associative arrays).
+
+macOS is **not supported or tested**: the system Bash is 3.2, and the BSD userland
+differs in every one of those commands. Running it there would need Homebrew Bash
+4.3+, `coreutils` (for `gstat` and friends), `gnu-sed` and `findutils` on `PATH`,
+and even then it is untested – please do not report a macOS problem as a bug.
 
 ### flac 1.5 and later
 
