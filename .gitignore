@@ -20,3 +20,8 @@
 # to catch. See tests/manual/README.md.
 !tests/manual/
 !tests/manual/*
+# lib/ holds the sourced modules the entry script needs next to itself (copied into
+# every test sandbox). `*/` above ignores the directory, so it needs its own entries -
+# the same failure mode as tests/manual/.
+!lib/
+!lib/*.sh

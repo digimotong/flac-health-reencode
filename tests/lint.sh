@@ -42,8 +42,12 @@ run_lint() {
     fi
 }
 
-# The production script is the priority: it rewrites the user's audio files.
-run_lint "production script" flac_health_reencode.sh
+# The production script is the priority: it rewrites the user's audio files. Its
+# lib/*.sh modules are analysed as their own inputs too - not merely as files the
+# entry sources - because whether ShellCheck FOLLOWS a `source=` directive depends on
+# the tool version, and a module it silently skipped would never be checked. Each
+# module carries `# shellcheck shell=bash`, so it parses the same way on its own.
+run_lint "production script" flac_health_reencode.sh lib/*.sh
 
 # The test suite and the flac/metaflac stubs, analysed WITHOUT the production
 # script in the file list: that is why .shellcheckrc enables external-sources,

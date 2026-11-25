@@ -56,6 +56,10 @@ make_sandbox() {
     cp "$TESTS_ROOT/stub_metaflac"    "$sbx/bin/metaflac"
     chmod +x "$sbx/bin/flac" "$sbx/bin/metaflac"
     cp "$PROD_SCRIPT" "$sbx/flac_health_reencode.sh"
+    # The entry script SOURCES its modules from ./lib next to itself, so the copy needs
+    # the tree too - otherwise every case would run an entry with no functions. It goes
+    # to $sbx/script_lib, NOT $sbx/lib: the sandbox's 'lib' IS the test music library.
+    cp -R "$(dirname "$PROD_SCRIPT")/lib" "$sbx/script_lib"
     # 'jobs' is pinned to 1 in every sandbox on purpose: the pre-existing cases
     # were written against strictly-sequential behavior (status lines in file
     # order, tallies equal to the file count) and stay the regression anchor for

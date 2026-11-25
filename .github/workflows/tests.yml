@@ -105,6 +105,16 @@ jobs:
               missing=1
             fi
           done < <(find tests/manual -maxdepth 1 -type f | sort)
+          # And the production modules the entry sources: `*/` in .gitignore ignores a
+          # directory, so lib/ needs its own allowlist entries. An untracked module is
+          # an entry script that cannot start on a clean clone - and, like the cases
+          # above, it would still work in the developer's tree.
+          while IFS= read -r lib_file; do
+            if ! git ls-files --error-unmatch "$lib_file" > /dev/null 2>&1; then
+              echo "::error file=$lib_file::$lib_file is not tracked by git (check .gitignore allowlist)"
+              missing=1
+            fi
+          done < <(find lib -maxdepth 1 -name '*.sh' 2>/dev/null | sort)
           if [ "$missing" -ne 0 ]; then
             echo "FAIL: required files are ignored by git; CI cannot see them."
             exit 1

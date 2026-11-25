@@ -163,6 +163,25 @@ sandbox. It runs in CI on every push and pull request. If you change the
 `flac`/`metaflac` flags the script passes, update `tests/stub_flac` and
 `tests/stub_metaflac` to match.
 
+`flac_health_reencode.sh` is the entry point (header, globals, modules, menu loop);
+the work lives in sourced modules beside it, so the entry can stay readable:
+
+| File | Holds |
+|------|-------|
+| `lib/common.sh` | tty probe and small pure helpers |
+| `lib/config.sh` | the config file, worker count, which files are real library content |
+| `lib/backup.sh` | backup roots, fingerprints, the tracking database |
+| `lib/progress.sh` | the shared progress bar and status lines |
+| `lib/pool.sh` | the worker pool, shard helpers, run lock, interrupt handling |
+| `lib/scan.sh` | option 1 and the report writer/readers |
+| `lib/reencode.sh` | options 2/4/5 and the path/worker settings |
+
+They are plain Bash sourced into one shell, so a full installation is the script
+plus this `lib/` directory next to it. Keep them together. The shared state they
+all use (the pool seams, progress counters, the tracking set) and the
+`.flac_scan_data` layout are declared in the entry script's header, so read that
+first.
+
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
 overlaps and that the merged log, report and tracking database are identical

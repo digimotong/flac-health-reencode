@@ -100,6 +100,10 @@ mlib_make_sandbox() {
     mkdir -p "$mlib_sbx/bin" "$mlib_sbx/lib" "$mlib_sbx/backup"
     cp "$PROD_SCRIPT" "$mlib_sbx/flac_health_reencode.sh"
     chmod +x "$mlib_sbx/flac_health_reencode.sh"
+    # The entry script SOURCES its modules from ./lib next to itself. They go to
+    # $mlib_sbx/script_lib, not $mlib_sbx/lib: that path is this sandbox's music
+    # library, exactly as in tests/helpers.sh's make_sandbox.
+    cp -R "$(dirname "$PROD_SCRIPT")/lib" "$mlib_sbx/script_lib"
     mlib_set_config "$mlib_sbx" 1
     mlib_log "sandbox created at $mlib_sbx"
     return 0
