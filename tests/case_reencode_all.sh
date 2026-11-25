@@ -81,7 +81,7 @@ miss "$BAK/Album One/sub/backup_FLAC_originals"
 
 # DB records exactly the 3 real files; no backup / internal path ever appears.
 DB="$LIB/.flac_scan_data/reencoded.db"
-[ "$(wc -l < "$DB")" -eq 3 ]   || _fail "expected exactly 3 db rows, got $(wc -l < "$DB")"
+[ "$(db_row_count "$DB")" -eq 3 ]   || _fail "expected exactly 3 db rows, got $(db_row_count "$DB")"
 db_has_path "$SBX" "$LIB/Album One/trackA.flac"
 db_has_path "$SBX" "$LIB/Album One/sub/trackB.flac"
 db_has_path "$SBX" "$LIB/Album Two/trackC.flac"

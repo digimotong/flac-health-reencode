@@ -10,6 +10,12 @@
 #       than `.` because the cases are analysed as `tests/case_*.sh`, making their
 #       relative path `./helpers.sh`.
 #
+#       The production modules under lib/ are NOT resolved this way: the entry sources
+#       them from a variable directory, and whether ShellCheck follows the
+#       `# shellcheck source=lib/<name>.sh` directives above those lines depends on
+#       the tool version. tests/lint.sh therefore passes lib/*.sh as their own inputs,
+#       which every version analyses, so the modules are covered regardless.
+#
 #   external-sources=true
 #       PERMISSION to read what was located (like -x). ShellCheck follows a source
 #       only when the file is a command-line input or external sources are enabled.
@@ -17,7 +23,7 @@
 #       file list, so source_guard_units.sh sourcing ../flac_health_reencode.sh
 #       raised SC1091 there while a combined local invocation passed and masked it.
 #
-# Safe: the only files sourced anywhere in the repo are helpers.sh and the
-# production script, both trusted and tracked in-repo.
+# Safe: the only files sourced anywhere in the repo are helpers.sh, the production
+# entry script and its lib/*.sh modules, all trusted and tracked in-repo.
 source-path=tests
 external-sources=true

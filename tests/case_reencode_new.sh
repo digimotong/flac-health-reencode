@@ -41,7 +41,7 @@ occur_re 'Found 2 new FLAC file\(s\).*never been reencoded'
 file_eq "$R1" 'REENCODE_OK'
 file_eq "$R2" 'REENCODE_OK'
 file_eq "$LIB/.flac_scan_data/hidden.flac" 'DO-NOT-COUNT'
-[ "$(wc -l < "$DB")" -eq 2 ] || _fail "run1 db should have 2 rows"
+[ "$(db_row_count "$DB")" -eq 2 ] || _fail "run1 db should have 2 rows"
 db_has_path "$SBX" "$R1"
 db_has_path "$SBX" "$R2"
 # Each original was mirrored outside the library, at its album-relative path.
@@ -54,7 +54,7 @@ occur_re 'All 2 FLAC files have already been reencoded'
 absent_re 'Starting reencode of .* new FLAC file'
 file_eq "$R1" 'REENCODE_OK'
 file_eq "$R2" 'REENCODE_OK'
-[ "$(wc -l < "$DB")" -eq 2 ] || _fail "run2 db grew unexpectedly (no-op)"
+[ "$(db_row_count "$DB")" -eq 2 ] || _fail "run2 db grew unexpectedly (no-op)"
 # The no-op consumed neither of the two mirrored originals.
 file_eq "$SBX/lib_backup/Album/r1.flac" 'song-alpha-content'
 file_eq "$SBX/lib_backup/Album/r2.flac" 'song-beta-content-002'
@@ -82,7 +82,7 @@ file_eq "$LIB/Album/backup_FLAC_originals/junk.flac" 'note-a-backup-copy-usually
 file_eq "$SBX/lib_backup/Album New/added later.flac" 'completely-fresh-track-xyz'
 miss "$SBX/lib_backup/Album/backup_FLAC_originals"
 [ "$(find "$SBX/lib_backup" -type f | wc -l)" -eq 3 ] || _fail "backup root should hold exactly 3 mirrored originals"
-[ "$(wc -l < "$DB")" -eq 3 ] || _fail "db should now hold 3 rows"
+[ "$(db_row_count "$DB")" -eq 3 ] || _fail "db should now hold 3 rows"
 db_has_path "$SBX" "$R3"
 
 echo "ok: case_reencode_new"

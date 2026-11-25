@@ -76,7 +76,7 @@ assert_reencoded() {
 
     [ -f "$lib/.flac_scan_data/reencoded.db" ] \
         || _fail "$sbx: the tracking DB was never written"
-    [ "$(grep -cv '^#' "$lib/.flac_scan_data/reencoded.db")" -eq "$want" ] \
+    [ "$(db_row_count "$lib/.flac_scan_data/reencoded.db")" -eq "$want" ] \
         || _fail "$sbx: tracking DB should hold exactly $want row(s)"
     db_has_path "$sbx" "$lib/Album/broken.flac"
     if [ "$want" -eq 2 ]; then
@@ -132,7 +132,7 @@ occur_re 'Found 1 errors'
 absent_re 'Failed reencodes: 1'
 assert_reencoded "$SBX1" 'Successful reencodes: 2'
 # The scan's own bookkeeping is untouched by the fix: its report still exists.
-[ -n "$(find "$SBX1/lib/.flac_scan_data/reports" -type f -name 'flac_scan_*.csv' -print -quit)" ] \
+[ -n "$(find "$SBX1/lib/.flac_scan_data/reports" -type f -name 'flac_scan_*.ndjson' -print -quit)" ] \
     || _fail "A: the scan should still have produced a report"
 
 echo "ok: session_state (scan then option 5, sequential)"
@@ -164,7 +164,7 @@ make_session_sandbox SBX3 1
 
 run_script "$SBX3" '1' '' '2' 'Y' '' 'q'
 occur_re 'Scan complete\.'
-# Option 2 acts on the CSV the scan just wrote: exactly the one corrupt file.
+# Option 2 acts on the report the scan just wrote: exactly the one corrupt file.
 occur_re 'Total files processed: 1'
 assert_reencoded "$SBX3" 'Successful reencodes: 1' 1
 # The healthy file was not in the report, so it is untouched and not backed up.

@@ -70,17 +70,18 @@ mlib_snapshot() {
 #
 #   Only the first three fields are printed, and the projection is done with awk on
 #   $NF, so a path containing spaces stays intact and no field can leak the mtime.
+#   Records are NUL-terminated, so mlib_db_records splits them into lines first.
 mlib_db_rows() {
     local lib="$1" db
     db="$lib/.flac_scan_data/reencoded.db"
     [ -f "$db" ] || return 0
-    awk -v lib="$lib/" '
+    mlib_db_records "$db" | awk -v lib="$lib/" '
         NF >= 2 && $NF ~ ("^" lib) {
             n = $NF
             sub("^" lib, "", n)
             printf "%s %s %s\n", $1, $2, n
         }
-    ' "$db" | sort
+    ' | sort
 }
 
 sbx_serial=''

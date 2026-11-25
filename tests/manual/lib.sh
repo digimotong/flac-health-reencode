@@ -100,6 +100,10 @@ mlib_make_sandbox() {
     mkdir -p "$mlib_sbx/bin" "$mlib_sbx/lib" "$mlib_sbx/backup"
     cp "$PROD_SCRIPT" "$mlib_sbx/flac_health_reencode.sh"
     chmod +x "$mlib_sbx/flac_health_reencode.sh"
+    # The entry script SOURCES its modules from ./lib next to itself. They go to
+    # $mlib_sbx/script_lib, not $mlib_sbx/lib: that path is this sandbox's music
+    # library, exactly as in tests/helpers.sh's make_sandbox.
+    cp -R "$(dirname "$PROD_SCRIPT")/lib" "$mlib_sbx/script_lib"
     mlib_set_config "$mlib_sbx" 1
     mlib_log "sandbox created at $mlib_sbx"
     return 0
@@ -262,11 +266,44 @@ mlib_count() {
     find "$dir" "$@" 2>/dev/null | wc -l
 }
 
-# mlib_latest_csv <sbx> : newest scan CSV under the sandbox library, or empty.
-mlib_latest_csv() {
+# mlib_latest_report <sbx> : newest scan report under the sandbox library, or empty.
+# Either format (a scan writes .ndjson; a pre-seeded legacy .csv is still a report).
+mlib_latest_report() {
     local sbx="$1"
-    find "$sbx/lib/.flac_scan_data/reports" -type f -iname 'flac_scan_*.csv' \
+    find "$sbx/lib/.flac_scan_data/reports" -type f \
+        \( -iname 'flac_scan_*.ndjson' -o -iname 'flac_scan_*.csv' \) \
         2>/dev/null | sort | tail -1
+}
+
+# mlib_report_paths <report> : the file paths a scan report lists, one per line, sorted.
+# NDJSON: the error records' filepath values, one per line. A legacy CSV is unwrapped the
+# way the script does it (one surrounding quote pair), so a pre-seeded fixture and a
+# produced report are read by the same call.
+mlib_report_paths() {
+    local report="$1"
+    case "$report" in
+        *.ndjson)
+            # One filepath per line, unescaped by jq. (A path containing a newline would
+            # span lines here, which the harness fixtures do not do.)
+            jq -r 'select(.type == "error") | .filepath' "$report"
+            ;;
+        *)
+            sed -e 's/^"//' -e 's/"$//' "$report" | grep -v '^#' | grep -v '^filepath$' | sed '/^$/d'
+            ;;
+    esac
+}
+
+# mlib_db_records <db> : the tracking DB as one record per line. Records are
+# NUL-separated, so a path holding any character round-trips; tr is used to split them
+# for the line-oriented assertions the harness makes.
+mlib_db_records() {
+    local db="$1"
+    [ -f "$db" ] || return 0
+    if LC_ALL=C grep -q $'\0' "$db" 2>/dev/null; then
+        tr '\0' '\n' < "$db"
+    else
+        cat "$db"
+    fi
 }
 
 # mlib_assert_real_flac <path> : 'flac -t' must pass on a real file.

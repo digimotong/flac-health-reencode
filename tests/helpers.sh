@@ -56,6 +56,10 @@ make_sandbox() {
     cp "$TESTS_ROOT/stub_metaflac"    "$sbx/bin/metaflac"
     chmod +x "$sbx/bin/flac" "$sbx/bin/metaflac"
     cp "$PROD_SCRIPT" "$sbx/flac_health_reencode.sh"
+    # The entry script SOURCES its modules from ./lib next to itself, so the copy needs
+    # the tree too - otherwise every case would run an entry with no functions. It goes
+    # to $sbx/script_lib, NOT $sbx/lib: the sandbox's 'lib' IS the test music library.
+    cp -R "$(dirname "$PROD_SCRIPT")/lib" "$sbx/script_lib"
     # 'jobs' is pinned to 1 in every sandbox on purpose: the pre-existing cases
     # were written against strictly-sequential behavior (status lines in file
     # order, tallies equal to the file count) and stay the regression anchor for
@@ -175,9 +179,45 @@ file_eq() {
     return 0
 }
 
+# db_records <db> : the tracking DB's records, one per line.
+#   Records are NUL-TERMINATED ("<md5> <size> <mtime> <path>\0", see
+#   record_reencoded_to in the production script), so a path holding any character
+#   survives; tr is used ONLY to split them for line-oriented presentation.
+#   NOTE: a path that itself contains a newline therefore still spans two lines; count
+#   with db_row_count, which reads records, not lines.
+#   A DB written by an older version is newline-delimited and is passed through as is,
+#   so the same assertions work on both forms.
+db_records() {
+    local db="$1"
+    [ -f "$db" ] || return 0
+    if LC_ALL=C grep -q $'\0' "$db"; then
+        tr '\0' '\n' < "$db"
+    else
+        cat "$db"
+    fi
+}
+
+# db_row_count <db> : how many records the DB holds (comments are not records).
+# A record is NUL-terminated and may itself contain a newline, so the DB is read with
+# 'read -r -d ""' rather than counted line by line.
+db_row_count() {
+    local db="$1" record count=0
+    [ -f "$db" ] || { echo 0; return 0; }
+    if LC_ALL=C grep -q $'\0' "$db"; then
+        while IFS= read -r -d '' record; do
+            case "$record" in ''|'#'*) continue ;; esac
+            count=$((count + 1))
+        done < "$db"
+        echo "$count"
+        return 0
+    fi
+    # Legacy newline form.
+    db_records "$db" | grep -v '^#' | grep -c '' || true
+}
+
 # db_has_path <sbx> <absolute-path>
 #   Rows are "<md5> <size> <mtime> <path>", path LAST (so it may contain spaces).
-#   Passes iff a row ENDS with the path: drop the first three tokens and compare
+#   Passes iff a record ENDS with the path: drop the first three tokens and compare
 #   the rebuilt remainder exactly.
 db_has_path() {
     local sbx="$1" path="$2" db
@@ -189,7 +229,7 @@ db_has_path() {
         read -r -a tokens <<< "$line"
         rest="${tokens[*]:3}"
         [ "$rest" = "$path" ] && return 0
-    done < "$db"
+    done < <(db_records "$db")
     _fail "db lacks entry for: $path"
 }
 

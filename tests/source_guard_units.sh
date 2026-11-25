@@ -312,4 +312,88 @@ frame_was_drawn "$FRAMES" || fail "live progress did not land on the final state
 progress_end
 [ "$PROGRESS_ACTIVE" -eq 0 ] || fail "progress_end left progress active"
 
+# --- DB record format: NUL-terminated, legacy DBs still readable ---------------
+# The tracking DB holds one NUL-terminated record per reencoded file, so a path with
+# a newline in it is ONE record instead of two. A DB written by an older version
+# (newline-delimited) must still load, and is migrated on the next write.
+LEGACY_DB="$LIB/.flac_scan_data/legacy_units.db"
+mkdir -p "$(dirname "$LEGACY_DB")"
+printf '%s %s %s %s\n' 0123456789abcdef0123456789abcdef 10 1 "$LIB/Album/plain.flac" > "$LEGACY_DB"
+db_is_nul_format "$LEGACY_DB" && fail "a legacy newline DB was misdetected as NUL-formatted"
+load_reencoded_set "$LEGACY_DB"
+[ "${#REENCODED_SET[@]}" -eq 1 ] || fail "legacy DB row not loaded (count=${#REENCODED_SET[@]})"
+# The first write migrates it, and the result holds both records, NUL-terminated.
+mark_as_reencoded "$LEGACY_DB" "$LIB/Album/track one.flac" || fail "mark_as_reencoded errored on a legacy DB"
+db_is_nul_format "$LEGACY_DB" || fail "the legacy DB was not migrated to the NUL record format"
+[ "$(tr -d -c '\000' < "$LEGACY_DB" | wc -c)" -eq 2 ] || fail "migrated DB does not hold exactly 2 NUL records"
+load_reencoded_set "$LEGACY_DB"
+[ "${#REENCODED_SET[@]}" -eq 2 ] || fail "migrated DB did not load both records (count=${#REENCODED_SET[@]})"
+# Migration is idempotent: a second call leaves a NUL DB byte-identical.
+cp "$LEGACY_DB" "$LEGACY_DB.before"
+migrate_reencoded_db "$LEGACY_DB" || fail "migrate_reencoded_db errored on a NUL DB"
+cmp -s "$LEGACY_DB" "$LEGACY_DB.before" || fail "migrate_reencoded_db rewrote an already-migrated DB"
+rm -f "$LEGACY_DB.before"
+# A path holding a NEWLINE is one record, not two - the bug this format removes.
+NL_DB="$LIB/.flac_scan_data/newline_units.db"
+printf '%s %s %s %s\0' 0123456789abcdef0123456789abcdef 10 1 "$LIB/Album/a"$'\n'"b.flac" > "$NL_DB"
+[ "$(tr -d -c '\000' < "$NL_DB" | wc -c)" -eq 1 ] || fail "newline record fixture is not one NUL record"
+load_reencoded_set "$NL_DB"
+[ "${#REENCODED_SET[@]}" -eq 1 ] || fail "newline-named record did not load as exactly one row"
+# No temp file is left behind by a migration.
+[ -z "$(find "$LIB/.flac_scan_data" -name '*.migrating.*' 2>/dev/null)" ] || fail "a migration temp file was left behind"
+rm -f "$LEGACY_DB" "$NL_DB"
+
+# --- parse_legacy_report_row --------------------------------------------------
+# A legacy (CSV) report row is the whole line with exactly ONE surrounding quote
+# pair removed. The two bugs this replaced: 'IFS=, read' truncated a path at its
+# first comma, and a blanket '"'-strip corrupted any name containing a quote.
+LEGACY_REPORT_PATH=''
+parse_legacy_report_row '"/m/Music/A, B.flac"' >/dev/null
+# Checked through the GLOBAL (a plain command, not $(...)): a command substitution
+# would run the parser in a subshell and the caller would never see the assignment -
+# which is exactly the reason the option-2 loop calls it as a plain command.
+[ "$LEGACY_REPORT_PATH" = '/m/Music/A, B.flac' ] \
+    || fail "legacy row lost its comma: <$LEGACY_REPORT_PATH>"
+# Interior double quotes survive; only the outer pair is unwrapped. (Double-quoted
+# literals: the input is a row holding a real '"' byte, not the two characters \".)
+[ "$(parse_legacy_report_row "\"/m/Music/A, B\"c.flac\"")" = '/m/Music/A, B"c.flac' ] \
+    || fail "legacy row corrupted an interior quote: $(parse_legacy_report_row "\"/m/Music/A, B\"c.flac\"")"
+# A backslash and a single quote are ordinary data.
+[ "$(parse_legacy_report_row '"/m/Music/back\slash.flac"')" = '/m/Music/back\slash.flac' ] \
+    || fail "legacy row mangled a backslash"
+[ "$(parse_legacy_report_row '"/m/Music/back\slash.flac"')" = "/m/Music/back\\slash.flac" ] \
+    || fail "legacy row mangled a backslash (comparison)"
+[ "$(parse_legacy_report_row "\"/m/Music/it's.flac\"")" = "/m/Music/it's.flac" ] \
+    || fail "legacy row mangled a single quote"
+# An unquoted row is taken verbatim, so a hand-written report keeps working.
+[ "$(parse_legacy_report_row '/m/Music/plain.flac')" = '/m/Music/plain.flac' ] \
+    || fail "legacy row mangled an unquoted path"
+# The header, a comment and a blank line pass through unchanged, so the caller's
+# existing filters still recognise them.
+[ "$(parse_legacy_report_row 'filepath')" = 'filepath' ] || fail "legacy header not passed through"
+[ "$(parse_legacy_report_row '# Scan Report: x')" = '# Scan Report: x' ] || fail "legacy comment not passed through"
+[ -z "$(parse_legacy_report_row '')" ] || fail "legacy blank line not passed through"
+# An empty quoted field unwraps to an empty path, which the caller drops.
+[ -z "$(parse_legacy_report_row '""')" ] || fail "empty quoted row did not unwrap to empty"
+
+# --- find_latest_scan_report ---------------------------------------------------
+# Newest by mtime across BOTH extensions, and nothing at all for a directory that
+# does not exist yet (a scan has never run), which must not fail under 'set -e'.
+LATEST_DIR="$LIB/.report_latest_test"
+mkdir -p "$LATEST_DIR/sub"
+[ -z "$(find_latest_scan_report "$LATEST_DIR")" ] || fail "find_latest_scan_report found a report in an empty dir"
+[ -z "$(find_latest_scan_report "$LIB/.no_such_reports_dir")" ] || fail "find_latest_scan_report reported a missing dir"
+printf '%s\n' '{}' > "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv"
+printf '%s\n' '{}' > "$LATEST_DIR/flac_scan_2021-01-01_00-00-00.ndjson"
+# An unrelated file, and one in a subdirectory, are never candidates.
+printf '%s\n' 'x' > "$LATEST_DIR/notes.txt"
+printf '%s\n' '{}' > "$LATEST_DIR/sub/flac_scan_2999-01-01_00-00-00.ndjson"
+[ "$(find_latest_scan_report "$LATEST_DIR")" = "$LATEST_DIR/flac_scan_2021-01-01_00-00-00.ndjson" ] \
+    || fail "find_latest_scan_report did not pick the newest .ndjson: $(find_latest_scan_report "$LATEST_DIR")"
+# A newer legacy CSV still wins, so an old-style report is never ignored.
+touch "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv"
+[ "$(find_latest_scan_report "$LATEST_DIR")" = "$LATEST_DIR/flac_scan_2020-01-01_00-00-00.csv" ] \
+    || fail "find_latest_scan_report ignored a newer legacy .csv"
+rm -rf "$LATEST_DIR"
+
 echo "ok: source-guard units"

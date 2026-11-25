@@ -4,7 +4,7 @@ Scans a FLAC music library for corrupted files, re-encodes them, and keeps a
 backup of every original it replaces.
 
 It runs `flac -t` over the whole library and writes the failures to a timestamped
-CSV report, then re-encodes them with `flac --verify --compression-level-0
+report, then re-encodes them with `flac --verify --compression-level-0
 --decode-through-errors --preserve-modtime` — the fastest compression level, and
 lossless, so the original timestamps survive. Files are processed several at a
 time (see [Configuration](#configuration)), which is what makes a large library
@@ -32,7 +32,7 @@ accepts `q` as a shortcut for quitting.
 
 | Option | Action | Notes |
 |--------|--------|-------|
-| `1` | Scan music library for errors | Read-only. Writes a CSV report; changes no audio file. Warns if any file could not be tested. |
+| `1` | Scan music library for errors | Read-only. Writes a report; changes no audio file. Warns if any file could not be tested. |
 | `2` | Reencode problematic FLAC files | Acts on the latest scan report. Mirrors each original into the backup directory first. |
 | `3` | Set/Update library path & backup directory | First-run setup; also sets the worker count. Validates that the backup destination is safe. |
 | `4` | Reencode ALL FLAC files | Confirmed by typing `REENCODE ALL`. Slow on a large library — check free disk space for the backups first. |
@@ -56,7 +56,7 @@ it (options 2 and 5) or just prints it (option 4).
 Files inside the script's own `backup_FLAC_originals/` folders (in-library
 backups written by older versions) and its `.flac_scan_data/` directory are never
 scanned, re-encoded or backed up. Re-encoded originals are **not** written inside
-the library either: `.flac_scan_data/` holds the CSV scan reports, the per-run
+the library either: `.flac_scan_data/` holds the scan reports, the per-run
 re-encode logs and `reencoded.db`, the fingerprints of files already re-encoded —
 which is what option 5 skips.
 
@@ -123,7 +123,8 @@ makes it look busy.
 
 ## Development
 
-Requires Bash 4.3+, `jq`, `md5sum` (coreutils), and `shellcheck` for linting.
+Requires Bash 4.3+, `jq`, `md5sum` (coreutils), and `shellcheck` for linting, on
+Linux with the GNU userland described under [Platform support](#platform-support).
 
 ```bash
 bash tests/run_tests.sh                # test suite
@@ -138,7 +139,7 @@ sandbox. It runs in CI on every push and pull request. If you change the
 
 Sandboxes pin `jobs: 1`, so the bulk of the suite exercises the sequential path;
 `tests/case_parallel.sh` covers the pooled one instead, asserting that work
-overlaps and that the merged log, CSV report and tracking database are identical
+overlaps and that the merged log, report and tracking database are identical
 at any worker count, and `tests/case_interrupt.sh` covers interrupt cleanup.
 `tests/case_session_state.sh` covers several operations in one menu session (a
 scan followed by a reencode), and `tests/case_run_lock.sh` covers the
@@ -163,14 +164,25 @@ for what each script proves.
 - Bash 4.3+ (associative arrays and `wait -n`, both used by the worker pool)
 - `flac` (which also provides `metaflac`), `jq`, and `md5sum` (coreutils; names the
   temp file of a basename too long for `tmp_<name>.part`)
+- GNU userland (`find`, `sed`, `stat`, `chmod`/`chown --reference`, `nproc`); see
+  [Platform support](#platform-support)
 
 ```bash
 # Debian / Ubuntu
 sudo apt-get install flac jq coreutils
-
-# macOS
-brew install flac jq md5sha1sum
 ```
+
+## Platform support
+
+The supported target is **Linux with GNU coreutils and Bash 4.3 or newer** – that
+is what CI runs and what the test suite exercises. The script relies on GNU
+behaviour (`nproc`, `stat -c`, `chmod`/`chown --reference`) and on Bash 4.3+
+features (`wait -n`, associative arrays).
+
+macOS is **not supported or tested**: the system Bash is 3.2, and the BSD userland
+differs in every one of those commands. Running it there would need Homebrew Bash
+4.3+, `coreutils` (for `gstat` and friends), `gnu-sed` and `findutils` on `PATH`,
+and even then it is untested – please do not report a macOS problem as a bug.
 
 ### flac 1.5 and later
 

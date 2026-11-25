@@ -23,6 +23,17 @@ set -o pipefail
 . "$TESTS_ROOT/helpers.sh"
 
 README="$(dirname "$PROD_SCRIPT")/README.md"
+# The production SOURCE is the entry script plus the modules it sources: a value the
+# script relies on may legitimately live in either, and the guards below are about the
+# script's contract with the user, not about which file holds the line.
+PROD_SOURCES=("$PROD_SCRIPT" "$(dirname "$PROD_SCRIPT")"/lib/*.sh)
+
+# grep_prod <pattern> : the matching SOURCE LINES across the production sources, with
+# any "file:line:" prefix removed, so callers parse the code and never the file name.
+grep_prod() {
+    grep -nE -- "$1" "${PROD_SOURCES[@]}" 2>/dev/null \
+        | sed -E 's/^[^:]*:[0-9]+://' || true
+}
 
 # Read the README straight from the repo, next to the script under test.
 exist "$README"
@@ -32,11 +43,11 @@ README_TEXT="$(cat "$README")"
 # A. Every tool in the startup gate is named in the README.
 # ===========================================================================
 # Parse: for cmd in flac metaflac jq; do
-gate_line="$(grep -E '^for cmd in ' "$PROD_SCRIPT" | head -n1)"
+gate_line="$(grep_prod '^for cmd in ' | head -n1)"
 [ -n "$gate_line" ] \
-    || _fail "no 'for cmd in ...' startup gate found in $PROD_SCRIPT"
+    || _fail "no 'for cmd in ...' startup gate found in the production sources"
 
-tools="${gate_line#for cmd in }"
+tools="${gate_line#*for cmd in }"
 tools="${tools%%;*}"            # drop everything from the first ';'
 # shellcheck disable=SC2086  # deliberate word splitting into the tool list
 set -- $tools
@@ -59,11 +70,11 @@ echo "ok: case_docs (startup-gate tools documented: $*)"
 # ===========================================================================
 # B. Every key the script writes into the config is documented.
 # ===========================================================================
-# Parse the width-1 keys out of the script's `jq -n '{...}'` default-config call: the ONLY
-# place the config schema is defined.
-jq_default="$(grep -E "jq -n '\{" "$PROD_SCRIPT" | head -n1)"
+# Parse the width-1 keys out of the production sources' `jq -n '{...}'` default-config
+# call: the ONLY place the config schema is defined.
+jq_default="$(grep_prod "jq -n '\{" | head -n1)"
 [ -n "$jq_default" ] \
-    || _fail "could not find the jq default-config call in $PROD_SCRIPT"
+    || _fail "could not find the jq default-config call in the production sources"
 
 # shellcheck disable=SC2016  # single quotes are literal: matching field names
 keys="$(printf '%s\n' "$jq_default" | grep -oE '[a-z_]+: ' | sed -E 's/: $//' | sort -u)"
@@ -83,7 +94,7 @@ echo "ok: case_docs (config keys documented: $(printf '%s' "$keys" | tr '\n' ' '
 # The README documents `version` as write-only. A jq read of '.version' in the production
 # script would make that claim false, so fail and point at the row. Matching reads only, so
 # the script's own writer line is not caught.
-version_reads="$(grep -nE '\.version\b|\[\"version\"\]|\[.version.\]' "$PROD_SCRIPT" || true)"
+version_reads="$(grep_prod '\.version\b')"
 if [ -n "$version_reads" ]; then
     _fail "the script now reads '.version' from the config, but the README key
        table documents it as never read back; update that row (and this guard).

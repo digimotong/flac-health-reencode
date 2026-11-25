@@ -4,10 +4,10 @@
 # Proves what the stubbed suite structurally cannot: that a real damaged file is
 # detected by 'flac -t', that the reencoded replacement is a real, decodable FLAC
 # carrying the same audio, that the backup is byte-identical to the ORIGINAL, and
-# that the tracking DB / CSV / log all agree with what happened on disk.
+# that the tracking DB / report / log all agree with what happened on disk.
 #
 # Sequence: generate 5 real FLACs, damage 2 (one by truncation, one by a byte
-# flip), run option 1 (scan) then option 2 (reencode the newest CSV), then assert
+# flip), run option 1 (scan) then option 2 (reencode the newest report), then assert
 # on the result. Both a jobs=1 and a jobs=4 variant are exercised, so the same
 # real-file assertions cover the pooled path too.
 #
@@ -58,30 +58,31 @@ mlib_run_variant() {
 
     # --- option 1: scan -----------------------------------------------------
     mlib_run_menu "$sbx" "1" ""
-    local csv
-    csv="$(mlib_latest_csv "$sbx")"
-    [ -n "$csv" ] || mlib_fail "jobs=$jobs: option 1 produced no scan CSV"
+    local report
+    report="$(mlib_latest_report "$sbx")"
+    [ -n "$report" ] || mlib_fail "jobs=$jobs: option 1 produced no scan report"
     grep -q 'Found 2 errors' "$sbx/run.out" \
         || mlib_fail "jobs=$jobs: scan did not report exactly 2 errors (see $sbx/run.out)"
 
-    # The CSV must list EXACTLY the two damaged files, fully qualified.
-    local csv_rows expected
-    csv_rows="$(sed -e 's/^"//' -e 's/"$//' "$csv" | grep -v '^#' | grep -v '^filepath$' | sed '/^$/d' | sort)"
+    # The report must list EXACTLY the two damaged files, fully qualified: an NDJSON
+    # report's error records, parsed by record type, are compared as a set.
+    local reported expected
+    reported="$(mlib_report_paths "$report" | sort)"
     expected="$(printf '%s\n%s\n' "$sbx/lib/track02.flac" "$sbx/lib/track04.flac" | sort)"
-    [ "$csv_rows" = "$expected" ] \
-        || mlib_fail "jobs=$jobs: CSV rows are not exactly the two bad files:
+    [ "$reported" = "$expected" ] \
+        || mlib_fail "jobs=$jobs: report rows are not exactly the two bad files:
 --- got ---
-$csv_rows
+$reported
 --- want ---
 $expected"
-    mlib_log "jobs=$jobs: scan CSV lists exactly track02 + track04"
+    mlib_log "jobs=$jobs: scan report lists exactly track02 + track04"
 
     # A scan must never modify library content.
     cmp -s "$sbx/lib/track01.flac" "$pristine/track01.flac" \
         || mlib_fail "jobs=$jobs: option 1 modified track01.flac"
     mlib_log "jobs=$jobs: option 1 left all library content untouched"
 
-    # --- option 2: reencode the newest CSV ----------------------------------
+    # --- option 2: reencode the newest report ----------------------------------
     mlib_run_menu "$sbx" "2" "Y" ""
     grep -q 'Total files processed: 2' "$sbx/run.out" \
         || mlib_fail "jobs=$jobs: reencode did not process exactly 2 files (see $sbx/run.out)"
@@ -166,7 +167,7 @@ $expected"
     # --- backups (checked BEFORE the option-4 pass below) --------------------
     # track02 and track04 were damaged, so option 2's backup for each is a copy of
     # the DAMAGED bytes (what we promised to preserve). The clean files were not in
-    # the scan CSV, so option 2 left them alone and made no backup for them. This is
+    # the scan report, so option 2 left them alone and made no backup for them. This is
     # asserted here rather than at the end because the option-4 pass backs up the
     # whole library and would add more files to the tree.
     mlib_assert_backup_matches "$sbx/backup/track02.flac" "$pristine/track02.corrupt"
@@ -184,7 +185,7 @@ $expected"
     # defect - so asserting equality there would fail on a correct implementation.
     #
     # track01 is pristine and was in the library all along. It is not in the scan
-    # CSV (only the damaged files are), so drive it through option 4 (reencode ALL)
+    # report (only the damaged files are), so drive it through option 4 (reencode ALL)
     # to force a real decode/re-encode round-trip of intact audio.
     #
     # Option 4 demands the literal phrase 'REENCODE ALL', not a bare 'Y': it is the
@@ -223,7 +224,9 @@ $expected"
     local db db_paths total_rows
     db="$sbx/lib/.flac_scan_data/reencoded.db"
     [ -f "$db" ] || mlib_fail "jobs=$jobs: no tracking database at $db"
-    db_paths=$(awk '{print $NF}' "$db" | sort)
+    # Records are NUL-terminated (mlib_db_records splits them); the path is the LAST
+    # field of each.
+    db_paths=$(mlib_db_records "$db" | awk '{print $NF}' | sort)
     total_rows=$(printf '%s\n' "$db_paths" | grep -c . || true)
 
     # Option 2 recorded 2 files, option 4 recorded 5 -> 7 rows.
@@ -261,7 +264,7 @@ $foreign"
     [ "$shard_dirs" -eq 0 ] || mlib_fail "jobs=$jobs: a shards/ directory survived the run"
     mlib_log "jobs=$jobs: no temp files, shards, or seed lists left behind"
 
-    # A second reencode of the same CSV must be a no-op: the DB now covers both
+    # A second reencode of the same report must be a no-op: the DB now covers both
     # files, so option 2 skips everything and changes nothing.
     local before_sum after_sum
     before_sum="$(md5sum "$sbx/lib"/*.flac | awk '{print $1}' | sort | md5sum)"

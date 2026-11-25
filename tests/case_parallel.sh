@@ -183,7 +183,8 @@ occur_re "SUCCESS: $LIB/Album $FILE_COUNT/track$FILE_COUNT.flac reencoded succes
     || _fail "jobs=1: processed count != $FILE_COUNT"
 [ "$(captured_count 'Successful reencodes: ([0-9]+)')" -eq "$FILE_COUNT" ] \
     || _fail "jobs=1: success count != $FILE_COUNT"
-[ "$(wc -l < "$DB")" -eq "$FILE_COUNT" ] \
+# The DB holds one NUL-terminated record per file (see db_row_count).
+[ "$(db_row_count "$DB")" -eq "$FILE_COUNT" ] \
     || _fail "jobs=1: DB should hold exactly $FILE_COUNT rows"
 
 # Every original was mirrored, so the parallel run below starts from a known state and
@@ -254,14 +255,16 @@ done
     || _fail "jobs=4: run log should hold all $FILE_COUNT SUCCESS lines"
 
 # ---- DB: one row per file, no duplicates -----------------------------------
-[ "$(wc -l < "$DB")" -eq "$FILE_COUNT" ] \
+[ "$(db_row_count "$DB")" -eq "$FILE_COUNT" ] \
     || _fail "jobs=4: DB should hold exactly $FILE_COUNT rows"
 for i in $(seq 1 "$FILE_COUNT"); do
     db_has_path "$SBX" "$LIB/Album $i/track$i.flac"
 done
 # Exactly one row mentions track1: the per-worker .db shards were merged rather than
-# appended to by racing writers, so no path is recorded twice.
-[ "$(grep -c 'track1\.flac' "$DB")" -eq 1 ] \
+# appended to by racing writers, so no path is recorded twice. (Records are
+# NUL-terminated, so they are split into lines first; the records themselves hold no
+# newlines here.)
+[ "$(db_records "$DB" | grep -c 'track1\.flac')" -eq 1 ] \
     || _fail "jobs=4: track1 appears more than once in the DB"
 
 # ---- concurrency: 4 workers really did run 4 reencodes at once --------------
@@ -328,13 +331,13 @@ occur_re "Processing $FILE_COUNT file\\(s\\) with [0-9]+ worker\\(s\\)"
 #   * it is READ-ONLY, so nothing is completed or mirrored; what matters is that every
 #     file is verified exactly once (probe record count) and that occupancy tracks 'jobs';
 #   * its OUTPUT must not depend on the pool's completion order: errors are replayed in
-#     dispatch order, so the CSV manifest option 2 consumes is identical whatever the
+#     dispatch order, so the report option 2 consumes lists them identically whatever the
 #     worker count. Asserted by running the same library at jobs=1 and jobs=4 and
-#     requiring the two CSVs to match byte for byte.
+#     requiring the two reports' error records to match, in order.
 # ===========================================================================
 
-# Fixture: 6 clean files plus 2 corrupt ones, so the CSV has more than one row and their
-# ORDER is observable. 'corrupt' is what the stub's verify path keys on (see
+# Fixture: 6 clean files plus 2 corrupt ones, so the report has more than one record and
+# their ORDER is observable. 'corrupt' is what the stub's verify path keys on (see
 # tests/stub_flac); the reencode path is never reached here.
 SCAN_COUNT=8
 SCAN_BAD=(3 6)
@@ -351,35 +354,45 @@ scan_fixture() {
     done
 }
 
-# scan_csv : the single scan report CSV from the most recent run ('' if none).
-scan_csv() {
-    find "$LIB/.flac_scan_data/reports" -type f -name 'flac_scan_*.csv' -print 2>/dev/null \
+# scan_report : the single scan report from the most recent run ('' if none).
+# Either format: a scan writes .ndjson; a legacy .csv would only appear if one were
+# seeded, and the clean-run assertions below must reject both.
+scan_report() {
+    find "$LIB/.flac_scan_data/reports" -type f \
+        \( -name 'flac_scan_*.ndjson' -o -name 'flac_scan_*.csv' \) -print 2>/dev/null \
         | head -n1
 }
 
-# scan_run <jobs> <out_var> : run option 1 with <jobs> workers and copy the resulting CSV
-# to the file named by <out_var>. Runs in the CURRENT shell (see all_run) so
+# scan_run <jobs> <out_var> : run option 1 with <jobs> workers and copy the resulting
+# report to the file named by <out_var>. Runs in the CURRENT shell (see all_run) so
 # run_script_env's output variables survive.
 scan_run() {
     local jobs="$1"
     local out_var="$2"
-    local csv
+    local report
     set_jobs "$jobs"
     scan_fixture
     probe_reset
     run_script_env "$SBX" "STUB_FLAC_TEST_SLEEP=$STUB_SLEEP" \
         "STUB_FLAC_SLOT_DIR=$PROBE" -- '1' '' ''
-    csv="$(scan_csv)"
-    [ -n "$csv" ] || _fail "scan at jobs=$jobs: expected a CSV report for a corrupt library"
-    cp "$csv" "$SBX/scan_$out_var.csv"
-    printf -v "$out_var" '%s' "$SBX/scan_$out_var.csv"
+    report="$(scan_report)"
+    [ -n "$report" ] || _fail "scan at jobs=$jobs: expected a report for a corrupt library"
+    cp "$report" "$SBX/scan_$out_var.ndjson"
+    printf -v "$out_var" '%s' "$SBX/scan_$out_var.ndjson"
 }
 
-SCAN_SEQ_CSV=''
-SCAN_PAR_CSV=''
+# report_errors <report> : the 'error' filepaths of a report, one per line. Used only to
+# compare two runs' ORDER, which is the contract below; the byte-exactness of a path is
+# pinned by case_report_nasty_names.sh.
+report_errors() {
+    jq -r 'select(.type == "error") | .filepath' "$1"
+}
+
+SCAN_SEQ_NDJSON=''
+SCAN_PAR_NDJSON=''
 
 echo "  .. jobs=1 scan run (${SCAN_COUNT} files)"
-scan_run 1 SCAN_SEQ_CSV
+scan_run 1 SCAN_SEQ_NDJSON
 [ "$(captured_count 'Scanned ([0-9]+) files')" -eq "$SCAN_COUNT" ] \
     || _fail "jobs=1 scan: scanned count != $SCAN_COUNT"
 [ "$(message_count 'Error detected in:')" -eq "${#SCAN_BAD[@]}" ] \
@@ -399,7 +412,7 @@ absent_re 'Scanning with [0-9]+ worker\(s\)'
 assert_peak 1 'jobs=1 scan' "$SCAN_COUNT"
 
 echo "  .. jobs=4 scan run (${SCAN_COUNT} files)"
-scan_run 4 SCAN_PAR_CSV
+scan_run 4 SCAN_PAR_NDJSON
 occur_re 'Scanning with 4 worker\(s\)'
 # A POOLED captured scan reports progress as plain lines, because its per-file
 # output is suppressed during the run. This is the regression anchor for a
@@ -414,25 +427,25 @@ occur_re 'Progress: \[#+-*\]'
 # The pool is really used: 4 verifies were in flight at once.
 assert_peak 4 'jobs=4 scan' "$SCAN_COUNT"
 
-# THE ORDERING CONTRACT: the CSV is identical whether the scan ran with 1 worker or 4.
-# This fails if the workers' shards are concatenated in completion order instead of being
-# replayed by dispatch id. Only the DATA rows are compared: the runs happen at different
-# times, so the '# Scan Report ... <timestamp>' comment legitimately differs.
-tail -n +2 "$SCAN_SEQ_CSV" > "$SBX/seq_rows.txt"
-tail -n +2 "$SCAN_PAR_CSV" > "$SBX/par_rows.txt"
+# THE ORDERING CONTRACT: the report's error records are identical, in order, whether the
+# scan ran with 1 worker or 4. This fails if the workers' shards are concatenated in
+# completion order instead of being replayed by dispatch id. The header is excluded: the
+# runs happen at different times, so its 'generated' timestamp legitimately differs.
+report_errors "$SCAN_SEQ_NDJSON" > "$SBX/seq_rows.txt"
+report_errors "$SCAN_PAR_NDJSON" > "$SBX/par_rows.txt"
 diff -u "$SBX/seq_rows.txt" "$SBX/par_rows.txt" > "$SBX/rows.diff" 2>&1 \
-    || _fail "jobs=4 scan CSV rows differ from the jobs=1 rows (order not preserved)"
+    || _fail "jobs=4 scan error order differs from the jobs=1 order:
+$(cat "$SBX/rows.diff")"
 # ...and the rows really are the corrupt files in the library's own order, so the equality
 # above is not two identically-wrong files.
-BAD_ROWS=$(grep -c '^"' "$SCAN_PAR_CSV")
-[ "$BAD_ROWS" -eq "${#SCAN_BAD[@]}" ] \
-    || _fail "jobs=4 scan CSV has $BAD_ROWS data row(s), expected ${#SCAN_BAD[@]}"
+[ "$(wc -l < "$SBX/par_rows.txt")" -eq "${#SCAN_BAD[@]}" ] \
+    || _fail "jobs=4 scan has $(wc -l < "$SBX/par_rows.txt") error record(s), expected ${#SCAN_BAD[@]}"
 for n in "${SCAN_BAD[@]}"; do
-    grep -Fq "\"$LIB/Album/bad$n.flac\"" "$SCAN_PAR_CSV" \
-        || _fail "jobs=4 scan CSV is missing bad$n.flac"
+    grep -qxF "$LIB/Album/bad$n.flac" "$SBX/par_rows.txt" \
+        || _fail "jobs=4 scan report is missing bad$n.flac"
 done
 
-# A clean library must still leave no CSV and no shards when scanned in parallel:
+# A clean library must still leave no report and no shards when scanned in parallel:
 # the report-removal path has to run on the pooled branch too.
 set_jobs 4
 rm -rf "$LIB"
@@ -441,7 +454,7 @@ write_file "$LIB/Album/clean.flac" 'PRISTINE'
 probe_reset
 run_script_env "$SBX" -- '1' '' ''
 occur_re 'No errors found'
-[ -z "$(scan_csv)" ] || _fail "jobs=4 clean scan left a CSV behind"
+[ -z "$(scan_report)" ] || _fail "jobs=4 clean scan left a report behind"
 [ "$(count_find "$LIB/.flac_scan_data" -type f \
         \( -name '*_w*.scan' -o -name '*_w*.log' -o -name '*.result' \) )" -eq 0 ] \
     || _fail "jobs=4 clean scan left worker shards behind"
@@ -577,7 +590,7 @@ occur_re "Processing $NEW_TOTAL file\\(s\\) with 4 worker\\(s\\)"
 assert_peak 4 'option 5 jobs=4 (new files > workers)' "$NEW_TOTAL"
 
 # ---- the DB now covers every file, with no duplicate rows ------------------
-[ "$(wc -l < "$DB")" -eq "$NEW_TOTAL" ] \
+[ "$(db_row_count "$DB")" -eq "$NEW_TOTAL" ] \
     || _fail "option 5: DB should hold exactly $NEW_TOTAL rows"
 for i in $(seq 1 "$NEW_TOTAL"); do
     db_has_path "$SBX" "$LIB/Album/track$i.flac"
