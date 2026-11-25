@@ -76,8 +76,11 @@ if [ -n "${STUB_FLAC_SLOT_DIR:-}" ]; then
             printf '%s\n' "$cur"
         ) 9>>"$probe_lock"
     }
-    # Invoked indirectly: the EXIT trap below calls it on every exit path.
-    # shellcheck disable=SC2329
+    # Invoked indirectly: the EXIT trap below calls it on every exit path, so
+    # ShellCheck cannot see the call. SC2329 is the code 0.10+/0.11 emit;
+    # SC2317 is what 0.9 emits for the same thing, so both are disabled and the
+    # file stays clean at whichever version a developer or CI happens to run.
+    # shellcheck disable=SC2317,SC2329
     probe_decr() {
         (
             flock 9
